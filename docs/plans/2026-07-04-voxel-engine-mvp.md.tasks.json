@@ -1,0 +1,29 @@
+{
+  "planPath": "docs/plans/2026-07-04-voxel-engine-mvp.md",
+  "tasks": [
+    {"id": 1, "subject": "Task 1: Workspace scaffold (nine crates, pinned deps)", "status": "pending"},
+    {"id": 2, "subject": "Task 2: Window + wgpu clear + frame loop skeleton", "status": "pending", "blockedBy": [1]},
+    {"id": 3, "subject": "Task 3: vox-core coordinates, config, errors", "status": "pending", "blockedBy": [1]},
+    {"id": 4, "subject": "Task 4: vox-core material registry from TOML", "status": "pending", "blockedBy": [3]},
+    {"id": 5, "subject": "Task 5: vox-world Chunk storage (Uniform/Dense)", "status": "pending", "blockedBy": [3]},
+    {"id": 6, "subject": "Task 6: vox-world World map, edits, dirty tracking", "status": "pending", "blockedBy": [5]},
+    {"id": 7, "subject": "Task 7: vox-world DDA raycast", "status": "pending", "blockedBy": [6]},
+    {"id": 8, "subject": "Task 8: vox-mesh greedy mesher with vertex AO", "status": "pending", "blockedBy": [6]},
+    {"id": 9, "subject": "Task 9: vox-render chunk pipeline + flat world on screen", "status": "pending", "blockedBy": [2, 4, 8]},
+    {"id": 10, "subject": "Task 10: vox-gen noise (hash, value, gradient, FBM)", "status": "pending", "blockedBy": [3]},
+    {"id": 11, "subject": "Task 11: vox-gen heightmap terrain + scale-invariance test", "status": "pending", "blockedBy": [6, 10]},
+    {"id": 12, "subject": "Task 12: vox-gen trees (meter-parameterized)", "status": "pending", "blockedBy": [11]},
+    {"id": 13, "subject": "Task 13: vox-physics kinematic character controller", "status": "pending", "blockedBy": [6]},
+    {"id": 14, "subject": "Task 14: threaded remeshing + place/break tools + walker", "status": "pending", "blockedBy": [9, 12, 13, 7]},
+    {"id": 15, "subject": "Task 15: vox-physics VoxelBody grids & mass properties", "status": "pending", "blockedBy": [4]},
+    {"id": 16, "subject": "Task 16: integration, world contacts, impulse solver, sleeping", "status": "pending", "blockedBy": [15, 6]},
+    {"id": 17, "subject": "Task 17: body-vs-body contacts + broadphase", "status": "pending", "blockedBy": [16]},
+    {"id": 18, "subject": "Task 18: debris rendering + interpolation + spawn key", "status": "pending", "blockedBy": [17, 9]},
+    {"id": 19, "subject": "Task 19: carve + connectivity + detach-to-body", "status": "pending", "blockedBy": [17]},
+    {"id": 20, "subject": "Task 20: blast tool + edit waking + money shot", "status": "pending", "blockedBy": [19, 14, 18]},
+    {"id": 21, "subject": "Task 21: vox-debug egui overlay (HUD, timings, tuning)", "status": "pending", "blockedBy": [20]},
+    {"id": 22, "subject": "Task 22: CLI world config + scale validation", "status": "pending", "blockedBy": [21]},
+    {"id": 23, "subject": "Task 23: README + extension guide + tag v0.1.0-mvp", "status": "pending", "blockedBy": [22]}
+  ],
+  "lastUpdated": "2026-07-04T00:00:00Z"
+}
