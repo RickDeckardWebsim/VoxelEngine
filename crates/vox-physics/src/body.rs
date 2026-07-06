@@ -363,7 +363,6 @@ mod tests {
         let body = Body::from_grid(grid, &reg, 0.1, Vec3::new(5.0, 5.0, 5.0)).expect("massive");
         // grid_offset must put the grid's center at the COM.
         assert!((body.grid_offset + Vec3::splat(0.2)).length() < 1e-6);
-        body.aabb_min.min_element(); // touchable
         assert!((body.aabb_min - Vec3::new(4.8, 4.8, 4.8)).length() < 1e-5);
         assert!((body.aabb_max - Vec3::new(5.2, 5.2, 5.2)).length() < 1e-5);
         assert!((body.mass() - 1000.0 * 0.4f32.powi(3)).abs() < 1e-3);
