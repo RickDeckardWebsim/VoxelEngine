@@ -75,7 +75,7 @@
     {
       "id": 10,
       "subject": "Task 10: vox-gen noise (hash, value, gradient, FBM)",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         3
       ]
@@ -83,7 +83,7 @@
     {
       "id": 11,
       "subject": "Task 11: vox-gen heightmap terrain + scale-invariance test",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         6,
         10
@@ -92,7 +92,7 @@
     {
       "id": 12,
       "subject": "Task 12: vox-gen trees (meter-parameterized)",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         11
       ]
@@ -193,5 +193,5 @@
       ]
     }
   ],
-  "lastUpdated": "2026-07-06T06:00:00Z"
+  "lastUpdated": "2026-07-06T15:20:00Z"
 }
