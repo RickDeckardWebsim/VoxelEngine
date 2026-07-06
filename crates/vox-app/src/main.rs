@@ -9,7 +9,7 @@ use rayon::prelude::*;
 
 use vox_core::consts::CHUNK_SIZE;
 use vox_core::{MaterialRegistry, WorldConfig, chunk_origin, voxel_at};
-use vox_gen::{TerrainGen, TerrainMaterials};
+use vox_gen::{TerrainGen, TerrainMaterials, TreeMaterials, generate_trees};
 use vox_mesh::{VoxelSlab, mesh_slab};
 use vox_platform::{App, FrameControl, FrameTiming, InputState, run_app};
 use vox_render::{Camera, Frustum, Gpu, VoxelPipeline};
@@ -55,7 +55,11 @@ fn build_terrain_world(
     cfg.validate()?;
     let mut world = World::new(cfg);
     let mats = TerrainMaterials::from_registry(registry)?;
-    TerrainGen::new(&world.cfg).generate(&mut world, mats);
+    let terrain = TerrainGen::new(&world.cfg);
+    terrain.generate(&mut world, mats);
+    let tree_mats = TreeMaterials::from_registry(registry)?;
+    let planted = generate_trees(&mut world, &terrain, tree_mats);
+    tracing::info!(trees = planted, "forest planted");
     Ok(world)
 }
 
