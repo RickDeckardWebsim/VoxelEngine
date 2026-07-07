@@ -179,7 +179,7 @@
     {
       "id": 22,
       "subject": "Task 22: CLI world config + scale validation",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         21
       ]
@@ -193,5 +193,5 @@
       ]
     }
   ],
-  "lastUpdated": "2026-07-07T01:20:00Z"
+  "lastUpdated": "2026-07-07T02:00:00Z"
 }
