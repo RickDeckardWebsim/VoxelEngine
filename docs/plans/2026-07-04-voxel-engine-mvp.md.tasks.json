@@ -187,11 +187,11 @@
     {
       "id": 23,
       "subject": "Task 23: README + extension guide + tag v0.1.0-mvp",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         22
       ]
     }
   ],
-  "lastUpdated": "2026-07-07T02:00:00Z"
+  "lastUpdated": "2026-07-07T02:30:00Z"
 }
