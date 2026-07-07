@@ -1,5 +1,6 @@
 //! Voxel engine application: world, player, tools, threaded remeshing, render.
 
+mod args;
 mod player;
 mod remesh;
 mod tools;
@@ -53,13 +54,9 @@ fn assets_dir() -> PathBuf {
 
 /// Build the world: noise terrain + forest from the world config.
 fn build_terrain_world(
+    cfg: WorldConfig,
     registry: &MaterialRegistry,
 ) -> Result<World, Box<dyn std::error::Error + Send + Sync>> {
-    let cfg = WorldConfig {
-        voxel_size_m: 0.1,
-        extent_m: [128.0, 48.0, 128.0],
-        ..WorldConfig::default()
-    };
     cfg.validate()?;
     let mut world = World::new(cfg);
     let mats = TerrainMaterials::from_registry(registry)?;
@@ -110,13 +107,16 @@ struct VoxApp {
 }
 
 impl VoxApp {
-    fn new(window: Arc<Window>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    fn new(
+        window: Arc<Window>,
+        cfg: WorldConfig,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let assets = assets_dir();
         let registry = MaterialRegistry::load_dir(&assets.join("materials"))?;
         let shader = std::fs::read_to_string(assets.join("shaders/voxel.wgsl"))?;
 
         let build_start = Instant::now();
-        let world = build_terrain_world(&registry)?;
+        let world = build_terrain_world(cfg, &registry)?;
         tracing::info!(
             chunks = world.chunk_count(),
             elapsed_ms = build_start.elapsed().as_millis() as u64,
@@ -544,15 +544,34 @@ impl App for VoxApp {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    if args::wants_help(cli_args.iter().map(String::as_str)) {
+        println!("{}", args::usage());
+        return Ok(());
+    }
+    let cfg = match args::parse(cli_args.iter().map(String::as_str)) {
+        Ok(cfg) => cfg,
+        Err(msg) => {
+            eprintln!("error: {msg}\n\n{}", args::usage());
+            std::process::exit(1);
+        }
+    };
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+    tracing::info!(
+        voxel_size_m = cfg.voxel_size_m,
+        seed = cfg.seed,
+        extent_m = ?cfg.extent_m,
+        "world config"
+    );
 
     run_app(vox_core::consts::PHYSICS_DT, |window| {
-        Ok(Box::new(VoxApp::new(window)?))
+        Ok(Box::new(VoxApp::new(window, cfg)?))
     })?;
     Ok(())
 }

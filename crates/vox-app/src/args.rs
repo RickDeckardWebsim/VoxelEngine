@@ -1,0 +1,142 @@
+//! Minimal hand-rolled CLI argument parsing for world configuration.
+//! No external arg-parsing crate: the surface is tiny (three flags) and a
+//! dependency isn't worth it for this.
+
+use vox_core::WorldConfig;
+
+/// `voxelengine [--scale 0.1|1.0] [--seed N] [--extent X,Y,Z] [--help]`
+pub fn usage() -> String {
+    "voxelengine [--scale 0.1|1.0] [--seed N] [--extent X,Y,Z] [--help]\n\n\
+     --scale   voxel edge length in meters (default 0.1)\n\
+     --seed    world generation seed (default 1337)\n\
+     --extent  world size in meters, comma-separated X,Y,Z (default 128,48,128)\n\
+     --help    show this message"
+        .to_string()
+}
+
+/// True if `args` requests help (checked before [`parse`] so the caller can
+/// print usage and exit 0, distinct from a parse error exiting 1).
+pub fn wants_help<'a>(args: impl Iterator<Item = &'a str>) -> bool {
+    args.into_iter().any(|a| a == "--help" || a == "-h")
+}
+
+/// Parse CLI overrides on top of [`WorldConfig::default`]. Returns a
+/// human-readable message (not including usage text) on any failure —
+/// unknown flag, missing value, unparseable number, or a value that fails
+/// [`WorldConfig::validate`].
+pub fn parse<'a>(args: impl Iterator<Item = &'a str>) -> Result<WorldConfig, String> {
+    let mut cfg = WorldConfig::default();
+    let args: Vec<&str> = args.collect();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "--scale" => {
+                let v = next_value(&args, &mut i, "--scale")?;
+                cfg.voxel_size_m = v
+                    .parse()
+                    .map_err(|_| format!("--scale: invalid number '{v}'"))?;
+            }
+            "--seed" => {
+                let v = next_value(&args, &mut i, "--seed")?;
+                cfg.seed = v
+                    .parse()
+                    .map_err(|_| format!("--seed: invalid number '{v}'"))?;
+            }
+            "--extent" => {
+                let v = next_value(&args, &mut i, "--extent")?;
+                let parts: Vec<&str> = v.split(',').collect();
+                if parts.len() != 3 {
+                    return Err(format!("--extent: expected X,Y,Z got '{v}'"));
+                }
+                let mut extent = [0.0f32; 3];
+                for (slot, p) in extent.iter_mut().zip(parts) {
+                    *slot = p
+                        .trim()
+                        .parse()
+                        .map_err(|_| format!("--extent: invalid number '{p}'"))?;
+                }
+                cfg.extent_m = extent;
+            }
+            other => return Err(format!("unknown argument '{other}'")),
+        }
+        i += 1;
+    }
+    cfg.validate().map_err(|e| e.to_string())?;
+    Ok(cfg)
+}
+
+fn next_value(args: &[&str], i: &mut usize, flag: &str) -> Result<String, String> {
+    *i += 1;
+    args.get(*i)
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("{flag}: missing value"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_str(s: &str) -> Result<WorldConfig, String> {
+        parse(s.split_whitespace())
+    }
+
+    #[test]
+    fn no_args_yields_default() {
+        let cfg = parse_str("").expect("empty args must parse");
+        assert_eq!(cfg.seed, WorldConfig::default().seed);
+        assert_eq!(cfg.voxel_size_m, WorldConfig::default().voxel_size_m);
+    }
+
+    #[test]
+    fn scale_and_seed_are_parsed() {
+        let cfg = parse_str("--scale 1.0 --seed 42").expect("must parse");
+        assert_eq!(cfg.voxel_size_m, 1.0);
+        assert_eq!(cfg.seed, 42);
+    }
+
+    #[test]
+    fn extent_is_parsed() {
+        let cfg = parse_str("--extent 64,32,64").expect("must parse");
+        assert_eq!(cfg.extent_m, [64.0, 32.0, 64.0]);
+    }
+
+    #[test]
+    fn unknown_flag_errors() {
+        let err = parse_str("--bogus").expect_err("must reject unknown flag");
+        assert!(err.contains("--bogus"), "error must name the flag: {err}");
+    }
+
+    #[test]
+    fn missing_value_errors() {
+        let err = parse_str("--scale").expect_err("must reject a dangling flag");
+        assert!(err.contains("--scale"), "error must name the flag: {err}");
+    }
+
+    #[test]
+    fn invalid_number_errors() {
+        let err = parse_str("--seed not-a-number").expect_err("must reject bad number");
+        assert!(err.contains("--seed"), "error must name the flag: {err}");
+    }
+
+    #[test]
+    fn malformed_extent_errors() {
+        let err = parse_str("--extent 1,2").expect_err("must reject wrong component count");
+        assert!(err.contains("--extent"));
+    }
+
+    #[test]
+    fn out_of_range_scale_is_rejected_by_validate() {
+        let err = parse_str("--scale 0").expect_err("scale 0 must fail WorldConfig::validate");
+        assert!(
+            err.contains("voxel_size_m"),
+            "error must name the field: {err}"
+        );
+    }
+
+    #[test]
+    fn wants_help_detects_both_spellings() {
+        assert!(wants_help("--help".split_whitespace()));
+        assert!(wants_help("-h".split_whitespace()));
+        assert!(!wants_help("--scale 1.0".split_whitespace()));
+    }
+}
