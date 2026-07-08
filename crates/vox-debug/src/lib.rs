@@ -34,9 +34,10 @@ pub struct OverlayState<'a> {
     pub chunks_drawn: u32,
     pub chunks_culled: u32,
     pub mesh_queue: usize,
+    pub body_mesh_in_flight: usize,
     pub bodies_awake: usize,
     pub bodies_total: usize,
-    pub blast_radius: &'a mut f32,
+    pub tool_radius: &'a mut f32,
     pub material_names: &'a [String],
     pub selected_material: &'a mut usize,
 }
@@ -59,9 +60,15 @@ pub struct DebugOverlay {
 
 impl DebugOverlay {
     /// Build the overlay against an existing GPU device and surface format.
+    /// `depth_format` must match whatever depth-stencil attachment (if any)
+    /// the render pass this overlay paints into actually uses -- egui's
+    /// pipeline is validated against the pass it's recorded into, and a
+    /// mismatch (`None` here vs. a real depth attachment on the pass) is a
+    /// wgpu validation panic, not a silent fallback.
     pub fn new(
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
+        depth_format: Option<wgpu::TextureFormat>,
         window: &Arc<Window>,
     ) -> Self {
         let ctx = Context::default();
@@ -72,7 +79,7 @@ impl DebugOverlay {
             Some(window.scale_factor() as f32),
             None,
         );
-        let renderer = Renderer::new(device, surface_format, None, 1);
+        let renderer = Renderer::new(device, surface_format, depth_format, 1);
         Self {
             ctx,
             winit_state,

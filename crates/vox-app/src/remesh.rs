@@ -85,12 +85,12 @@ impl RemeshQueue {
                 .pending
                 .remove(&key)
                 .expect("key came from pending set");
-            let slab =
-                VoxelSlab::extract(world, chunk_origin(key), IVec3::splat(CHUNK_SIZE as i32));
+            let origin = chunk_origin(key);
+            let slab = VoxelSlab::extract(world, origin, IVec3::splat(CHUNK_SIZE as i32));
             let tx = self.tx.clone();
             self.in_flight += 1;
             rayon::spawn(move || {
-                let mesh = mesh_slab(&slab);
+                let mesh = mesh_slab(&slab, origin);
                 // Receiver dropped only on shutdown; ignore send failure.
                 let _ = tx.send((key, generation, mesh));
             });

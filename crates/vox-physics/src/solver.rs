@@ -20,6 +20,45 @@ use crate::contact::{Contact, ContactKey, pair_contacts, world_contacts};
 /// as a multiple of the live `sleep_lin` tunable.
 const WAKE_SPEED_FACTOR: f32 = 2.0;
 
+/// Minimum closing speed (see [`crate::contact::Contact::approach_speed`])
+/// for a contact to count as an "impact" at all, regardless of its
+/// accumulated normal impulse. A body resting quietly (or mid-bounce while
+/// settling) still needs a real contact impulse every single substep just
+/// to hold it up against gravity/Baumgarte correction -- that impulse looks
+/// identical, frame to frame, to the one from a body that just landed hard,
+/// but its approach speed is near zero. Without this gate, a freshly
+/// detached fragment resting on a fragile material kept re-reporting that
+/// steady load as a fresh impact on *every single frame* it was settling,
+/// which for a low-strength material (leaves) repeatedly re-triggered
+/// impact fracture forever -- read as continuous flicker, not a one-time
+/// crumble. Comfortably above gravity's own per-substep speed contribution
+/// (~0.08 m/s at 60Hz/2 substeps) so ordinary settling never crosses it, but
+/// well below any real collision.
+const MIN_IMPACT_APPROACH_SPEED_M_S: f32 = 0.4;
+
+/// The hardest single-contact impact a body took during one [`PhysicsWorld::step`]
+/// call, in case a caller wants to fracture it (material-based impact
+/// destruction). `impulse` is the contact's peak accumulated normal impulse
+/// this step (kg*m/s) -- `impulse / body.mass()` is the velocity change the
+/// hit imparted, a physically meaningful, mass-independent way to compare
+/// against a material's strength. Only the single hardest hit per body is
+/// reported per step, not every contact -- a resting stack's steady contact
+/// forces are not "impacts", and a caller deciding whether to fracture a
+/// body only needs to know its worst moment.
+#[derive(Copy, Clone, Debug)]
+pub struct ImpactEvent {
+    pub body: BodyId,
+    /// World-space point of the hardest contact.
+    pub point_m: Vec3,
+    /// Peak accumulated normal impulse at that contact this step, kg*m/s.
+    pub impulse: f32,
+    /// Unit direction the impact pushed `body`, i.e. away from whatever it
+    /// hit and into `body`'s own volume at the contact point -- a caller
+    /// fracturing the body along this can carve *into* the struck surface
+    /// instead of a generic sphere straddling half in, half out of it.
+    pub push_dir: Vec3,
+}
+
 /// Two distinct mutable borrows out of the slot array.
 fn two_mut(slots: &mut [Option<Body>], a: usize, b: usize) -> (&mut Body, &mut Body) {
     debug_assert_ne!(a, b);
@@ -164,7 +203,11 @@ impl PhysicsWorld {
     }
 
     /// Advance the simulation by `dt` seconds against the static world.
-    pub fn step(&mut self, world: &World, dt: f32) {
+    /// Returns each body's hardest single contact this step, if any -- see
+    /// [`ImpactEvent`]. Most steps most bodies are resting quietly, so this
+    /// is typically empty or small; it's the caller's job to decide what
+    /// "hard enough" means (e.g. comparing against a material's strength).
+    pub fn step(&mut self, world: &World, dt: f32) -> Vec<ImpactEvent> {
         // Snapshot transforms once per full step for render interpolation.
         for body in self.slots.iter_mut().flatten() {
             if !body.sleep.asleep {
@@ -173,10 +216,25 @@ impl PhysicsWorld {
             }
         }
 
+        // Peak impulse (point, and push direction) per body slot, across
+        // every substep.
+        let mut peaks: HashMap<usize, (f32, Vec3, Vec3)> = HashMap::new();
         let h = dt / SUBSTEPS as f32;
         for _ in 0..SUBSTEPS {
-            self.substep(world, h);
+            self.substep(world, h, &mut peaks);
         }
+        let impacts = peaks
+            .into_iter()
+            .map(|(slot, (impulse, point_m, push_dir))| ImpactEvent {
+                body: BodyId {
+                    slot: slot as u32,
+                    generation: self.generations[slot],
+                },
+                point_m,
+                impulse,
+                push_dir,
+            })
+            .collect();
 
         // Update per-body quiet counters.
         for body in self.slots.iter_mut().flatten() {
@@ -233,6 +291,7 @@ impl PhysicsWorld {
                 }
             }
         }
+        impacts
     }
 
     /// Group bodies into connected components via broadphase contact.
@@ -261,7 +320,7 @@ impl PhysicsWorld {
         groups.into_values().collect()
     }
 
-    fn substep(&mut self, world: &World, h: f32) {
+    fn substep(&mut self, world: &World, h: f32, peaks: &mut HashMap<usize, (f32, Vec3, Vec3)>) {
         // Integrate velocities and collect contacts.
         let mut contacts: Vec<Contact> = Vec::new();
         for (slot, entry) in self.slots.iter_mut().enumerate() {
@@ -359,6 +418,35 @@ impl PhysicsWorld {
                     let applied_t = new_t - *acc;
                     *acc = new_t;
                     Self::apply_contact_impulse(&mut self.slots, c, t * applied_t);
+                }
+            }
+        }
+
+        // Record each body's hardest single contact this substep, for
+        // material-based impact fracture (see `ImpactEvent`). Positions
+        // here are pre-integration, matching the frame `c.r_arm`/`r_arm_b`
+        // were computed in when this substep's contacts were generated.
+        for c in &contacts {
+            if c.acc_n <= 0.0 || c.approach_speed < MIN_IMPACT_APPROACH_SPEED_M_S {
+                continue;
+            }
+            // `c.normal` points from the target toward `c.body` (its push
+            // direction); `body_b` receives the equal-and-opposite impulse,
+            // so its own push direction is the reverse.
+            if let Some(body) = self.slots[c.body].as_ref() {
+                let point = body.pos + c.r_arm;
+                let entry = peaks.entry(c.body).or_insert((0.0, point, c.normal));
+                if c.acc_n > entry.0 {
+                    *entry = (c.acc_n, point, c.normal);
+                }
+            }
+            if let Some(b) = c.body_b
+                && let Some(body_b) = self.slots[b].as_ref()
+            {
+                let point = body_b.pos + c.r_arm_b;
+                let entry = peaks.entry(b).or_insert((0.0, point, -c.normal));
+                if c.acc_n > entry.0 {
+                    *entry = (c.acc_n, point, -c.normal);
                 }
             }
         }
@@ -515,6 +603,38 @@ mod tests {
             "rest height off: aabb_min.y = {}",
             b.aabb_min.y
         );
+    }
+
+    /// A body dropped from height must report a hard impact when it lands
+    /// (a big peak normal impulse, at a point near the floor), but once
+    /// resting quietly, later steps must report nothing of the sort --
+    /// steady contact force holding a body up is not an "impact".
+    #[test]
+    fn a_hard_landing_reports_an_impact_event_but_resting_does_not() {
+        let reg = registry();
+        let world = floored_world();
+        let mut phys = PhysicsWorld::new();
+        let id = phys.spawn(cube_body(&reg, 4, Vec3::new(16.0, 10.0, 16.0)));
+
+        let mut saw_impact = false;
+        let mut max_impulse = 0.0f32;
+        for _ in 0..300 {
+            for event in phys.step(&world, PHYSICS_DT) {
+                assert_eq!(event.body, id);
+                saw_impact = true;
+                max_impulse = max_impulse.max(event.impulse);
+            }
+            if phys.get(id).expect("alive").sleep.asleep {
+                break;
+            }
+        }
+        assert!(saw_impact, "a body falling 6 m onto stone must report an impact");
+        assert!(max_impulse > 0.0);
+
+        // Once settled and asleep, further steps must be quiet -- no
+        // spurious impacts from steady resting contact.
+        let quiet = phys.step(&world, PHYSICS_DT);
+        assert!(quiet.is_empty(), "resting body must not report an impact: {quiet:?}");
     }
 
     #[test]
@@ -703,5 +823,38 @@ mod tests {
 
         phys.wake_region(Vec3::new(15.5, 3.5, 15.5), Vec3::new(16.5, 5.0, 16.5));
         assert!(!phys.get(id).expect("alive").sleep.asleep);
+    }
+
+    /// The steady contact holding a body up while it settles (not yet
+    /// asleep) must never be misreported as a fresh impact -- see
+    /// `MIN_IMPACT_APPROACH_SPEED_M_S`'s doc comment for the exact bug this
+    /// guards against (repeated spurious impacts every settling frame,
+    /// which for a fragile material meant continuous re-fracturing).
+    #[test]
+    fn settling_after_a_hard_landing_reports_no_further_impacts() {
+        let reg = registry();
+        let world = floored_world();
+        let mut phys = PhysicsWorld::new();
+        let id = phys.spawn(cube_body(&reg, 4, Vec3::new(16.0, 10.0, 16.0)));
+
+        let mut saw_landing = false;
+        let mut saw_impact_after_landing = false;
+        for _ in 0..300 {
+            let events = phys.step(&world, PHYSICS_DT);
+            if saw_landing && !events.is_empty() {
+                saw_impact_after_landing = true;
+            }
+            if !events.is_empty() {
+                saw_landing = true;
+            }
+            if phys.get(id).expect("alive").sleep.asleep {
+                break;
+            }
+        }
+        assert!(saw_landing, "a body falling 6 m onto stone must report an impact");
+        assert!(
+            !saw_impact_after_landing,
+            "settling under steady contact must not keep reporting fresh impacts"
+        );
     }
 }

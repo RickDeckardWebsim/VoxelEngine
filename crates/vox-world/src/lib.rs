@@ -6,4 +6,4 @@ pub mod world;
 
 pub use chunk::{AIR, CHUNK_VOLUME, Chunk, Voxel};
 pub use raycast::{RayHit, raycast};
-pub use world::{DirtyRegion, World};
+pub use world::{DirtyRegion, SolidLookup, World};

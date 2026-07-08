@@ -47,6 +47,87 @@ impl VoxelGrid {
     }
 }
 
+/// Result of a body-grid raycast, in the grid's own local voxel coordinates.
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub struct GridRayHit {
+    pub voxel: IVec3,
+    pub dist_m: f32,
+}
+
+/// Cast a ray from `origin_m` (in the grid's own local-meter frame, origin
+/// at its minimum corner) along `dir` for at most `max_dist_m` meters,
+/// returning the first solid voxel hit. Same Amanatides-Woo DDA algorithm as
+/// [`vox_world::raycast`], just against a body's dense in-memory grid
+/// instead of the chunked world -- no chunk indirection needed, so this is
+/// simpler, and there's no need for an early-exit bounds check: bodies are
+/// small (debris-scale), so the loop running out via `max_dist_m` costs
+/// little even without one.
+pub fn raycast_grid(
+    grid: &VoxelGrid,
+    origin_m: Vec3,
+    dir: Vec3,
+    max_dist_m: f32,
+    voxel_size_m: f32,
+) -> Option<GridRayHit> {
+    let s = voxel_size_m;
+    let dir = dir.normalize_or_zero();
+    if dir == Vec3::ZERO || !origin_m.is_finite() || max_dist_m <= 0.0 {
+        return None;
+    }
+
+    let p = origin_m / s;
+    let mut cell = p.floor().as_ivec3();
+    if grid.solid(cell) {
+        return Some(GridRayHit {
+            voxel: cell,
+            dist_m: 0.0,
+        });
+    }
+
+    let step = IVec3::new(
+        dir.x.signum() as i32,
+        dir.y.signum() as i32,
+        dir.z.signum() as i32,
+    );
+    let mut t_max = Vec3::ZERO;
+    let mut t_delta = Vec3::ZERO;
+    for a in 0..3 {
+        if dir[a] > 0.0 {
+            t_max[a] = (cell[a] as f32 + 1.0 - p[a]) / dir[a];
+            t_delta[a] = 1.0 / dir[a];
+        } else if dir[a] < 0.0 {
+            t_max[a] = (p[a] - cell[a] as f32) / -dir[a];
+            t_delta[a] = -1.0 / dir[a];
+        } else {
+            t_max[a] = f32::INFINITY;
+            t_delta[a] = f32::INFINITY;
+        }
+    }
+
+    let max_t = max_dist_m / s;
+    loop {
+        let a = if t_max.x < t_max.y {
+            if t_max.x < t_max.z { 0 } else { 2 }
+        } else if t_max.y < t_max.z {
+            1
+        } else {
+            2
+        };
+        if t_max[a] > max_t {
+            return None;
+        }
+        cell[a] += step[a];
+        let t_enter = t_max[a];
+        t_max[a] += t_delta[a];
+        if grid.solid(cell) {
+            return Some(GridRayHit {
+                voxel: cell,
+                dist_m: t_enter * s,
+            });
+        }
+    }
+}
+
 /// Mass, center of mass, and inertia tensor about the COM (body frame).
 #[derive(Copy, Clone, Debug)]
 pub struct MassProps {
@@ -366,5 +447,26 @@ mod tests {
         assert!((body.aabb_min - Vec3::new(4.8, 4.8, 4.8)).length() < 1e-5);
         assert!((body.aabb_max - Vec3::new(5.2, 5.2, 5.2)).length() < 1e-5);
         assert!((body.mass() - 1000.0 * 0.4f32.powi(3)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn raycast_grid_hits_the_near_face() {
+        let grid = solid_grid(IVec3::splat(4));
+        let hit = raycast_grid(
+            &grid,
+            Vec3::new(-1.0, 0.2, 0.2),
+            Vec3::X,
+            5.0,
+            0.1,
+        )
+        .expect("must hit the near face");
+        assert_eq!(hit.voxel, IVec3::new(0, 2, 2));
+        assert!((hit.dist_m - 1.0).abs() < 1e-4, "got {}", hit.dist_m);
+    }
+
+    #[test]
+    fn raycast_grid_misses_when_aimed_away() {
+        let grid = solid_grid(IVec3::splat(4));
+        assert!(raycast_grid(&grid, Vec3::new(-1.0, 0.2, 0.2), Vec3::NEG_X, 5.0, 0.1).is_none());
     }
 }

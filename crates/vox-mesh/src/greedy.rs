@@ -22,7 +22,11 @@ pub struct VoxelVertex {
     pub ao: u8,
     /// Face normal id: 0..6 = +X, -X, +Y, -Y, +Z, -Z.
     pub normal: u8,
-    pub _pad: u8,
+    /// Deterministic per-vertex jitter (0..=255), baked in once at mesh-build
+    /// time from this vertex's position -- see `mesh_slab`'s `jitter_seed`
+    /// parameter for why this has to be baked rather than computed from
+    /// world position in the shader every frame.
+    pub jitter: u8,
     /// Material id of the face.
     pub material: u16,
 }
@@ -76,8 +80,42 @@ struct Cell {
     ao4: [u8; 4],
 }
 
-/// Greedy-mesh a slab into quads.
-pub fn mesh_slab(slab: &VoxelSlab) -> MeshData {
+/// Deterministic per-vertex jitter hash, baked into the mesh once here
+/// rather than recomputed from world position in the shader every frame.
+/// An earlier version hashed the vertex's *world* position dynamically in
+/// WGSL so per-voxel color variation stayed put in world space instead of
+/// tiling identically with the mesh's own local coordinates -- fine for a
+/// chunk (which never moves), but for a tumbling debris body, world
+/// position changes continuously as it rotates/translates, so the "fixed"
+/// per-voxel jitter recomputed each frame actually shifted constantly,
+/// reading as flicker on every moving body's surface. Baking it in at mesh
+/// time instead makes it a fixed property of the geometry, stable
+/// regardless of how the object subsequently moves.
+///
+/// `seed` anchors the pattern to roughly where in a larger space this mesh
+/// sits (a chunk's origin, so neighboring chunks don't all tile the
+/// identical repeating pattern chunk meshes' own 0..32 local coordinates
+/// would otherwise produce); bodies pass `IVec3::ZERO` since their own
+/// local grid is already small and irregular enough per shape.
+#[inline]
+fn jitter_hash(seed: IVec3, local: [u8; 3]) -> u8 {
+    let p = seed + IVec3::new(local[0] as i32, local[1] as i32, local[2] as i32);
+    let mut x = (p.x as u32)
+        .wrapping_mul(0x8529_7a4d)
+        ^ (p.y as u32).wrapping_mul(0x68e3_1da4)
+        ^ (p.z as u32).wrapping_mul(0x1b56_c4e9);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x2c1b_3c6d);
+    x ^= x >> 12;
+    x = x.wrapping_mul(0x297a_2d39);
+    x ^= x >> 15;
+    (x & 0xFF) as u8
+}
+
+/// Greedy-mesh a slab into quads. `jitter_seed` anchors the baked per-vertex
+/// jitter pattern (see `jitter_hash`) -- pass a chunk's world origin for
+/// chunks, `IVec3::ZERO` for a body's own local mesh.
+pub fn mesh_slab(slab: &VoxelSlab, jitter_seed: IVec3) -> MeshData {
     let mut mesh = MeshData::default();
     let dims = slab.inner_dims;
 
@@ -156,6 +194,7 @@ pub fn mesh_slab(slab: &VoxelSlab) -> MeshData {
                     }
                     emit_quad(
                         &mut mesh, cell, normal_id, axis, sign, slice, u_axis, v_axis, u0, v0, w, h,
+                        jitter_seed,
                     );
                     for vv in v0..v0 + h {
                         for uu in u0..u0 + w {
@@ -185,6 +224,7 @@ fn emit_quad(
     v0: i32,
     w: i32,
     h: i32,
+    jitter_seed: IVec3,
 ) {
     // Corner positions on the face plane, in (du, dv) order 00, 10, 01, 11.
     let plane = if sign > 0 { slice + 1 } else { slice };
@@ -204,7 +244,7 @@ fn emit_quad(
             pos,
             ao: cell.ao4[i],
             normal: normal_id,
-            _pad: 0,
+            jitter: jitter_hash(jitter_seed, pos),
             material: cell.material.0,
         });
     }
@@ -271,7 +311,7 @@ mod tests {
     #[test]
     fn empty_slab_zero_quads() {
         let slab = slab_of(IVec3::splat(4), &[]);
-        let mesh = mesh_slab(&slab);
+        let mesh = mesh_slab(&slab, IVec3::ZERO);
         assert_eq!(mesh.quads(), 0);
         assert!(mesh.is_empty());
     }
@@ -279,9 +319,45 @@ mod tests {
     #[test]
     fn single_voxel_six_quads() {
         let slab = slab_of(IVec3::splat(3), &[(IVec3::splat(1), STONE)]);
-        let mesh = mesh_slab(&slab);
+        let mesh = mesh_slab(&slab, IVec3::ZERO);
         assert_eq!(mesh.quads(), 6);
         assert_eq!(mesh.indices.len(), 36);
+    }
+
+    /// Regression test for a rendering bug: jitter used to be recomputed in
+    /// the shader from each vertex's *world* position every frame. That's
+    /// stable for a chunk (which never moves) but not for a tumbling debris
+    /// body, whose world position changes continuously -- the "fixed"
+    /// per-voxel jitter recomputed from a moving position actually shifted
+    /// every frame, which read as flicker on every rotating fragment. Baking
+    /// the jitter into the mesh at build time (this test's whole point)
+    /// means it's a pure function of local geometry and the caller's seed:
+    /// re-meshing identical geometry with the same seed must produce
+    /// byte-for-byte identical jitter, with no hidden dependency on anything
+    /// that could vary as an object moves.
+    #[test]
+    fn jitter_is_deterministic_from_local_geometry_and_seed_alone() {
+        let slab = slab_of(
+            IVec3::splat(5),
+            &[
+                (IVec3::new(1, 1, 1), STONE),
+                (IVec3::new(2, 1, 1), STONE),
+                (IVec3::new(1, 2, 1), STONE),
+            ],
+        );
+        let mesh_a = mesh_slab(&slab, IVec3::new(7, -3, 42));
+        let mesh_b = mesh_slab(&slab, IVec3::new(7, -3, 42));
+        let jitter_a: Vec<u8> = mesh_a.vertices.iter().map(|v| v.jitter).collect();
+        let jitter_b: Vec<u8> = mesh_b.vertices.iter().map(|v| v.jitter).collect();
+        assert_eq!(jitter_a, jitter_b, "same geometry + same seed must match exactly");
+
+        // A body (seed always zero) meshed twice must also match, and a
+        // *different* seed (a different chunk's origin) must generally
+        // produce a different pattern -- confirming the seed actually
+        // participates, not just the local position.
+        let mesh_c = mesh_slab(&slab, IVec3::ZERO);
+        let jitter_c: Vec<u8> = mesh_c.vertices.iter().map(|v| v.jitter).collect();
+        assert_ne!(jitter_a, jitter_c, "different seeds should not collide onto the same pattern");
     }
 
     #[test]
@@ -290,7 +366,7 @@ mod tests {
             IVec3::new(2, 1, 1),
             &[(IVec3::new(0, 0, 0), STONE), (IVec3::new(1, 0, 0), STONE)],
         );
-        let mesh = mesh_slab(&slab);
+        let mesh = mesh_slab(&slab, IVec3::ZERO);
         assert_eq!(mesh.quads(), 6, "coplanar same-material faces must merge");
     }
 
@@ -300,7 +376,7 @@ mod tests {
             IVec3::new(2, 1, 1),
             &[(IVec3::new(0, 0, 0), STONE), (IVec3::new(1, 0, 0), DIRT)],
         );
-        let mesh = mesh_slab(&slab);
+        let mesh = mesh_slab(&slab, IVec3::ZERO);
         // 2 end caps + 4 long sides split in two each = 2 + 8 = 10.
         assert_eq!(mesh.quads(), 10);
     }
@@ -317,7 +393,7 @@ mod tests {
             }
         }
         let slab = slab_of(dims, &solids);
-        let mesh = mesh_slab(&slab);
+        let mesh = mesh_slab(&slab, IVec3::ZERO);
         assert_eq!(mesh.quads(), 6, "each full face merges into one quad");
         // Corner coordinates must span the whole region.
         let max = mesh.vertices.iter().map(|v| v.pos[0]).max().unwrap();
@@ -342,7 +418,7 @@ mod tests {
                 }
             }
             let slab = slab_of(dims, &solids);
-            let mesh = mesh_slab(&slab);
+            let mesh = mesh_slab(&slab, IVec3::ZERO);
 
             // Brute-force expected exposed faces.
             let mut expected: HashSet<(IVec3, u8)> = HashSet::new();
@@ -412,7 +488,7 @@ mod tests {
             }
         }
         let slab = slab_of(dims, &solids);
-        let mesh = mesh_slab(&slab);
+        let mesh = mesh_slab(&slab, IVec3::ZERO);
         assert!(!mesh.is_empty());
 
         for tri in mesh.indices.chunks_exact(3) {
@@ -445,7 +521,7 @@ mod tests {
                 (IVec3::new(0, 1, 0), STONE), // wall on top of (0,0,0)
             ],
         );
-        let mesh = mesh_slab(&slab);
+        let mesh = mesh_slab(&slab, IVec3::ZERO);
 
         // Top faces (+Y, normal id 2) of the floor at y=1 (excluding the wall
         // voxel's own top at y=2).
@@ -479,7 +555,7 @@ mod tests {
             pos: [1, 2, 3],
             ao: 3,
             normal: 0,
-            _pad: 0,
+            jitter: 0,
             material: 7,
         };
         let bytes: &[u8] = bytemuck::bytes_of(&v);

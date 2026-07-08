@@ -45,12 +45,15 @@ pub struct DrawStats {
 }
 
 /// A debris body's mesh: geometry is static (meshed once at spawn), the
-/// instance transform is rewritten every frame via `write_buffer`.
+/// instance transform (and world-space bounds, for culling) is rewritten
+/// every frame via `update_body_transform`.
 struct GpuBodyMesh {
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     index_count: u32,
     instance: wgpu::Buffer,
+    aabb_min: Vec3,
+    aabb_max: Vec3,
 }
 
 /// Identifies a debris body's GPU mesh; callers use their physics body
@@ -321,19 +324,32 @@ impl VoxelPipeline {
                 indices,
                 index_count: mesh.indices.len() as u32,
                 instance,
+                aabb_min: Vec3::ZERO,
+                aabb_max: Vec3::ZERO,
             },
         );
     }
 
-    /// Rewrite a resident body's per-frame model matrix. No-op if the body's
-    /// mesh isn't uploaded (e.g. this frame's despawn already raced ahead).
-    pub fn update_body_transform(&self, gpu: &Gpu, key: BodyMeshKey, model: Mat4) {
-        if let Some(mesh) = self.bodies.get(&key) {
+    /// Rewrite a resident body's per-frame model matrix and world-space
+    /// bounds (the latter used for frustum culling in `draw_bodies`, the
+    /// same way chunks already are). No-op if the body's mesh isn't
+    /// uploaded (e.g. this frame's despawn already raced ahead).
+    pub fn update_body_transform(
+        &mut self,
+        gpu: &Gpu,
+        key: BodyMeshKey,
+        model: Mat4,
+        aabb_min: Vec3,
+        aabb_max: Vec3,
+    ) {
+        if let Some(mesh) = self.bodies.get_mut(&key) {
             gpu.queue().write_buffer(
                 &mesh.instance,
                 0,
                 bytemuck::cast_slice(&model.to_cols_array()),
             );
+            mesh.aabb_min = aabb_min;
+            mesh.aabb_max = aabb_max;
         }
     }
 
@@ -383,21 +399,26 @@ impl VoxelPipeline {
         stats
     }
 
-    /// Draw every resident debris body (no culling — the debris budget is
-    /// small enough that per-body AABB culling isn't worth vox-render taking
-    /// a dependency on vox-physics just to receive world-space bounds).
+    /// Draw every resident debris body whose world-space bounds (as of the
+    /// last `update_body_transform` call) are inside `frustum` -- same
+    /// culling `draw_chunks` already does, now applied to debris too now
+    /// that a single bomb can scatter dozens of small bodies at once.
     /// Assumes the pipeline/bind group are already bound (call after
     /// `draw_chunks` in the same pass, or call `bind` first).
-    pub fn draw_bodies<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>) -> u32 {
-        let mut drawn = 0;
+    pub fn draw_bodies<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>, frustum: &Frustum) -> DrawStats {
+        let mut stats = DrawStats::default();
         for mesh in self.bodies.values() {
+            if !frustum.aabb_visible(mesh.aabb_min, mesh.aabb_max) {
+                stats.culled += 1;
+                continue;
+            }
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
             pass.set_vertex_buffer(1, mesh.instance.slice(..));
             pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-            drawn += 1;
+            stats.drawn += 1;
         }
-        drawn
+        stats
     }
 
     /// Bind the pipeline and its bind group (needed if drawing bodies without

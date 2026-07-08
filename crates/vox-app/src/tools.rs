@@ -1,33 +1,157 @@
-//! Player tools: place, break (with a connectivity check), and blast.
+//! Player tools, selected from a 1-9 hotbar: normal single-voxel dig,
+//! scalable-radius dig, an explosive bomb, and a long-range death laser.
+//! Placing (right-click) is independent of the active tool.
 
 use glam::{IVec3, Vec3};
 use vox_core::consts::REACH;
 use vox_core::{MaterialRegistry, voxel_center_m};
-use vox_physics::{Aabb, PhysicsWorld};
+use vox_physics::{Aabb, BodyId, PhysicsWorld};
 use vox_world::{AIR, Voxel, World, raycast};
 
-/// The selectable tools.
+/// The selectable hotbar tools. Slots 5-9 are reserved (not yet assigned to
+/// a tool); selecting one of them leaves the previously active tool in
+/// place.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Tool {
-    Place,
-    Break,
-    Blast,
+    /// Slot 1: break exactly the one voxel under the crosshair.
+    Dig,
+    /// Slot 2: carve a sphere of adjustable radius (see [`Tools::radius_m`]).
+    /// No blast impulse -- severed material just falls.
+    ScalableDig,
+    /// Slot 3: carve a sphere of adjustable radius and give the debris an
+    /// outward impulse from the blast center.
+    Bomb,
+    /// Slot 4: an effectively infinite-range beam that tunnels straight
+    /// through everything in its path in one shot -- no impulse, just an
+    /// instant, precise cut.
+    DeathLaser,
 }
 
-/// Blast radius bounds adjustable via `[`/`]`, in meters.
-const BLAST_RADIUS_MIN: f32 = 0.5;
-const BLAST_RADIUS_MAX: f32 = 4.0;
-/// Per-keypress blast radius step, in meters.
-const BLAST_RADIUS_STEP: f32 = 0.25;
-/// Padding (voxels) searched around a single broken voxel for the
-/// connectivity check — a lone support beam knocked out should drop
-/// whatever it held up.
-const BREAK_CONNECTIVITY_PAD: i32 = 2;
+/// Hotbar key (1-9) to tool mapping. Slots past the array select nothing.
+pub const HOTBAR: [(u8, Tool); 4] = [
+    (1, Tool::Dig),
+    (2, Tool::ScalableDig),
+    (3, Tool::Bomb),
+    (4, Tool::DeathLaser),
+];
 
-/// Tool state: active tool, selected build material, and blast radius.
+/// Radius bounds for [`Tool::ScalableDig`] and [`Tool::Bomb`], adjustable
+/// via `[`/`]` or the mouse wheel while one of those tools is active, in
+/// meters.
+const TOOL_RADIUS_MIN: f32 = 0.5;
+const TOOL_RADIUS_MAX: f32 = 4.0;
+/// Per-keypress / per-wheel-notch radius step, in meters.
+const TOOL_RADIUS_STEP: f32 = 0.25;
+/// Beam range for [`Tool::DeathLaser`], in meters -- deliberately far beyond
+/// any reasonable world size ("infinite reach"); [`vox_physics::laser`]
+/// clamps its own search box to the world's actual bounds, so this never
+/// costs more than the world it's cutting through.
+const DEATH_LASER_RANGE_M: f32 = 10_000.0;
+/// Beam radius for [`Tool::DeathLaser`], in meters. Not adjustable -- the
+/// laser's whole point is an instant, maximal cut, not a tunable one.
+const DEATH_LASER_RADIUS_M: f32 = 1.5;
+
+/// Result of a tool use that might carve an existing body: ids newly
+/// spawned (need a mesh uploaded -- an id with no uploaded mesh is
+/// simulated but never drawn) and ids removed (need their old mesh
+/// dropped). A carved body is always despawned and replaced, even when it
+/// splits into exactly one still-whole-looking fragment -- there's no
+/// partial update, only despawn-and-respawn. Empty on both sides when the
+/// tool hit nothing, or hit a body but removed nothing from it.
+#[derive(Default)]
+pub struct CarveOutcome {
+    pub spawned: Vec<BodyId>,
+    pub removed: Vec<BodyId>,
+}
+
+/// What a scene raycast hit: a specific static-world voxel, or an existing
+/// body plus the exact grid-local voxel hit on it (needed for an exact
+/// single-voxel dig; see [`carve_body_voxel_at`](vox_physics::carve_body_voxel_at)).
+enum SceneHit {
+    World(IVec3),
+    Body(BodyId, IVec3),
+}
+
+/// Raycast against both the static world and every live body, returning
+/// whichever is closer along with the world-space hit point. Debris bodies
+/// are typically few and small, so a linear scan per click is cheap --
+/// this only runs once per tool use, not per frame.
+fn raycast_scene(
+    world: &World,
+    phys: &PhysicsWorld,
+    eye_m: Vec3,
+    look: Vec3,
+    max_dist_m: f32,
+) -> Option<(SceneHit, Vec3)> {
+    let dir = look.normalize_or_zero();
+    if dir == Vec3::ZERO {
+        return None;
+    }
+
+    let mut best_dist = max_dist_m;
+    let mut best: Option<SceneHit> = None;
+    if let Some(hit) = raycast(world, eye_m, dir, max_dist_m) {
+        best_dist = hit.dist_m;
+        best = Some(SceneHit::World(hit.voxel));
+    }
+    for (id, body) in phys.iter() {
+        let voxel_size_m = body.half_voxel * 2.0;
+        let inv_rot = body.rot.inverse();
+        let local_origin = inv_rot * (eye_m - body.pos) - body.grid_offset;
+        let local_dir = inv_rot * dir;
+        let Some(hit) =
+            vox_physics::raycast_grid(&body.grid, local_origin, local_dir, best_dist, voxel_size_m)
+        else {
+            continue;
+        };
+        if hit.dist_m < best_dist {
+            best_dist = hit.dist_m;
+            best = Some(SceneHit::Body(id, hit.voxel));
+        }
+    }
+    // Nudge slightly past the entry point: `best_dist` lands exactly on the
+    // hit surface, which is fine for any real carve radius but not for a
+    // radius as tiny as Dig's single-voxel carve -- floating-point rounding
+    // can put a boundary-exact point a hair on the empty side of the face,
+    // missing the voxel entirely. A tenth of a millimeter is far below any
+    // real voxel scale in this engine (0.1 m at the finest) but comfortably
+    // clears float imprecision.
+    const SURFACE_NUDGE_M: f32 = 1e-4;
+    best.map(|t| (t, eye_m + dir * (best_dist + SURFACE_NUDGE_M)))
+}
+
+/// Build a [`CarveOutcome`] from one of `vox_physics::carve_body_*_at`'s
+/// results: if `id` still exists afterward, nothing was actually removed
+/// and the (untouched) body needs no mesh update at all -- the default,
+/// empty outcome. Otherwise it was despawned (replaced by 0+ fragments).
+fn body_outcome(phys: &PhysicsWorld, id: BodyId, spawned: Vec<BodyId>) -> CarveOutcome {
+    if phys.get(id).is_some() {
+        return CarveOutcome::default();
+    }
+    CarveOutcome {
+        spawned,
+        removed: vec![id],
+    }
+}
+
+/// Carve a sphere out of body `id` and report the outcome (see
+/// [`body_outcome`]).
+fn carve_body_sphere(
+    phys: &mut PhysicsWorld,
+    registry: &MaterialRegistry,
+    id: BodyId,
+    center_world_m: Vec3,
+    radius_m: f32,
+) -> CarveOutcome {
+    let spawned = vox_physics::carve_body_sphere_at(phys, registry, id, center_world_m, radius_m);
+    body_outcome(phys, id, spawned)
+}
+
+/// Tool state: active tool, selected build material, and the shared
+/// dig/bomb radius.
 pub struct Tools {
     pub tool: Tool,
-    pub blast_radius: f32,
+    pub radius_m: f32,
     /// Index into the registry (skips air).
     material_index: usize,
     material_count: usize,
@@ -36,21 +160,43 @@ pub struct Tools {
 impl Tools {
     pub fn new(registry: &MaterialRegistry) -> Self {
         Self {
-            tool: Tool::Place,
-            blast_radius: vox_core::consts::BLAST_RADIUS,
+            tool: Tool::Dig,
+            radius_m: vox_core::consts::BLAST_RADIUS,
             material_index: 1,
             material_count: registry.len(),
         }
     }
 
-    /// Shrink the blast radius by one step, clamped to [`BLAST_RADIUS_MIN`].
-    pub fn shrink_blast_radius(&mut self) {
-        self.blast_radius = (self.blast_radius - BLAST_RADIUS_STEP).max(BLAST_RADIUS_MIN);
+    /// True for tools whose affected-area radius is adjustable ([`Tool::ScalableDig`],
+    /// [`Tool::Bomb`]) -- used to decide whether the mouse wheel resizes the
+    /// tool or cycles build material.
+    pub fn has_adjustable_radius(&self) -> bool {
+        matches!(self.tool, Tool::ScalableDig | Tool::Bomb)
     }
 
-    /// Grow the blast radius by one step, clamped to [`BLAST_RADIUS_MAX`].
-    pub fn grow_blast_radius(&mut self) {
-        self.blast_radius = (self.blast_radius + BLAST_RADIUS_STEP).min(BLAST_RADIUS_MAX);
+    /// Select a hotbar slot (1-9) by key number. Slots not in [`HOTBAR`] do
+    /// nothing. Returns the newly active tool if the slot changed it.
+    pub fn select_hotbar_slot(&mut self, slot: u8) -> Option<Tool> {
+        let tool = HOTBAR.iter().find(|(s, _)| *s == slot)?.1;
+        self.tool = tool;
+        Some(tool)
+    }
+
+    /// Shrink the tool radius by one step, clamped to [`TOOL_RADIUS_MIN`].
+    pub fn shrink_radius(&mut self) {
+        self.radius_m = (self.radius_m - TOOL_RADIUS_STEP).max(TOOL_RADIUS_MIN);
+    }
+
+    /// Grow the tool radius by one step, clamped to [`TOOL_RADIUS_MAX`].
+    pub fn grow_radius(&mut self) {
+        self.radius_m = (self.radius_m + TOOL_RADIUS_STEP).min(TOOL_RADIUS_MAX);
+    }
+
+    /// Adjust the tool radius by `steps` notches (e.g. mouse wheel delta),
+    /// clamped to [`TOOL_RADIUS_MIN`]/[`TOOL_RADIUS_MAX`].
+    pub fn adjust_radius(&mut self, steps: i32) {
+        self.radius_m =
+            (self.radius_m + steps as f32 * TOOL_RADIUS_STEP).clamp(TOOL_RADIUS_MIN, TOOL_RADIUS_MAX);
     }
 
     /// Currently selected build material.
@@ -86,32 +232,42 @@ impl Tools {
         }
     }
 
-    /// Break the voxel under the crosshair. Returns its position if
-    /// something was removed, so the caller can run a connectivity check
-    /// (a lone support beam knocked out should drop whatever it held up).
-    pub fn break_voxel(&self, world: &mut World, eye_m: Vec3, look: Vec3) -> Option<IVec3> {
-        let hit = raycast(world, eye_m, look, REACH)?;
-        world.set_voxel(hit.voxel, AIR);
-        Some(hit.voxel)
-    }
-
-    /// Run the connectivity check around a just-broken voxel, detaching
-    /// anything that's now unsupported.
-    pub fn check_broken_support(
+    /// Dig: break exactly the one voxel or body-voxel under the crosshair,
+    /// then detach whatever that leaves unsupported (world target) or
+    /// whatever the body splits into (body target). See [`CarveOutcome`].
+    pub fn dig(
+        &self,
         world: &mut World,
         phys: &mut PhysicsWorld,
         registry: &MaterialRegistry,
-        broken: IVec3,
-    ) {
-        let pad = IVec3::splat(BREAK_CONNECTIVITY_PAD);
-        let region = (broken - pad, broken + pad + IVec3::ONE);
-        vox_physics::detach_unsupported(world, phys, registry, region);
+        eye_m: Vec3,
+        look: Vec3,
+    ) -> CarveOutcome {
+        let Some((hit, _)) = raycast_scene(world, phys, eye_m, look, REACH) else {
+            return CarveOutcome::default();
+        };
+        match hit {
+            SceneHit::World(voxel) => {
+                world.set_voxel(voxel, AIR);
+                CarveOutcome {
+                    spawned: vox_physics::detach_unsupported(world, phys, registry, &[voxel]),
+                    removed: Vec::new(),
+                }
+            }
+            SceneHit::Body(id, local_voxel) => {
+                let spawned = vox_physics::carve_body_voxel_at(phys, registry, id, local_voxel);
+                body_outcome(phys, id, spawned)
+            }
+        }
     }
 
-    /// Blast the crosshair target: carve a sphere, detach whatever becomes
-    /// unsupported, and give the debris a blast impulse. `power` is the
-    /// live-tunable blast strength; `seed` drives per-body spin variation —
-    /// pass a different value each call.
+    /// Blast the crosshair target: carve a jagged explosion shape (a base
+    /// crater plus outward shrapnel spikes -- see
+    /// `vox_physics::destruction::ExplosionShape` -- not a plain sphere),
+    /// detach whatever becomes unsupported, and give the debris a blast
+    /// impulse. `power` is the live-tunable blast strength; `seed` drives
+    /// both the crater's shape and per-body spin variation — pass a
+    /// different value each call. See [`CarveOutcome`].
     #[allow(
         clippy::too_many_arguments,
         reason = "plain parameter list is clearer here than a params struct"
@@ -125,20 +281,104 @@ impl Tools {
         look: Vec3,
         power: f32,
         seed: u32,
-    ) {
-        let Some(hit) = raycast(world, eye_m, look, REACH) else {
-            return;
+    ) -> CarveOutcome {
+        let Some((hit, hit_point_m)) = raycast_scene(world, phys, eye_m, look, REACH) else {
+            return CarveOutcome::default();
         };
-        let hit_point_m = eye_m + look * hit.dist_m;
-        vox_physics::blast(
-            world,
-            phys,
-            registry,
-            hit_point_m,
-            self.blast_radius,
-            power,
-            seed,
-        );
+        match hit {
+            SceneHit::World(_) => CarveOutcome {
+                spawned: vox_physics::blast(
+                    world,
+                    phys,
+                    registry,
+                    hit_point_m,
+                    self.radius_m,
+                    power,
+                    seed,
+                )
+                .spawned,
+                removed: Vec::new(),
+            },
+            SceneHit::Body(id, _) => {
+                let spawned = vox_physics::carve_body_explosion_at(
+                    phys,
+                    registry,
+                    id,
+                    hit_point_m,
+                    self.radius_m,
+                    seed,
+                );
+                let outcome = body_outcome(phys, id, spawned);
+                vox_physics::apply_blast_impulse(phys, &outcome.spawned, hit_point_m, power, seed);
+                outcome
+            }
+        }
+    }
+
+    /// Scalable dig: carve a sphere of [`Tools::radius_m`] at the crosshair
+    /// target and detach whatever becomes unsupported, with no blast
+    /// impulse -- severed material just falls, unlike [`Tools::blast`]. See
+    /// [`CarveOutcome`].
+    pub fn scalable_dig(
+        &self,
+        world: &mut World,
+        phys: &mut PhysicsWorld,
+        registry: &MaterialRegistry,
+        eye_m: Vec3,
+        look: Vec3,
+    ) -> CarveOutcome {
+        let Some((hit, hit_point_m)) = raycast_scene(world, phys, eye_m, look, REACH) else {
+            return CarveOutcome::default();
+        };
+        match hit {
+            SceneHit::World(_) => {
+                let mut carve = vox_physics::carve_sphere(world, hit_point_m, self.radius_m);
+                let removed: Vec<IVec3> = carve.removed.iter().map(|&(v, _)| v).collect();
+                let ids = vox_physics::detach_unsupported(world, phys, registry, &removed);
+                let s = world.cfg.voxel_size_m;
+                phys.wake_region(carve.region.0.as_vec3() * s, carve.region.1.as_vec3() * s);
+                carve.spawned = ids;
+                CarveOutcome {
+                    spawned: carve.spawned,
+                    removed: Vec::new(),
+                }
+            }
+            SceneHit::Body(id, _) => carve_body_sphere(phys, registry, id, hit_point_m, self.radius_m),
+        }
+    }
+
+    /// Death laser: fire an effectively infinite-range beam from the eye
+    /// along `look`, instantly tunneling through everything in its path --
+    /// the static world *and* every body in the beam's way -- and detaching
+    /// whatever becomes unsupported. No raycast gate, no impulse, just an
+    /// immediate, total cut. See [`CarveOutcome`].
+    pub fn death_laser(
+        &self,
+        world: &mut World,
+        phys: &mut PhysicsWorld,
+        registry: &MaterialRegistry,
+        eye_m: Vec3,
+        look: Vec3,
+    ) -> CarveOutcome {
+        let end_m = eye_m + look * DEATH_LASER_RANGE_M;
+        let mut outcome = CarveOutcome {
+            spawned: vox_physics::laser(world, phys, registry, eye_m, end_m, DEATH_LASER_RADIUS_M)
+                .spawned,
+            removed: Vec::new(),
+        };
+
+        // The beam also tunnels through every body already in its path --
+        // debris is small, so attempting every live body is cheap even
+        // though most will report "nothing removed".
+        let ids: Vec<BodyId> = phys.iter().map(|(id, _)| id).collect();
+        for id in ids {
+            let sub =
+                vox_physics::carve_body_capsule_at(phys, registry, id, eye_m, end_m, DEATH_LASER_RADIUS_M);
+            let sub_outcome = body_outcome(phys, id, sub);
+            outcome.removed.extend(sub_outcome.removed);
+            outcome.spawned.extend(sub_outcome.spawned);
+        }
+        outcome
     }
 
     /// Place the selected material against the hit face, unless it would
@@ -193,11 +433,15 @@ mod tests {
     /// it. Single-voxel cross-section: no corners, so a centered sphere
     /// carve clears it uniformly at every height (matching the proven
     /// geometry in `vox_physics::destruction`'s own pillar tests). The floor
-    /// is thick enough (4 m) that a generous blast severing the pillar's
-    /// base can't also blow all the way through it — otherwise the debris
+    /// is thick enough (12 m) that a generous blast severing the pillar's
+    /// base can't also blow all the way through it -- otherwise the debris
     /// would fall through the blast's own crater, which is realistic but
-    /// not what this test is checking.
-    const FLOOR_THICKNESS_VOX: i32 = 20;
+    /// not what this test is checking. Bomb's crater is a jagged
+    /// `ExplosionShape`, not a plain sphere: its shrapnel spikes reach up to
+    /// ~2.6x the nominal radius (e.g. ~7.9 m for this test's 3 m blasts), so
+    /// the floor must clear that reach with real margin, not just the
+    /// nominal radius.
+    const FLOOR_THICKNESS_VOX: i32 = 60;
     /// Pillar footprint, centered in a generously large floor so debris
     /// picking up lateral velocity from the blast (plus several rampage
     /// blasts) has real room to drift without exiting the world's bounds
@@ -233,8 +477,8 @@ mod tests {
         let reg = registry();
         let mut phys = PhysicsWorld::new();
         let mut tools = Tools::new(&reg);
-        tools.tool = Tool::Blast;
-        tools.blast_radius = 3.0;
+        tools.tool = Tool::Bomb;
+        tools.radius_m = 3.0;
 
         // Footprint is voxel x,z = PILLAR_XZ_VOX -> center at (+0.5)*s
         // meters. Aim a level, axis-aligned ray straight down +X at the
@@ -245,9 +489,17 @@ mod tests {
         let cz = px + 0.5 * s;
         let eye = Vec3::new(px - 2.0, floor_top_m + 1.0, cz);
         let look = Vec3::X;
-        tools.blast(&mut world, &mut phys, &reg, eye, look, 40.0, 1);
+        let spawned = tools.blast(&mut world, &mut phys, &reg, eye, look, 40.0, 1);
 
         assert!(phys.body_count() > 0, "the upper tower section must detach");
+        assert_eq!(
+            spawned.spawned.len(),
+            phys.body_count(),
+            "blast must report every spawned body's id back to the caller \
+             (the caller needs these to upload debris meshes -- an id that \
+             gets lost here means real, physically-simulated debris that \
+             never appears on screen)"
+        );
         for (_, body) in phys.iter() {
             assert!(body.vel.is_finite() && body.pos.is_finite());
             assert!(
@@ -276,8 +528,12 @@ mod tests {
             }
         }
 
-        // Let everything finish settling.
-        for _ in 0..600 {
+        // Let everything finish settling. Longer than it used to be: the
+        // bomb now also scatters small flying debris chips (on top of the
+        // detached structural fragments), which means more bodies bouncing
+        // off each other during the cascade -- more collisions to damp out
+        // before the scene as a whole goes quiet.
+        for _ in 0..900 {
             phys.step(&world, PHYSICS_DT);
         }
         let awake = phys.awake_count();
@@ -289,5 +545,258 @@ mod tests {
         for (_, body) in phys.iter() {
             assert!(body.pos.y > -1.0, "nothing should fall through the floor");
         }
+    }
+
+    /// Scalable dig (hotbar slot 2) through the raycast entry point: unlike
+    /// `blast`, the severed section must detach with *no* impulse -- it
+    /// starts at rest and only gravity/impacts move it from there.
+    #[test]
+    fn scalable_dig_detaches_the_tower_top_with_no_impulse() {
+        let s = 0.2;
+        let mut world = wood_tower(s, 40);
+        let reg = registry();
+        let mut phys = PhysicsWorld::new();
+        let mut tools = Tools::new(&reg);
+        tools.tool = Tool::ScalableDig;
+        tools.radius_m = 3.0;
+
+        let floor_top_m = FLOOR_THICKNESS_VOX as f32 * s;
+        let px = PILLAR_XZ_VOX as f32 * s;
+        let cz = px + 0.5 * s;
+        let eye = Vec3::new(px - 2.0, floor_top_m + 1.0, cz);
+        let spawned = tools.scalable_dig(&mut world, &mut phys, &reg, eye, Vec3::X);
+
+        assert!(phys.body_count() > 0, "the upper tower section must detach");
+        assert_eq!(spawned.spawned.len(), phys.body_count());
+        for (_, body) in phys.iter() {
+            assert_eq!(
+                body.vel,
+                Vec3::ZERO,
+                "scalable dig must not impart any impulse, unlike a bomb"
+            );
+        }
+    }
+
+    /// Death laser (hotbar slot 4) through the raycast-free entry point: an
+    /// "infinite range" beam fired at a tower far beyond normal tool reach
+    /// must still tunnel through it and detach the severed top.
+    #[test]
+    fn death_laser_reaches_far_beyond_normal_tool_range_and_detaches_debris() {
+        let s = 0.2;
+        let mut world = wood_tower(s, 40);
+        let reg = registry();
+        let mut phys = PhysicsWorld::new();
+        let tools = Tools::new(&reg);
+
+        let floor_top_m = FLOOR_THICKNESS_VOX as f32 * s;
+        let px = PILLAR_XZ_VOX as f32 * s;
+        let cz = px + 0.5 * s;
+        // Stand far outside REACH (5 m) -- a normal tool couldn't touch the
+        // tower from here at all.
+        let eye = Vec3::new(px - 50.0, floor_top_m + 1.0, cz);
+        let spawned = tools.death_laser(&mut world, &mut phys, &reg, eye, Vec3::X);
+
+        assert!(
+            phys.body_count() > 0,
+            "the laser must reach and detach the tower's upper section from far beyond REACH"
+        );
+        assert_eq!(spawned.spawned.len(), phys.body_count());
+    }
+
+    /// A free-floating debris body (as if already spawned by an earlier
+    /// blast), sitting in open air with nothing else nearby, so any tool's
+    /// world raycast can't possibly hit anything first.
+    fn floating_debris(reg: &MaterialRegistry, phys: &mut PhysicsWorld, dims: IVec3) -> BodyId {
+        let voxels = vec![Voxel(1); (dims.x * dims.y * dims.z) as usize];
+        let grid = vox_physics::VoxelGrid::new(dims, voxels);
+        let body = vox_physics::Body::from_grid(grid, reg, 0.2, Vec3::new(50.0, 50.0, 50.0))
+            .expect("solid grid must be massive");
+        phys.spawn(body)
+    }
+
+    /// The actual point of this whole feature: debris that already exists
+    /// (e.g. from an earlier blast) must itself be breakable by every tool,
+    /// not just the static world. Dig should chip exactly one voxel off,
+    /// reporting the original body as removed and a smaller replacement as
+    /// spawned.
+    #[test]
+    fn dig_hits_and_chips_an_existing_debris_body() {
+        let mut world = World::new(WorldConfig {
+            voxel_size_m: 0.2,
+            extent_m: [128.0, 128.0, 128.0],
+            ..WorldConfig::default()
+        });
+        let reg = registry();
+        let mut phys = PhysicsWorld::new();
+        let tools = Tools::new(&reg);
+        let id = floating_debris(&reg, &mut phys, IVec3::splat(6));
+        let original_count = phys.get(id).unwrap().grid.solid_count();
+
+        let pos = phys.get(id).unwrap().pos;
+        let eye = pos + Vec3::new(-3.0, 0.0, 0.0);
+        let outcome = tools.dig(&mut world, &mut phys, &reg, eye, Vec3::X);
+
+        assert_eq!(outcome.removed, vec![id], "the original body must be reported removed");
+        assert_eq!(outcome.spawned.len(), 1, "chipping one voxel must not split a 6^3 cube");
+        let remaining = phys.get(outcome.spawned[0]).unwrap().grid.solid_count();
+        assert_eq!(remaining, original_count - 1, "must have removed exactly one voxel");
+    }
+
+    /// Bomb hitting debris must despawn the original and give the resulting
+    /// fragment(s) an outward blast impulse, just like hitting the world.
+    #[test]
+    fn bomb_hits_debris_and_gives_it_an_impulse() {
+        let mut world = World::new(WorldConfig {
+            voxel_size_m: 0.2,
+            extent_m: [128.0, 128.0, 128.0],
+            ..WorldConfig::default()
+        });
+        let reg = registry();
+        let mut phys = PhysicsWorld::new();
+        let mut tools = Tools::new(&reg);
+        tools.tool = Tool::Bomb;
+        tools.radius_m = 1.0;
+        let id = floating_debris(&reg, &mut phys, IVec3::splat(10));
+
+        let pos = phys.get(id).unwrap().pos;
+        let eye = pos + Vec3::new(-3.0, 0.0, 0.0);
+        let outcome = tools.blast(&mut world, &mut phys, &reg, eye, Vec3::X, 40.0, 1);
+
+        assert_eq!(outcome.removed, vec![id]);
+        assert!(!outcome.spawned.is_empty(), "must produce at least one fragment");
+        for &fid in &outcome.spawned {
+            let f = phys.get(fid).unwrap();
+            assert!(f.vel.length() > 0.1, "bomb must impart velocity to debris fragments too");
+        }
+    }
+
+    /// Death laser must tunnel through debris in its path even when the
+    /// beam's raycast-free design means it never "aims" at anything --
+    /// every live body in range gets attempted.
+    #[test]
+    fn death_laser_tunnels_through_debris_in_its_path() {
+        let mut world = World::new(WorldConfig {
+            voxel_size_m: 0.2,
+            extent_m: [128.0, 128.0, 128.0],
+            ..WorldConfig::default()
+        });
+        let reg = registry();
+        let mut phys = PhysicsWorld::new();
+        let tools = Tools::new(&reg);
+        let id = floating_debris(&reg, &mut phys, IVec3::splat(6));
+
+        let pos = phys.get(id).unwrap().pos;
+        let eye = pos + Vec3::new(-20.0, 0.0, 0.0);
+        let outcome = tools.death_laser(&mut world, &mut phys, &reg, eye, Vec3::X);
+
+        assert!(outcome.removed.contains(&id), "the beam must reach the debris body");
+    }
+
+    fn registry_with_tree_materials() -> MaterialRegistry {
+        MaterialRegistry::from_toml_str(
+            r#"
+            [[material]]
+            name = "stone"
+            color = [0.5, 0.5, 0.5]
+            density = 2600.0
+            strength = 8.0
+            [[material]]
+            name = "wood"
+            color = [0.5, 0.4, 0.3]
+            density = 700.0
+            strength = 4.0
+            [[material]]
+            name = "leaves"
+            color = [0.2, 0.5, 0.2]
+            density = 300.0
+            strength = 1.0
+            "#,
+            "test.toml",
+        )
+        .expect("registry")
+    }
+
+    /// A real, generator-produced tree (multi-voxel-wide tapered trunk plus
+    /// branches and canopy leaves), severed across its full base
+    /// cross-section. Earlier destruction tests only covered hand-built,
+    /// single-voxel-wide columns; this is the case the user actually hit:
+    /// does a real, wide trunk detach its whole disconnected upper section
+    /// (trunk, branches, and canopy) once fully severed, given the canopy's
+    /// true size (tens of thousands of voxels at 0.1 m scale)?
+    #[test]
+    fn severing_a_real_tree_trunk_detaches_the_whole_tree() {
+        let s = 0.1;
+        let mut world = World::new(WorldConfig {
+            voxel_size_m: s,
+            extent_m: [64.0, 32.0, 64.0],
+            ..WorldConfig::default()
+        });
+        let reg = registry_with_tree_materials();
+        let mats = vox_gen::TreeMaterials::from_registry(&reg).expect("tree materials");
+
+        let ground_top_vox = (10.0 / s) as i32;
+        let (_, max) = world.bounds_voxels();
+        world.fill_box(
+            IVec3::ZERO,
+            IVec3::new(max.x, ground_top_vox, max.z),
+            Voxel(reg.id_by_name("stone").unwrap().0),
+        );
+
+        let tree = vox_gen::TreeInstance {
+            x_m: 32.0,
+            z_m: 32.0,
+            base_y_m: 10.0,
+            height_m: 8.0,
+            tree_seed: 0xC0FFEE,
+        };
+        vox_gen::stamp_tree(&mut world, &tree, mats);
+
+        // A cut layer 0.3 m above the ground: comfortably inside the trunk's
+        // tapered base radius (~0.3-0.45 m), well below any branch (branches
+        // start at 55%+ of the tree's height).
+        let cut_y = ((10.3) / s) as i32;
+        let mut cut_voxels = Vec::new();
+        for z in 0..max.z {
+            for x in 0..max.x {
+                let v = IVec3::new(x, cut_y, z);
+                if world.get_voxel(v) == mats.wood {
+                    cut_voxels.push(v);
+                }
+            }
+        }
+        assert!(
+            cut_voxels.len() > 1,
+            "expected a multi-voxel-wide trunk cross-section at the cut \
+             layer, found {}",
+            cut_voxels.len()
+        );
+
+        // Sever the whole cross-section at once (one `check_broken_support`
+        // call per voxel would be a faithful frame-by-frame replay of a
+        // player clicking through the ring, but is redundant here: every
+        // intermediate call re-floods the still-fully-connected tree from
+        // scratch only to conclude "still anchored", which is correct but
+        // needlessly expensive to repeat dozens of times in one test -- the
+        // per-click cost itself is exercised by the single-voxel break tests
+        // elsewhere. What this test needs to prove is that severing a real,
+        // multi-voxel-wide, generator-produced tree detaches correctly at
+        // all, given its true (large) canopy size.
+        for &v in &cut_voxels {
+            world.set_voxel(v, AIR);
+        }
+        let mut phys = PhysicsWorld::new();
+        vox_physics::detach_unsupported(&mut world, &mut phys, &reg, &cut_voxels);
+
+        assert!(
+            phys.body_count() > 0,
+            "the fully-severed tree above the cut must detach as debris, \
+             not vanish or stay floating in place"
+        );
+        let total_debris_voxels: usize = phys.iter().map(|(_, b)| b.grid.solid_count()).sum();
+        assert!(
+            total_debris_voxels > 50,
+            "detached debris ({total_debris_voxels} voxels) looks far too \
+             small to be the whole severed tree (trunk + branches + canopy)"
+        );
     }
 }

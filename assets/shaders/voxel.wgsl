@@ -1,6 +1,7 @@
 // Opaque voxel pipeline: chunks and debris bodies share this shader.
-// Shading: material palette color + per-vertex jitter hash, directional sun,
-// hemisphere ambient, baked vertex AO, distance fog.
+// Shading: material palette color + per-vertex jitter hash, directional sun
+// with a soft (half-Lambert) terminator, a faint opposite-direction fill
+// light, a two-tone sky/ground ambient, baked vertex AO, distance fog.
 
 struct Camera {
     view_proj: mat4x4f,
@@ -21,18 +22,31 @@ struct Inst {
 
 struct VIn {
     @location(0) pos_ao: vec4<u32>,   // x, y, z corner (voxel units), ao 0..3
-    @location(1) norm_mat: vec4<u32>, // normal id, pad, material lo, material hi
+    @location(1) norm_mat: vec4<u32>, // normal id, jitter 0..255, material lo, material hi
 };
 
 struct VOut {
     @builtin(position) clip: vec4f,
     @location(0) color: vec3f,
-    @location(1) @interpolate(flat) normal_id: u32,
+    @location(1) world_normal: vec3f,
     @location(2) ao: f32,
     @location(3) world_pos: vec3f,
 };
 
 const SKY_COLOR = vec3f(0.45, 0.66, 0.90);
+// Ambient is two-tone (sky-facing vs. ground-facing) rather than a flat
+// scalar: a cool tint from above, a warmer/darker one from below, mixed by
+// how much the surface faces up vs. down. Reads far less "flat gray" in
+// shadow than a single ambient number ever can.
+const AMBIENT_SKY = vec3f(0.50, 0.58, 0.70);
+const AMBIENT_GROUND = vec3f(0.30, 0.27, 0.24);
+const AMBIENT_STRENGTH = 0.55;
+const SUN_STRENGTH = 0.85;
+// Faint light from the direction opposite the sun -- like real bounce
+// light off the sky and surroundings -- so a face angled away from the
+// sun still reads as lit, not flat black. Small on purpose: it's a floor,
+// not a second sun.
+const FILL_STRENGTH = 0.12;
 
 // Face normal from id (0..6 = +X, -X, +Y, -Y, +Z, -Z). Arithmetic instead of
 // a const-array lookup: naga rejects dynamic indexing of module constants.
@@ -58,14 +72,26 @@ fn vs(v: VIn, inst: Inst) -> VOut {
 
     let mat_id = v.norm_mat.z | (v.norm_mat.w << 8u);
     let base = palette[mat_id];
-    // Deterministic per-corner jitter; shared corners agree across quads.
-    let cell = floor(wp / cam.fog.z + vec3f(0.5));
-    let h = fract(sin(dot(cell, vec3f(12.9898, 78.233, 37.719))) * 43758.547);
+    // Jitter is baked into the mesh once at build time (see vox-mesh's
+    // `jitter_hash`), not recomputed here from world position: hashing a
+    // *moving* vertex's world position dynamically made the jitter shift
+    // continuously as a debris body translated/rotated, which read as
+    // flicker on its surface -- chunks never move, so they never showed it,
+    // matching the exact "only on detached bodies" symptom this fixed.
+    let h = f32(v.norm_mat.y) / 255.0;
 
     var out: VOut;
     out.clip = cam.view_proj * vec4f(wp, 1.0);
     out.color = base.rgb * (1.0 + (h - 0.5) * 2.0 * base.a);
-    out.normal_id = v.norm_mat.x;
+    // Chunks never rotate, so their local and world axes coincide -- but a
+    // debris body's instance matrix carries real rotation (it tumbles), and
+    // lighting a tumbling body against its *local* (un-rotated) face normal
+    // makes the lit/shadowed faces stay fixed to the body instead of the
+    // world's actual sun direction: it looks like the light is glued to the
+    // object and spinning with it. Rotating the normal by the model matrix
+    // here (translation-free, via w=0) fixes that for both cases uniformly.
+    let local_n = face_normal(v.norm_mat.x);
+    out.world_normal = normalize((model * vec4f(local_n, 0.0)).xyz);
     out.ao = f32(v.pos_ao.w) / 3.0;
     out.world_pos = wp;
     return out;
@@ -73,11 +99,21 @@ fn vs(v: VIn, inst: Inst) -> VOut {
 
 @fragment
 fn fs(in: VOut) -> @location(0) vec4f {
-    let n = face_normal(in.normal_id);
-    let sun = max(dot(n, -cam.sun_dir.xyz), 0.0);
-    let hemi = 0.5 + 0.5 * n.y;
-    let ao = 0.35 + 0.65 * in.ao;
-    var c = in.color * (0.28 * hemi + 0.75 * sun) * ao;
+    let n = normalize(in.world_normal);
+    let ndotl = dot(n, -cam.sun_dir.xyz);
+    // Half-Lambert wrap instead of a plain clamped dot product: a hard
+    // `max(ndotl, 0)` goes fully dark the instant a face tips past 90
+    // degrees from the sun, which is exactly the flat, artificial "baked"
+    // look on structure sides this pass is fixing. Wrapping softens that
+    // terminator into a gradient.
+    let sun = pow(clamp(ndotl * 0.5 + 0.5, 0.0, 1.0), 1.5) * SUN_STRENGTH;
+    let fill = max(-ndotl, 0.0) * FILL_STRENGTH;
+
+    let hemi_t = clamp(0.5 + 0.5 * n.y, 0.0, 1.0);
+    let ambient = mix(AMBIENT_GROUND, AMBIENT_SKY, hemi_t) * AMBIENT_STRENGTH;
+
+    let ao = 0.45 + 0.55 * in.ao;
+    var c = in.color * (ambient + vec3f(sun + fill)) * ao;
 
     let dist = length(in.world_pos - cam.cam_pos.xyz);
     let f = clamp((dist - cam.fog.x) / (cam.fog.y - cam.fog.x), 0.0, 1.0);

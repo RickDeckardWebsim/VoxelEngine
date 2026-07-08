@@ -43,6 +43,16 @@ pub struct Contact {
     pub acc_n: f32,
     pub acc_t1: f32,
     pub acc_t2: f32,
+    /// How fast `body` (relative to `body_b`, or the static world) was
+    /// closing on this contact *before* this substep resolved it -- i.e.
+    /// gravity/prior velocity only, no constraint impulse yet. A body
+    /// resting quietly has an accumulated normal impulse (`acc_n`) that
+    /// looks identical frame to frame to one that just landed hard (both
+    /// simply "hold the body up against gravity"), but its approach speed
+    /// is near zero every single step, where a genuine impact's is not.
+    /// This is what separates a real collision from steady load-bearing
+    /// contact for impact-fracture purposes (see `PhysicsWorld::substep`).
+    pub approach_speed: f32,
 }
 
 /// Face directions with ids matching the mesher convention.
@@ -163,6 +173,12 @@ fn push_world_contact(
     inv_iw: &Mat3,
 ) {
     let (t1, t2) = tangent_basis(n);
+    // Pre-solve velocity at this point (gravity for this substep already
+    // integrated, no contact impulse yet): its component into the surface
+    // (opposite `n`, which points away from it) is how fast the body was
+    // actually closing on the world at the moment this contact was found.
+    let point_vel = body.vel + body.omega.cross(r_arm);
+    let approach_speed = (-point_vel).dot(n);
     out.push(Contact {
         body: slot,
         body_b: None,
@@ -179,6 +195,7 @@ fn push_world_contact(
         acc_n: 0.0,
         acc_t1: 0.0,
         acc_t2: 0.0,
+        approach_speed,
     })
 }
 
@@ -267,8 +284,12 @@ pub fn pair_contacts(
 
         let va = sampler.vel + sampler.omega.cross(r_arm);
         let vb = target.vel + target.omega.cross(r_arm_b);
-        result.max_rel_speed = result.max_rel_speed.max((va - vb).dot(n).abs());
+        let rel = va - vb;
+        result.max_rel_speed = result.max_rel_speed.max(rel.dot(n).abs());
         result.contact_count += 1;
+        // Same sign convention as `push_world_contact`: positive means
+        // `sampler` is closing on `target` along this contact's normal.
+        let approach_speed = (-rel).dot(n);
 
         let b_terms = if target_static {
             None
@@ -296,6 +317,7 @@ pub fn pair_contacts(
             acc_n: 0.0,
             acc_t1: 0.0,
             acc_t2: 0.0,
+            approach_speed,
         });
     }
     result

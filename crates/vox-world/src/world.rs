@@ -13,6 +13,43 @@ use vox_core::{WorldConfig, chunk_origin};
 
 use crate::chunk::{AIR, Chunk, Voxel};
 
+/// A chunk-caching solidity lookup: repeated queries into the *same* chunk
+/// skip the hash-map lookup after the first. Build once per traversal (e.g.
+/// once per flood-fill), not once per query -- a 6-connected walk's
+/// neighbors are almost always in the chunk just queried, so this turns a
+/// hash-map lookup per step into (amortized) an array bounds check per step.
+pub struct SolidLookup<'w> {
+    world: &'w World,
+    cached: Option<(IVec3, Option<&'w Chunk>)>,
+}
+
+impl<'w> SolidLookup<'w> {
+    pub fn new(world: &'w World) -> Self {
+        Self {
+            world,
+            cached: None,
+        }
+    }
+
+    /// True when the voxel at `v` is solid (non-air). Same semantics as
+    /// [`World::solid`].
+    pub fn solid(&mut self, v: IVec3) -> bool {
+        if !self.world.in_bounds(v) {
+            return false;
+        }
+        let key = chunk_of(v);
+        let chunk = match self.cached {
+            Some((k, c)) if k == key => c,
+            _ => {
+                let c = self.world.chunk_at(key);
+                self.cached = Some((key, c));
+                c
+            }
+        };
+        chunk.is_some_and(|c| c.get(local_of(v)) != AIR)
+    }
+}
+
 /// A half-open voxel-space box `[min, max)` touched by an edit.
 pub type DirtyRegion = (IVec3, IVec3);
 
@@ -108,27 +145,81 @@ impl World {
 
     /// Fill the half-open voxel box `[min, max)` with `v`, clipped to bounds.
     pub fn fill_box(&mut self, min: IVec3, max: IVec3, v: Voxel) {
+        self.edit_box(min, max, |_, cur| (cur != v).then_some(v));
+    }
+
+    /// Visit every voxel in the half-open box `[min, max)`, clipped to world
+    /// bounds, resolving each *chunk* the box touches exactly once instead of
+    /// once per voxel — [`get_voxel`](Self::get_voxel)/[`set_voxel`](Self::set_voxel)
+    /// each pay a hash-map lookup per call, which dominates the cost of any
+    /// edit spanning more than a handful of voxels (a blast or beam crossing
+    /// real terrain touches tens of thousands). `edit(pos, current)` is
+    /// called for every voxel in the box, including ones in absent (all-air)
+    /// chunks; returning `Some(new)` writes it, `None` leaves it unchanged.
+    /// A chunk is only allocated if `edit` actually asks to change something
+    /// in it.
+    pub fn edit_box(
+        &mut self,
+        min: IVec3,
+        max: IVec3,
+        mut edit: impl FnMut(IVec3, Voxel) -> Option<Voxel>,
+    ) {
         let (bmin, bmax) = self.bounds_voxels;
-        let min_c = min.max(bmin);
-        let max_c = max.min(bmax);
-        if min_c.cmpge(max_c).any() {
+        let min = min.max(bmin);
+        let max = max.min(bmax);
+        if min.cmpge(max).any() {
             return;
         }
-        for y in min_c.y..max_c.y {
-            for z in min_c.z..max_c.z {
-                for x in min_c.x..max_c.x {
-                    let pos = IVec3::new(x, y, z);
-                    let key = chunk_of(pos);
-                    let local = local_of(pos);
+
+        let ckey_min = chunk_of(min);
+        let ckey_max = chunk_of(max - IVec3::ONE); // inclusive
+        for cz in ckey_min.z..=ckey_max.z {
+            for cy in ckey_min.y..=ckey_max.y {
+                for cx in ckey_min.x..=ckey_max.x {
+                    let key = IVec3::new(cx, cy, cz);
+                    let origin = chunk_origin(key);
+                    let local_min = (min - origin).max(IVec3::ZERO);
+                    let local_max = (max - origin).min(IVec3::splat(CHUNK));
+                    if local_min.cmpge(local_max).any() {
+                        continue;
+                    }
+
+                    // Read pass against the chunk as it currently exists (one
+                    // hash-map lookup total for this chunk, not per voxel).
+                    // Absent chunks read as all-air without allocating.
+                    let mut changes: Vec<(UVec3, Voxel)> = Vec::new();
+                    {
+                        let existing = self.chunks.get(&key);
+                        for z in local_min.z..local_max.z {
+                            for y in local_min.y..local_max.y {
+                                for x in local_min.x..local_max.x {
+                                    let local = UVec3::new(x as u32, y as u32, z as u32);
+                                    let cur = existing.map_or(AIR, |c| c.get(local));
+                                    let world_pos = origin + IVec3::new(x, y, z);
+                                    if let Some(new_v) = edit(world_pos, cur)
+                                        && new_v != cur
+                                    {
+                                        changes.push((local, new_v));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if changes.is_empty() {
+                        continue;
+                    }
+
                     let chunk = self.chunks.entry(key).or_default();
-                    if chunk.get(local) != v {
+                    for &(local, v) in &changes {
                         chunk.set(local, v);
+                    }
+                    for (local, _) in changes {
                         self.mark_dirty_with_neighbors(key, local);
                     }
                 }
             }
         }
-        self.dirty_regions.push((min_c, max_c));
+        self.dirty_regions.push((min, max));
     }
 
     /// Insert a whole generated chunk, replacing any existing one. Dirties the

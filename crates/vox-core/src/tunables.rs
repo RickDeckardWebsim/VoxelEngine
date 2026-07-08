@@ -23,6 +23,15 @@ pub struct Tunables {
     pub blast_power: f32,
     /// Noclip/fly speed in m/s.
     pub fly_speed: f32,
+    /// Impact speed (m/s) a strength-1.0 material can just barely survive
+    /// before an impact fractures it; a material's actual threshold is this
+    /// *multiplied* by its own `strength` -- the same "higher survives more"
+    /// convention every other destruction tool uses (see
+    /// `MaterialDef::strength`'s doc comment). Higher `fracture_sensitivity`
+    /// raises every material's threshold uniformly (tougher overall, less
+    /// sensitive to impacts); it doesn't change materials' *relative*
+    /// toughness to each other, which comes entirely from `strength`.
+    pub fracture_sensitivity: f32,
 }
 
 impl Default for Tunables {
@@ -34,6 +43,11 @@ impl Default for Tunables {
             sleep_ang: consts::SLEEP_ANG,
             blast_power: 40.0,
             fly_speed: 12.0,
+            // With the core material set (leaves 0.5, wood 4.0, stone 8.0),
+            // this gives fracture thresholds of 0.5 / 4.0 / 8.0 m/s: leaves
+            // give way at the slightest bump, wood needs a real fall or
+            // throw, stone needs a genuinely hard impact.
+            fracture_sensitivity: 1.0,
         }
     }
 }

@@ -35,6 +35,7 @@ fn stats_window(ctx: &Context, state: &OverlayState<'_>) {
                 state.chunks_drawn, state.chunks_culled
             ));
             ui.label(format!("remesh queue: {}", state.mesh_queue));
+            ui.label(format!("body mesh in-flight: {}", state.body_mesh_in_flight));
             ui.label(format!(
                 "bodies awake/total: {}/{}",
                 state.bodies_awake, state.bodies_total
@@ -87,11 +88,16 @@ fn tuning_window(ctx: &Context, state: &mut OverlayState<'_>) {
                     .text("sleep_ang (rad/s)")
                     .logarithmic(true),
             );
+            ui.add(
+                Slider::new(&mut state.tunables.fracture_sensitivity, 0.2..=10.0)
+                    .text("fracture_sensitivity")
+                    .logarithmic(true),
+            );
             ui.separator();
 
-            ui.label("Blast:");
+            ui.label("Bomb power / dig-and-bomb radius:");
             ui.add(Slider::new(&mut state.tunables.blast_power, 1.0..=200.0).text("power"));
-            ui.add(Slider::new(state.blast_radius, 0.5..=4.0).text("radius (m)"));
+            ui.add(Slider::new(state.tool_radius, 0.5..=4.0).text("radius (m)"));
             ui.separator();
 
             ui.label("Movement:");

@@ -37,5 +37,10 @@ pub const REACH: f32 = 5.0;
 pub const BLAST_RADIUS: f32 = 1.5;
 /// Detached components smaller than this many voxels are discarded as debris.
 pub const DEBRIS_MIN_VOXELS: usize = 4;
-/// Components larger than this many voxels stay in-world instead of becoming rigid bodies.
-pub const MAX_BODY_VOXELS: usize = 65_536;
+/// Components larger than this many voxels stay in-world instead of becoming
+/// rigid bodies. Must comfortably exceed a fully generated tree's
+/// disconnected canopy (crown + several branch canopies, each up to a ~2.2 m
+/// ellipsoid) severed near its base -- at 0.1 m voxels that can reach ~150k-
+/// 200k voxels, so a cap too close to that (65_536 undershoots it) makes
+/// severing a tree misfire unpredictably depending on its randomized size.
+pub const MAX_BODY_VOXELS: usize = 300_000;
