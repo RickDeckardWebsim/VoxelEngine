@@ -24,7 +24,7 @@ const FLUID_TICK_BUDGET: usize = 4096;
 
 /// How far sideways a blocked cell searches for a reachable drop (an open
 /// cell with air beneath it) before giving up and settling. Larger values
-/// flatten mounds over a wider area per wake, at O(4 * horizon) extra
+/// flatten mounds over a wider area per wake, at O(8 * horizon) extra
 /// lookups per stuck-but-active cell per tick. Purely a grid count -- no
 /// meters involved, so scale invariance is preserved.
 const FLOW_HORIZON: i32 = 8;
@@ -242,8 +242,9 @@ fn step_cell(
         }
     }
 
-    // Flow: no immediate fall exists, so search each horizontal direction
-    // (randomized order) for a reachable drop -- an open run of same-height
+    // Flow: no immediate fall exists, so search all eight horizontal
+    // directions -- the four axes, then the four diagonals, each group in
+    // randomized order -- for a reachable drop -- an open run of same-height
     // cells ending in one with air beneath -- and take one step toward the
     // nearest. This is what keeps a mound from freezing into a stable
     // stepped pyramid: its surface cells can walk over the water below them
@@ -292,13 +293,24 @@ fn step_cell(
     None
 }
 
-/// The four horizontal step directions in a randomized order: `coin` picks
-/// the sign within each axis, `coin2` picks which axis is tried first --
-/// same de-biasing role the coins already play in the fall/spread rules.
-fn flow_dirs(coin: bool, coin2: bool) -> [IVec3; 4] {
+/// The eight horizontal step directions: the four axis dirs first (shorter
+/// true distance), then the four diagonals. `coin` picks the sign order
+/// within each group, `coin2` picks which axis/diagonal pair leads -- same
+/// de-biasing role the coins already play in the fall/spread rules.
+fn flow_dirs(coin: bool, coin2: bool) -> [IVec3; 8] {
     let (x1, x2) = if coin { (IVec3::X, IVec3::NEG_X) } else { (IVec3::NEG_X, IVec3::X) };
     let (z1, z2) = if coin { (IVec3::Z, IVec3::NEG_Z) } else { (IVec3::NEG_Z, IVec3::Z) };
-    if coin2 { [x1, x2, z1, z2] } else { [z1, z2, x1, x2] }
+    let (d1, d2) = if coin {
+        (IVec3::new(1, 0, 1), IVec3::new(-1, 0, -1))
+    } else {
+        (IVec3::new(-1, 0, -1), IVec3::new(1, 0, 1))
+    };
+    let (d3, d4) = if coin {
+        (IVec3::new(1, 0, -1), IVec3::new(-1, 0, 1))
+    } else {
+        (IVec3::new(-1, 0, 1), IVec3::new(1, 0, -1))
+    };
+    if coin2 { [x1, x2, z1, z2, d1, d2, d3, d4] } else { [z1, z2, x1, x2, d3, d4, d1, d2] }
 }
 
 #[cfg(test)]
@@ -675,6 +687,23 @@ mod tests {
         let b = run(1.0);
         assert!(!a.is_empty(), "the single cell must still exist somewhere after 40 ticks");
         assert_eq!(a, b, "grid-space behavior must not depend on voxel_size_m: {a:?} vs {b:?}");
+    }
+
+    #[test]
+    fn flow_finds_a_drop_reachable_only_diagonally() {
+        // Water at `pos` rests on water. The four axis neighbors are walled
+        // off; the only escape is the diagonal (+1, 0, +1), which has air
+        // beneath it. The old 4-direction scan settles here forever.
+        let pos = IVec3::new(8, 6, 8);
+        let open = [IVec3::new(9, 6, 9), IVec3::new(9, 5, 9)]; // diag + its drop
+        let mut is_open = |p: IVec3| open.contains(&p);
+        let mut is_supported = |_: IVec3| true;
+        let dest = step_cell(pos, &mut is_open, &mut is_supported, false, false, false);
+        assert_eq!(
+            dest,
+            Some(IVec3::new(9, 6, 9)),
+            "the scan must step toward a diagonal-only drop"
+        );
     }
 
     fn count_water(world: &World) -> usize {
