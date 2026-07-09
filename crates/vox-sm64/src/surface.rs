@@ -116,13 +116,16 @@ pub fn voxel_surfaces_near(world: &World, center_m: Vec3, radius_m: f32, units_p
 
 /// The 6 face directions: (normal axis, normal sign).
 /// Axis: 0=X, 1=Y, 2=Z. Sign: +1 or -1.
-// Floor + ceiling only for now. Wall faces dominate the surface count
-// at 0.1m voxels (~80% of exposed faces). Mario can walk on floors
-// without wall collision — we'll add walls back once the surface count
-// is manageable with better merging or a spatial grid.
-const FACES: [(u32, i32); 2] = [
+/// All 6 faces enabled — Mario collides with walls, floors, and ceilings.
+/// The #54 slice-skip optimization keeps sparse chunks fast even with
+/// 3x more face directions to scan.
+const FACES: [(u32, i32); 6] = [
     (1, 1),  // +Y (top/floor)
     (1, -1), // -Y (bottom/ceiling)
+    (0, 1),  // +X (wall)
+    (0, -1), // -X (wall)
+    (2, 1),  // +Z (wall)
+    (2, -1), // -Z (wall)
 ];
 
 /// Generate greedily-merged collision surfaces for all 6 face directions
@@ -454,15 +457,15 @@ mod tests {
     }
 
     #[test]
-    fn single_voxel_produces_2_faces_4_triangles() {
+    fn single_voxel_produces_6_faces_12_triangles() {
         let world = test_world();
         let surfaces = voxel_surfaces_near(&world, Vec3::new(5.5, 5.5, 5.5), 10.0, 30.0);
-        // Floor-only: top + bottom = 2 faces × 2 tris = 4
-        assert_eq!(surfaces.len(), 4);
+        // All 6 faces × 2 tris = 12
+        assert_eq!(surfaces.len(), 12);
     }
 
     #[test]
-    fn flat_3x3_merges_to_4_triangles() {
+    fn flat_3x3_merges_to_12_triangles() {
         let mut world = World::new(WorldConfig {
             voxel_size_m: 1.0,
             extent_m: [32.0, 32.0, 32.0],
@@ -474,12 +477,12 @@ mod tests {
             }
         }
         let surfaces = voxel_surfaces_near(&world, Vec3::new(5.0, 5.5, 5.0), 10.0, 30.0);
-        // Floor-only: top 3×3 merged = 2 tris, bottom 3×3 merged = 2 tris = 4
-        assert_eq!(surfaces.len(), 4);
+        // Top 3×3 merged = 2, bottom 3×3 merged = 2, 4 walls 3×1 merged = 8 = 12 total
+        assert_eq!(surfaces.len(), 12);
     }
 
     #[test]
-    fn buried_voxel_produces_only_outer_floor() {
+    fn buried_3x3x3_produces_12_triangles() {
         let mut world = World::new(WorldConfig {
             voxel_size_m: 1.0,
             extent_m: [32.0, 32.0, 32.0],
@@ -493,8 +496,8 @@ mod tests {
             }
         }
         let surfaces = voxel_surfaces_near(&world, Vec3::new(5.0, 5.0, 5.0), 10.0, 30.0);
-        // Floor-only: top 3×3 = 2 tris, bottom 3×3 = 2 tris = 4 total
-        assert_eq!(surfaces.len(), 4);
+        // All 6 faces 3×3 merged = 2 tris × 6 = 12 total
+        assert_eq!(surfaces.len(), 12);
     }
 
     #[test]

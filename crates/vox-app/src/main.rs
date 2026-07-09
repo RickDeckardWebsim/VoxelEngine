@@ -5,6 +5,7 @@ mod body_mesh;
 mod particles;
 mod player;
 mod mario;
+mod audio;
 mod remesh;
 mod tools;
 
@@ -707,6 +708,35 @@ impl VoxApp {
         }
     }
 
+    /// Carve a crater where Mario's ground pound landed, detach any
+    /// material left unsupported, spawn it as debris, and give the
+    /// fragments an outward blast impulse — the same pipeline a bomb uses,
+    /// but centered on Mario's impact point with a fixed crater radius.
+    /// The wake + remesh pass later in the frame picks up the dirty region
+    /// automatically (same as `Tools::blast`).
+    fn apply_ground_pound(&mut self, impact_m: Vec3) {
+        const CRATER_RADIUS_M: f32 = 1.5;
+        const POUND_POWER: f32 = 12.0;
+        let seed = self.blast_seed;
+        self.blast_seed = self.blast_seed.wrapping_add(1);
+        let result = vox_physics::blast(
+            &mut self.world,
+            &mut self.phys,
+            &self.registry,
+            impact_m,
+            CRATER_RADIUS_M,
+            POUND_POWER,
+            seed,
+        );
+        // Upload meshes for every debris fragment the blast spawned, so
+        // they're visible immediately (mirrors `apply_tools`'s post-blast
+        // handling for a world-only hit, where `removed` is empty).
+        for id in result.spawned {
+            self.upload_debris_mesh(id);
+        }
+        tracing::info!(?impact_m, radius = CRATER_RADIUS_M, "ground pound crater carved");
+    }
+
     /// The palette color of `v`, for destruction-feedback particles; a
     /// neutral gray when the material is unknown or air.
     fn material_color(&self, v: Voxel) -> [f32; 3] {
@@ -982,6 +1012,11 @@ impl App for VoxApp {
                 .as_mut()
                 .map(|m| m.tick(&self.world, input, timing.dt_frame))
                 .unwrap_or(Vec3::ZERO);
+            // A ground pound may have landed this frame — carve a crater
+            // at the impact point and detach/spawn debris like a blast.
+            if let Some(impact_m) = self.mario_mode.as_mut().unwrap().pending_ground_pound() {
+                self.apply_ground_pound(impact_m);
+            }
         } else {
             // FPS mode: existing player controller
             if self.grabbed {
@@ -1013,6 +1048,42 @@ impl App for VoxApp {
         self.apply_impact_fracture(impacts);
         self.enforce_debris_budget();
         self.expire_clutter(timing.physics_steps as f32 * vox_core::consts::PHYSICS_DT);
+        // Feed nearby debris bodies to Mario as moving collision surfaces.
+        // Must run after the physics step (fresh transforms) and after
+        // debris eviction/lifetime expiry (so we don't register surfaces
+        // for bodies that are already gone this frame).
+        if mario_active {
+            let mario_pos = self.mario_mode.as_ref().unwrap().mario_pos_m();
+            let radius = vox_sm64::SURFACE_RADIUS_M + 2.0;
+            let mut nearby: Vec<(u64, Vec3, glam::Quat, Vec3, Vec3)> = Vec::new();
+            for (_id, body) in self.phys.iter() {
+                let voxel_size = body.half_voxel * 2.0;
+                let grid_min = body.grid_offset;
+                let grid_max = body.grid_offset + body.grid.dims.as_vec3() * voxel_size;
+                // Cheap world-AABB vs Mario distance pre-filter.
+                let wmin = body.pos + grid_min.min(grid_max);
+                let wmax = body.pos + grid_max.max(grid_min);
+                let d = Vec3::new(
+                    (mario_pos.x - wmin.x).max(0.0).max(wmax.x - mario_pos.x),
+                    (mario_pos.y - wmin.y).max(0.0).max(wmax.y - mario_pos.y),
+                    (mario_pos.z - wmin.z).max(0.0).max(wmax.z - mario_pos.z),
+                );
+                if d.length_squared() > radius * radius {
+                    continue;
+                }
+                // Stable key: hash the BodyId (slot + generation).
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut h = DefaultHasher::new();
+                _id.hash(&mut h);
+                let key = h.finish();
+                nearby.push((key, body.pos, body.rot, grid_min, grid_max));
+            }
+            self.mario_mode
+                .as_mut()
+                .unwrap()
+                .update_debris(nearby.into_iter());
+        }
 
         let fluid_timing = self.fluid_clock.advance(timing.dt_frame);
         for _ in 0..fluid_timing.physics_steps {

@@ -33,6 +33,10 @@ pub mod ffi;
 mod surface;
 
 pub use surface::{voxel_surfaces_near, SurfaceProvider, SURFACE_RADIUS_M};
+pub use ffi::{
+    ACT_FLAG_AIR, ACT_FLAG_ATTACKING, ACT_GROUND_POUND, ACT_GROUND_POUND_LAND,
+    ACT_TRIPLE_JUMP,
+};
 
 use ffi::*;
 
@@ -247,13 +251,18 @@ impl Mario {
             gfx_adapter_set_interp_alpha(alpha);
             sm64_mario_render_geometry(self.id, &mut geo_buffers);
         }
-        self.geometry.num_triangles = geo_buffers.numTrianglesUsed as usize;
-        self.geometry.version = self.geometry.version.wrapping_add(1);
     }
 
     /// Teleport Mario to a position (in SM64 units).
     pub fn set_position(&mut self, x: f32, y: f32, z: f32) {
         unsafe { sm64_set_mario_position(self.id, x, y, z) };
+    }
+
+    /// Directly set Mario's velocity (in SM64 units/sec). Useful for
+    /// applying external impulses (e.g. a ground-pound launch) without
+    /// going through the normal input/action system.
+    pub fn set_velocity(&mut self, x: f32, y: f32, z: f32) {
+        unsafe { sm64_set_mario_velocity(self.id, x, y, z) };
     }
 }
 
@@ -371,5 +380,206 @@ impl From<&mut MarioGeometry> for SM64MarioGeometryBuffers {
             uv: geo.uvs.as_mut_ptr() as *mut f32,
             numTrianglesUsed: (geo.positions.len() / 3) as u16,
         }
+    }
+}
+
+// ── Surface objects (dynamic collision) ───────────────────────────────
+
+/// SM64 surface type for a default solid surface (matches surface.rs).
+const SURFACE_DEFAULT: i16 = 0x0000;
+/// Terrain type: grass (affects footsteps, not collision).
+const SURFACE_TERRAIN_GRASS: u16 = 0x0000;
+
+/// Owned handle to a libsm64 *surface object*: a set of triangles that
+/// can move and rotate each frame. Mario collides with these exactly
+/// like static terrain — he can stand on them, wall-slide, and ride
+/// moving platforms (libsm64 tracks the platform under Mario and
+/// carries him with it via `surfaces_object_get_transform_ptr`).
+///
+/// The triangles are stored in **local** coordinates and baked into
+/// world space each call to [`SurfaceObject::move_to`] using the
+/// supplied transform (libsm64's `mtxf_rotate_zxy_and_translate`).
+/// Drop deletes the object from libsm64 — no leaks.
+pub struct SurfaceObject {
+    id: u32,
+    /// Owned local surfaces. libsm64 copies these on create, but we
+    /// keep them so the `*mut SM64Surface` we hand it stays valid in
+    /// case a future libsm64 build stops copying. The pointer is only
+    /// read inside `sm64_surface_object_create`.
+    _surfaces: Vec<SM64Surface>,
+}
+
+impl SurfaceObject {
+    /// Create a surface object from local-space triangles + an initial
+    /// transform. The surfaces are copied by libsm64 internally
+    /// (`surfaces_load_object` does a `memcpy`), so the slice may be
+    /// dropped after this call — but this handle keeps its own copy.
+    ///
+    /// `transform.position` is in **SM64 units** (meters ×
+    /// [`SM64_UNITS_PER_METER`]); `transform.eulerRotation` is in
+    /// **degrees** (pitch, yaw, roll).
+    pub fn create(
+        surfaces: &[SM64Surface],
+        transform: SM64ObjectTransform,
+    ) -> Result<Self, Sm64Error> {
+        let owned = surfaces.to_vec();
+        let obj = SM64SurfaceObject {
+            transform,
+            surfaceCount: owned.len() as u32,
+            surfaces: owned.as_ptr() as *mut SM64Surface,
+        };
+        // SAFETY: libsm64 is initialized (caller holds Sm64); `obj`
+        // points at a valid SM64SurfaceObject whose `surfaces` pointer
+        // references `owned`, alive for this entire call.
+        let id = unsafe { sm64_surface_object_create(&obj) };
+        tracing::debug!(surface_object_id = id, count = owned.len(), "surface object created");
+        Ok(Self { id, _surfaces: owned })
+    }
+
+    /// Update the surface object's transform. libsm64 rebakes the local
+    /// triangles into world space using the new position + rotation.
+    pub fn move_to(&self, transform: &SM64ObjectTransform) {
+        // SAFETY: `id` is a valid, live surface object (we created it
+        // and haven't dropped it).
+        unsafe { sm64_surface_object_move(self.id, transform) };
+    }
+
+    /// Raw libsm64 object id (for diagnostics).
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+}
+
+impl Drop for SurfaceObject {
+    fn drop(&mut self) {
+        // SAFETY: `id` is valid and live until this drop. libsm64 also
+        // clears Mario's platform reference if he was riding this
+        // object (see sm64_surface_object_delete in libsm64.c).
+        unsafe { sm64_surface_object_delete(self.id) };
+        tracing::debug!(surface_object_id = self.id, "surface object deleted");
+    }
+}
+
+/// Convert a glam quaternion to SM64 euler rotation in **degrees** as
+/// `[pitch, yaw, roll]` — the layout `SM64ObjectTransform.eulerRotation`
+/// expects.
+///
+/// glam's `EulerRot::ZXY` decomposes a quaternion into the intrinsic
+/// Z-X-Y sequence and returns `(z, x, y)` = (roll, pitch, yaw), which
+/// matches the **order** libsm64's `mtxf_rotate_zxy_and_translate`
+/// applies (roll-Z, pitch-X, yaw-Y). We reorder to `[pitch, yaw, roll]`.
+///
+/// **Sign:** libsm64 converts each input degree value through
+/// `CONVERT_ANGLE(x) = -x/180*32768` before feeding it to `sins`/`coss`
+/// (plain `sin`/`cos` table lookups). So `sins(CONVERT_ANGLE(θ°))` =
+/// `sin(-θ°)` = `-sin(θ°)`. Tracing `mtxf_rotate_zxy_and_translate`
+/// for a pure yaw `y` shows the resulting matrix is `Ry(-y)`, not
+/// `Ry(+y)`: a local point `(0, 0, 1)` maps to `(-sin(y), 0, cos(y))`.
+/// A glam `Quat::from_rotation_y(+y)` encodes `Ry(+y)`. To make
+/// libsm64 reproduce the glam rotation we must therefore **negate**
+/// every angle before handing it over, so `CONVERT_ANGLE(-θ)` yields
+/// `sin(+θ°)` inside libsm64. Identity → `[0, 0, 0]` (negation of zero
+/// is zero, which is why the identity test alone cannot catch this).
+pub fn quat_to_sm64_euler(rot: glam::Quat) -> [f32; 3] {
+    let (roll, pitch, yaw) = rot.to_euler(glam::EulerRot::ZXY);
+    let rad_to_deg = 180.0 / std::f32::consts::PI;
+    [-pitch * rad_to_deg, -yaw * rad_to_deg, -roll * rad_to_deg]
+}
+
+/// Build 12 triangles (6 faces × 2) for an axis-aligned box in **local**
+/// coordinates, given min/max corners already in SM64 units. The box is
+/// centered at the transform origin; the transform's rotation orients
+/// it in world space.
+///
+/// Winding is counter-clockwise when viewed from outside each face, so
+/// the surface normals point outward — matching how `surface.rs` emits
+/// terrain faces and what libsm64's collision code expects.
+pub fn aabb_box_surfaces(min: [i32; 3], max: [i32; 3]) -> Vec<SM64Surface> {
+    let [x0, y0, z0] = min;
+    let [x1, y1, z1] = max;
+    let mut s = Vec::with_capacity(12);
+    // Helper using the crate's surface fields directly.
+    let mut tri = |a: [i32; 3], b: [i32; 3], c: [i32; 3]| {
+        s.push(SM64Surface {
+            type_: SURFACE_DEFAULT,
+            force: 0,
+            terrain: SURFACE_TERRAIN_GRASS,
+            vertices: [a, b, c],
+        });
+    };
+    // +X face (normal +X): viewed from +X looking toward -X,
+    // CCW is (y0,z0)->(y0,z1)->(y1,z1) etc. Use the standard box
+    // winding: for each +normal face, list corners CCW from outside.
+    // -X
+    tri([x0, y0, z1], [x0, y1, z1], [x0, y1, z0]);
+    tri([x0, y0, z1], [x0, y1, z0], [x0, y0, z0]);
+    // +X
+    tri([x1, y0, z0], [x1, y1, z0], [x1, y1, z1]);
+    tri([x1, y0, z0], [x1, y1, z1], [x1, y0, z1]);
+    // -Y (floor below; normal -Y)
+    tri([x0, y0, z0], [x1, y0, z0], [x1, y0, z1]);
+    tri([x0, y0, z0], [x1, y0, z1], [x0, y0, z1]);
+    // +Y (floor on top; normal +Y) — Mario stands here.
+    tri([x0, y1, z1], [x1, y1, z1], [x1, y1, z0]);
+    tri([x0, y1, z1], [x1, y1, z0], [x0, y1, z0]);
+    // -Z
+    tri([x0, y0, z0], [x0, y1, z0], [x1, y1, z0]);
+    tri([x0, y0, z0], [x1, y1, z0], [x1, y0, z0]);
+    // +Z
+    tri([x0, y0, z1], [x1, y0, z1], [x1, y1, z1]);
+    tri([x0, y0, z1], [x1, y1, z1], [x0, y1, z1]);
+    s
+}
+
+#[cfg(test)]
+mod surface_object_tests {
+    use super::*;
+
+    #[test]
+    fn identity_quat_is_zero_euler() {
+        let e = quat_to_sm64_euler(glam::Quat::IDENTITY);
+        assert!(e[0].abs() < 1e-4, "pitch = {}", e[0]);
+        assert!(e[1].abs() < 1e-4, "yaw = {}", e[1]);
+        assert!(e[2].abs() < 1e-4, "roll = {}", e[2]);
+    }
+
+    #[test]
+    fn aabb_box_has_twelve_surfaces() {
+        let s = aabb_box_surfaces([0, 0, 0], [10, 20, 30]);
+        assert_eq!(s.len(), 12);
+        // Every vertex lies within the box.
+        for surf in &s {
+            for v in &surf.vertices {
+                assert!(v[0] >= 0 && v[0] <= 10);
+                assert!(v[1] >= 0 && v[1] <= 20);
+                assert!(v[2] >= 0 && v[2] <= 30);
+            }
+        }
+    }
+
+    #[test]
+    fn yaw_quat_decomposes_to_negated_yaw() {
+        // glam::Quat::from_rotation_y(+90°) encodes Ry(+90°). libsm64's
+        // CONVERT_ANGLE negates, so to reproduce Ry(+90°) we must feed
+        // it -90° → eulerRotation[1] = -90. pitch/roll stay 0.
+        // This is the test the identity case can't catch: negation of
+        // zero is zero.
+        let q = glam::Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        let e = quat_to_sm64_euler(q);
+        assert!(e[0].abs() < 1e-3, "pitch = {} (want ~0)", e[0]);
+        assert!((e[1] + 90.0).abs() < 1e-3, "yaw = {} (want ~-90)", e[1]);
+        assert!(e[2].abs() < 1e-3, "roll = {} (want ~0)", e[2]);
+    }
+
+    #[test]
+    fn pitch_quat_decomposes_to_negated_pitch() {
+        // 90° about X → pitch must be -90 (negated). At exactly 90° the
+        // ZXY decomposition hits the asin gimbal edge, so allow a small
+        // absolute tolerance rather than the 1e-3 used elsewhere.
+        let q = glam::Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+        let e = quat_to_sm64_euler(q);
+        assert!((e[0] + 90.0).abs() < 0.05, "pitch = {} (want ~-90)", e[0]);
+        assert!(e[1].abs() < 1e-3, "yaw = {} (want ~0)", e[1]);
+        assert!(e[2].abs() < 1e-3, "roll = {} (want ~0)", e[2]);
     }
 }

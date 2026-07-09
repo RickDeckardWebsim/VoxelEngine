@@ -15,6 +15,21 @@ pub const SM64_TEXTURE_WIDTH: u32 = 64 * 11;
 pub const SM64_TEXTURE_HEIGHT: u32 = 64;
 pub const SM64_GEO_MAX_TRIANGLES: u32 = 1024;
 
+// ── Mario action constants (from decomp/include/sm64.h) ───────────────
+// Action flags (masks): the high bits of an action encode its category.
+/// Set while Mario is airborne (jump/fall/etc.).
+pub const ACT_FLAG_AIR: u32 = 0x00000800;
+/// Set for attacking actions (ground pound, dive, punch, etc.).
+pub const ACT_FLAG_ATTACKING: u32 = 0x00800000;
+
+// Specific actions we react to from the engine.
+/// Ground pound (mid-air, after crouch+jump).
+pub const ACT_GROUND_POUND: u32 = 0x008008A9;
+/// Ground pound landing — the single tick where Mario impacts the ground.
+pub const ACT_GROUND_POUND_LAND: u32 = 0x0080023C;
+/// Triple jump (the highest of the three jump tiers).
+pub const ACT_TRIPLE_JUMP: u32 = 0x01000882;
+
 // ── Structs (match libsm64.h layout exactly) ───────────────────────────
 
 #[repr(C)]
