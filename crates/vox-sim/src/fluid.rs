@@ -245,14 +245,6 @@ impl FluidSim {
     }
 }
 
-/// Where a water cell at `pos` wants to move this tick, or `None` if it has
-/// nowhere to go (should settle). `is_open` reports whether a cell can be
-/// flowed into: empty (air) and in-bounds. Order of preference: straight
-/// down, then diagonal-down (randomized left/right), then one step toward
-/// the nearest drop reachable within `FLOW_HORIZON` cells sideways, then
-/// pressure-gated sideways leveling onto supported terrain or water
-/// (randomized left/right, then front/back) -- see the design doc §4 for
-/// why this shape and not fractional pressure levels.
 /// Thin momentum-free wrapper kept for the unit tests that predate momentum;
 /// `tick` itself always calls `step_cell_with_momentum` directly.
 #[cfg(test)]
@@ -267,11 +259,20 @@ fn step_cell(
     step_cell_with_momentum(pos, is_open, is_supported, has_water_above, coin, coin2, None)
 }
 
-/// `step_cell` with an optional remembered horizontal direction: momentum's
-/// axis components bias the diagonal-fall and sideways-spread sign order,
-/// and the full vector (which may be diagonal, e.g. `(1, 0, 1)`) leads the
-/// flow scan ahead of the coin-ordered eight. `None` reproduces the
-/// coin-only behavior exactly.
+/// Where a water cell at `pos` wants to move this tick, or `None` if it has
+/// nowhere to go (should settle). `is_open` reports whether a cell can be
+/// flowed into: empty (air) and in-bounds. Order of preference: straight
+/// down, then diagonal-down (randomized left/right), then one step toward
+/// the first drop reachable within `FLOW_HORIZON` cells sideways, then
+/// pressure-gated sideways leveling onto supported terrain or water
+/// (randomized left/right, then front/back) -- see the design doc §4 for
+/// why this shape and not fractional pressure levels.
+///
+/// `momentum` is an optional remembered horizontal direction: its axis
+/// components bias the diagonal-fall and sideways-spread sign order, and the
+/// full vector (which may be diagonal, e.g. `(1, 0, 1)`) leads the flow scan
+/// ahead of the coin-ordered eight. `None` reproduces the coin-only
+/// behavior exactly.
 fn step_cell_with_momentum(
     pos: IVec3,
     is_open: &mut impl FnMut(IVec3) -> bool,
