@@ -35,11 +35,11 @@ world.
 | `Shift` | Fly down (noclip) |
 | `Ctrl` (held, noclip) | 5x fly speed |
 | `F` | Toggle fly / noclip |
-| `1`-`9` | Hotbar: 1 Dig, 2 Scalable Dig, 3 Bomb, 4 Death Laser (5-9 reserved) |
-| Mouse wheel | Adjust tool radius (Scalable Dig / Bomb) or cycle build material (otherwise) |
+| `1`-`9` | Hotbar: 1 Dig, 2 Scalable Dig, 3 Bomb, 4 Death Laser, 5 Place Water (6-9 reserved) |
+| Mouse wheel | Adjust tool radius (Scalable Dig / Bomb / Place Water) or cycle build material (otherwise) |
 | Left click | Use the active hotbar tool |
 | Right click | Place selected material |
-| `[` / `]` | Shrink / grow the Scalable Dig / Bomb radius (0.5-4 m) |
+| `[` / `]` | Shrink / grow the Scalable Dig / Bomb / Place Water radius (0.5-4 m) |
 | `B` | Spawn a wood debris cube in front of the player |
 | `X` | Clear all sleeping (settled) debris |
 | `F3` | Toggle the debug overlay (FPS, timings, tuning sliders) |
@@ -53,6 +53,7 @@ world.
 | 2 | Scalable Dig | Carves a sphere of adjustable radius; severed material falls under gravity alone -- no impulse. |
 | 3 | Bomb | Carves a sphere of adjustable radius and gives the debris an outward blast impulse. |
 | 4 | Death Laser | An effectively infinite-range beam that tunnels straight through everything in its path in one shot -- no raycast gate, no impulse, just an instant, total cut. |
+| 5 | Place Water | Fills a sphere of adjustable radius with water at the crosshair target; it starts flowing immediately. |
 
 Slots 5-9 are reserved for future tools.
 

@@ -4,8 +4,9 @@
 
 use glam::{IVec3, Vec3};
 use vox_core::consts::REACH;
-use vox_core::{MaterialRegistry, voxel_center_m};
+use vox_core::{MaterialRegistry, voxel_at, voxel_center_m};
 use vox_physics::{Aabb, BodyId, PhysicsWorld};
+use vox_sim::FluidSim;
 use vox_world::{AIR, Voxel, World, raycast};
 
 /// The selectable hotbar tools. Slots 5-9 are reserved (not yet assigned to
@@ -25,14 +26,18 @@ pub enum Tool {
     /// through everything in its path in one shot -- no impulse, just an
     /// instant, precise cut.
     DeathLaser,
+    /// Slot 5: place a sphere of water at the crosshair target (radius
+    /// shares `Tools::radius_m` with Scalable Dig / Bomb).
+    PlaceWater,
 }
 
 /// Hotbar key (1-9) to tool mapping. Slots past the array select nothing.
-pub const HOTBAR: [(u8, Tool); 4] = [
+pub const HOTBAR: [(u8, Tool); 5] = [
     (1, Tool::Dig),
     (2, Tool::ScalableDig),
     (3, Tool::Bomb),
     (4, Tool::DeathLaser),
+    (5, Tool::PlaceWater),
 ];
 
 /// Radius bounds for [`Tool::ScalableDig`] and [`Tool::Bomb`], adjustable
@@ -191,7 +196,7 @@ impl Tools {
     /// [`Tool::Bomb`]) -- used to decide whether the mouse wheel resizes the
     /// tool or cycles build material.
     pub fn has_adjustable_radius(&self) -> bool {
-        matches!(self.tool, Tool::ScalableDig | Tool::Bomb)
+        matches!(self.tool, Tool::ScalableDig | Tool::Bomb | Tool::PlaceWater)
     }
 
     /// Select a hotbar slot (1-9) by key number. Slots not in [`HOTBAR`] do
@@ -441,6 +446,35 @@ impl Tools {
         if !overlaps {
             world.set_voxel(target, self.material());
         }
+    }
+
+    /// Place Water: fill a sphere of [`Tools::radius_m`] with water at the
+    /// crosshair target and hand the filled cells to `fluid` so they start
+    /// flowing immediately. Unlike every other tool, this never touches
+    /// `PhysicsWorld` -- it can't hit or carve a body, only the static
+    /// world, and only into existing air.
+    pub fn place_water(
+        &self,
+        world: &mut World,
+        fluid: &mut FluidSim,
+        registry: &MaterialRegistry,
+        eye_m: Vec3,
+        look: Vec3,
+    ) {
+        let dir = look.normalize_or_zero();
+        if dir == Vec3::ZERO {
+            return;
+        }
+        let Some(hit) = raycast(world, eye_m, dir, REACH) else {
+            return;
+        };
+        let Some(water_id) = registry.id_by_name("water") else {
+            return; // asset set doesn't define water; nothing to place
+        };
+        let s = world.cfg.voxel_size_m;
+        let center_vox = voxel_at(eye_m + dir * hit.dist_m, s);
+        let radius_vox = (self.radius_m / s).round() as i32;
+        fluid.place_blob(world, center_vox, radius_vox, Voxel(water_id.0));
     }
 }
 
@@ -839,5 +873,60 @@ mod tests {
             "detached debris ({total_debris_voxels} voxels) looks far too \
              small to be the whole severed tree (trunk + branches + canopy)"
         );
+    }
+
+    fn registry_with_water() -> MaterialRegistry {
+        MaterialRegistry::from_toml_str(
+            r#"
+            [[material]]
+            name = "stone"
+            color = [0.5, 0.5, 0.5]
+            density = 2000.0
+            strength = 5.0
+
+            [[material]]
+            name = "water"
+            color = [0.1, 0.3, 0.8]
+            density = 1000.0
+            strength = 0.0
+            solid = false
+            fluid = true
+            "#,
+            "test.toml",
+        )
+        .expect("registry")
+    }
+
+    fn solid_table_for(reg: &MaterialRegistry) -> Vec<bool> {
+        (0..reg.len())
+            .map(|i| reg.get(vox_core::MaterialId(i as u16)).is_some_and(|d| d.solid))
+            .collect()
+    }
+
+    fn stone_id(reg: &MaterialRegistry) -> Voxel {
+        Voxel(reg.id_by_name("stone").unwrap().0)
+    }
+
+    fn water_voxel(reg: &MaterialRegistry) -> Voxel {
+        Voxel(reg.id_by_name("water").unwrap().0)
+    }
+
+    #[test]
+    fn place_water_fills_a_sphere_at_the_crosshair_and_activates_it() {
+        let reg = registry_with_water();
+        let mut world = World::new(WorldConfig {
+            voxel_size_m: 1.0,
+            extent_m: [32.0, 32.0, 32.0],
+            ..WorldConfig::default()
+        });
+        world.set_solid_table(solid_table_for(&reg));
+        let (_, max) = world.bounds_voxels();
+        world.fill_box(IVec3::ZERO, IVec3::new(max.x, 10, max.z), stone_id(&reg));
+
+        let mut sim = vox_sim::FluidSim::new(water_voxel(&reg));
+        let tools = Tools::new(&reg);
+        tools.place_water(&mut world, &mut sim, &reg, Vec3::new(16.0, 15.0, 16.0), Vec3::new(0.0, -1.0, 0.0));
+
+        assert!(sim.active_count() > 0, "placing water must activate at least one cell");
     }
 }

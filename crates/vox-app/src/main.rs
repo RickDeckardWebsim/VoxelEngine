@@ -619,6 +619,11 @@ impl VoxApp {
                     self.tools
                         .death_laser(&mut self.world, &mut self.phys, &self.registry, eye, look)
                 }
+                Tool::PlaceWater => {
+                    self.tools
+                        .place_water(&mut self.world, &mut self.fluid, &self.registry, eye, look);
+                    CarveOutcome::default()
+                }
             };
             // A carved body is despawned and replaced, not updated in
             // place. `removed` is empty for a carve that only ever touched
@@ -753,6 +758,11 @@ impl VoxApp {
                     buoyant: false,
                 });
             }
+            // Placing water never carves anything -- `outcome.impact_m` is
+            // always `None` for it, so the early return above already
+            // exits before this match runs; kept here only to stay
+            // exhaustive.
+            Tool::PlaceWater => {}
         }
     }
 
@@ -1093,6 +1103,7 @@ fn tool_label(tool: Tool) -> &'static str {
         Tool::ScalableDig => "Carve",
         Tool::Bomb => "Bomb",
         Tool::DeathLaser => "Laser",
+        Tool::PlaceWater => "Water",
     }
 }
 
