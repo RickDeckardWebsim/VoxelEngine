@@ -1,15 +1,16 @@
 {
   "planPath": "docs/plans/2026-07-09-water-refinement.md",
   "tasks": [
-    {"id": 7, "subject": "Task 0: Commit the pending flow-rule fix", "status": "pending"},
-    {"id": 8, "subject": "Task 1: 8-direction drop-search", "status": "pending", "blockedBy": [7]},
-    {"id": 9, "subject": "Task 2: Momentum memory", "status": "pending", "blockedBy": [8]},
-    {"id": 10, "subject": "Task 3: Contact events from the fluid tick", "status": "pending", "blockedBy": [9]},
-    {"id": 11, "subject": "Task 4: Weathering module — soak transformations", "status": "pending", "blockedBy": [10]},
-    {"id": 12, "subject": "Task 5: Weathering — drying + sleep guarantee", "status": "pending", "blockedBy": [11]},
-    {"id": 13, "subject": "Task 6: mud material", "status": "pending", "blockedBy": [12]},
-    {"id": 14, "subject": "Task 7: vox-app integration", "status": "pending", "blockedBy": [13]},
-    {"id": 15, "subject": "Task 8: Verify end-to-end + docs", "status": "pending", "blockedBy": [14]}
+    {"id": 7, "subject": "Task 0: Commit the pending flow-rule fix", "status": "done"},
+    {"id": 8, "subject": "Task 1: 8-direction drop-search", "status": "done"},
+    {"id": 9, "subject": "Task 2: Momentum memory", "status": "done"},
+    {"id": 10, "subject": "Task 3: Contact events from the fluid tick", "status": "done"},
+    {"id": 11, "subject": "Task 4: Weathering module — soak transformations", "status": "done"},
+    {"id": 12, "subject": "Task 5: Weathering — drying + sleep guarantee", "status": "done"},
+    {"id": 13, "subject": "Task 6: mud material", "status": "done"},
+    {"id": 14, "subject": "Task 7: vox-app integration", "status": "done"},
+    {"id": 15, "subject": "Task 8: Verify end-to-end + docs", "status": "done"}
   ],
-  "lastUpdated": "2026-07-09"
+  "lastUpdated": "2026-07-09",
+  "note": "All 8 tasks complete. Bonus: fixed a fall_boost stickiness bug (sticky flag kept eroding stone at 5x after water settled; now re-derived per tick from Fell events)."
 }

@@ -398,11 +398,11 @@ Duplicate names across files are a load error, not a silent override.
 `VoxApp::apply_tools` (in `main.rs`) to wire it to input. `Tool::Bomb` is the
 fullest example: raycast -> `vox_physics::blast` -> done.
 
-**Add a whole new engine system** (e.g. the planned cellular-automata
-fluid/fire sim, or ecosystem/creature life) — add it as a **new sibling
-crate** at the `vox-gen`/`vox-physics` tier: it can depend on `vox-core` and
-`vox-world` (and `vox-physics` if it needs bodies) without any existing
-crate changing. This is deliberate: the layering was chosen so that
+**Add a whole new engine system** (e.g. ecosystem/creature life) — add it as
+a **new sibling crate** at the `vox-gen`/`vox-physics` tier, the way
+`vox-sim` (the cellular-automata fluid sim) already does: it can depend on
+`vox-core` and `vox-world` (and `vox-physics` if it needs bodies) without any
+existing crate changing. This is deliberate: the layering was chosen so that
 "add a concept" means "add a crate," not "thread a new dependency through
 six existing files."
 
@@ -415,7 +415,7 @@ so, it probably shouldn't be a dependency.
 ## Testing
 
 ```
-cargo test              # ~190 tests, everything below vox-render runs headless
+cargo test              # ~235 tests, everything below vox-render runs headless
 cargo clippy --all-targets -- -D warnings
 cargo run -p vox-app --release --example stress   # headless perf probe, not a test
 ```
@@ -437,8 +437,13 @@ pillar's base, confirm the upper section detaches, tumbles, and sleeps.
   (the `HashMap<ChunkPos, Chunk>` storage is already streaming-ready).
 - Palette-compressed chunks and an RLE binary save format (the chunk
   storage's `Uniform`/`Dense` enum already hides this behind `get`/`set`).
-- A cellular-automata simulation crate (`vox-sim`): falling sand, fire,
-  water — a sibling crate at the physics tier.
+- ~~A cellular-automata simulation crate (`vox-sim`): falling sand, fire,
+  water — a sibling crate at the physics tier.~~ **Implemented:** a
+  cellular-automata fluid sim (`vox-sim`) with active-cell sleeping, 8-
+  direction drop-search, momentum memory for cohesive flow, and water-
+  driven weathering (grass→dirt→mud, stone→sand erosion with waterfall
+  boost, mud drying). See `docs/plans/2026-07-09-fluid-sim-design.md` and
+  `docs/plans/2026-07-09-water-refinement-design.md`.
 - An ecosystem/life crate: creatures, growth, populations.
 - Structural stress (load propagation -> creaking collapses) layered on top
   of the existing connectivity pass.

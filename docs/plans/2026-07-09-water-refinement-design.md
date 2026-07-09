@@ -1,7 +1,7 @@
 # Water Refinement — Cohesive Flow + Weathering — Design Document
 
 **Date:** 2026-07-09
-**Status:** Approved
+**Status:** Implemented
 **Builds on:** `2026-07-09-fluid-sim-design.md` (the CA fluid sim, including the
 flow rule that fixed sand-piling). This document refines flow behavior and adds
 water-driven material transformation. Nothing here changes the sim's core
