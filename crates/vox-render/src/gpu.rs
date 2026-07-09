@@ -31,7 +31,13 @@ impl Gpu {
         width: u32,
         height: u32,
     ) -> Result<Self, RenderError> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let backends = parse_backend_env();
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends,
+            flags: wgpu::InstanceFlags::default(),
+            dx12_shader_compiler: wgpu::Dx12Compiler::default(),
+            gles_minor_version: wgpu::Gles3MinorVersion::default(),
+        });
         let surface = instance.create_surface(target)?;
 
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -209,4 +215,28 @@ fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Te
         view_formats: &[],
     });
     texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// Select the wgpu backend from the `WGPU_BACKEND` environment variable,
+/// falling back to `Backends::PRIMARY` (Vulkan + DX12 + Metal) so the
+/// engine stays portable across machines. Set `WGPU_BACKEND=vulkan` to
+/// force Vulkan — useful on AMD Windows drivers where wgpu 0.20's D3D12
+/// backend hits a swapchain resource-state bug (`INVALID_SUBRESOURCE_STATE`
+/// every frame, eventually crashing with `STATUS_STACK_BUFFER_OVERRUN`).
+/// Accepted values (case-insensitive): `vulkan`, `dx12`, `metal`, `gl`,
+/// `primary`, `all`.
+fn parse_backend_env() -> wgpu::Backends {
+    match std::env::var("WGPU_BACKEND")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("vulkan") => wgpu::Backends::VULKAN,
+        Some("dx12") => wgpu::Backends::DX12,
+        Some("metal") => wgpu::Backends::METAL,
+        Some("gl") => wgpu::Backends::GL,
+        Some("primary") => wgpu::Backends::PRIMARY,
+        Some("all") => wgpu::Backends::all(),
+        _ => wgpu::Backends::PRIMARY,
+    }
 }

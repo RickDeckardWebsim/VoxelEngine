@@ -6,11 +6,13 @@
 pub mod camera;
 pub mod frustum;
 pub mod gpu;
+pub mod mario_pipeline;
 pub mod voxel_pipeline;
 
 pub use camera::Camera;
 pub use frustum::Frustum;
 pub use gpu::{DEPTH_FORMAT, Frame, Gpu};
+pub use mario_pipeline::{MarioCameraUniform, MarioPipeline, MarioVertex};
 pub use voxel_pipeline::{BodyMeshKey, DrawStats, VoxelPipeline};
 
 /// Errors from GPU initialization and per-frame surface operations.

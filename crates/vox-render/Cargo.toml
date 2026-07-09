@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 vox-core = { workspace = true }
 vox-mesh = { workspace = true }
+vox-sm64 = { workspace = true }
 wgpu = { workspace = true }
 glam = { workspace = true }
 bytemuck = { workspace = true }

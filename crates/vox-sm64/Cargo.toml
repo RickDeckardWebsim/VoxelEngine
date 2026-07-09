@@ -1,0 +1,14 @@
+[package]
+name = "vox-sm64"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+
+[dependencies]
+glam = { workspace = true }
+vox-core = { workspace = true }
+vox-world = { workspace = true }
+tracing = { workspace = true }
+
+[build-dependencies]
+cc = "1.2"

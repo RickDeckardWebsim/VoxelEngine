@@ -2287,6 +2287,7 @@ dependencies = [
  "vox-physics",
  "vox-platform",
  "vox-render",
+ "vox-sm64",
  "vox-world",
  "wgpu",
  "winit",
@@ -2367,7 +2368,19 @@ dependencies = [
  "tracing",
  "vox-core",
  "vox-mesh",
+ "vox-sm64",
  "wgpu",
+]
+
+[[package]]
+name = "vox-sm64"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "glam",
+ "tracing",
+ "vox-core",
+ "vox-world",
 ]
 
 [[package]]

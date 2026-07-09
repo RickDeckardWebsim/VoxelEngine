@@ -3,6 +3,7 @@
 mod args;
 mod body_mesh;
 mod player;
+mod mario;
 mod remesh;
 mod tools;
 
@@ -129,6 +130,10 @@ struct VoxApp {
     /// `enforce_debris_budget` to evict the oldest *settled* debris once the
     /// total exceeds `MAX_DEBRIS_BODIES`.
     debris_order: VecDeque<BodyId>,
+    /// Mario mode state. `None` = not initialized yet (ROM not loaded).
+    /// `Some` with `is_active() == false` = initialized but Mario not
+    /// spawned. `Some` with `is_active() == true` = Mario is running.
+    mario_mode: Option<mario::MarioMode>,
 }
 
 /// Hard cap on total debris bodies alive at once. Past this, the oldest
@@ -205,6 +210,7 @@ impl VoxApp {
             selected_material,
             last_draw_stats: vox_render::DrawStats::default(),
             debris_order: VecDeque::new(),
+            mario_mode: None,
         };
         app.initial_mesh();
 
@@ -517,6 +523,57 @@ impl VoxApp {
             self.last_report = Instant::now();
         }
     }
+
+    /// Toggle Mario mode on/off. On first activation, lazily loads the
+    /// SM64 ROM and builds the Mario render pipeline. Subsequent
+    /// toggles spawn/despawn Mario at the player's position.
+    fn toggle_mario_mode(&mut self) {
+        // Initialize Mario mode if not yet done
+        if self.mario_mode.is_none() {
+            let assets = assets_dir();
+            let rom_path = match mario::MarioMode::find_rom(&assets) {
+                Some(p) => p,
+                None => {
+                    tracing::warn!("SM64 ROM not found — press M with baserom.us.z64 in the project root or assets dir");
+                    return;
+                }
+            };
+            let mario_shader =
+                match std::fs::read_to_string(assets.join("shaders/mario.wgsl")) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("mario.wgsl not found: {e}");
+                        return;
+                    }
+                };
+            match mario::MarioMode::init(&self.gpu, &rom_path, &mario_shader) {
+                Ok(mode) => self.mario_mode = Some(mode),
+                Err(e) => {
+                    tracing::error!("Mario mode init failed: {e}");
+                    return;
+                }
+            }
+        }
+
+        // Toggle spawn/despawn
+        if let Some(mode) = self.mario_mode.as_mut() {
+            if mode.is_active() {
+                mode.despawn();
+            } else {
+                // Spawn Mario just above the player's current position.
+                // The player is already grounded, so this is right above
+                // the terrain surface.
+                let pos = self.player.ctrl.pos;
+                let spawn_pos = Vec3::new(pos.x, pos.y + 1.0, pos.z);
+                mode.cam_yaw = self.player.yaw;
+                mode.cam_pitch = self.player.pitch;
+
+                if let Err(e) = mode.spawn(spawn_pos, &self.world) {
+                    tracing::warn!("Mario spawn failed: {e}");
+                }
+            }
+        }
+    }
 }
 
 impl App for VoxApp {
@@ -582,6 +639,9 @@ impl App for VoxApp {
         if input.key_pressed(KeyCode::F3) {
             self.debug_visible = !self.debug_visible;
         }
+        if input.key_pressed(KeyCode::KeyM) {
+            self.toggle_mario_mode();
+        }
         self.profile
             .input
             .push(input_start.elapsed().as_secs_f32() * 1000.0);
@@ -592,15 +652,36 @@ impl App for VoxApp {
         self.player.fly_speed = self.tunables.fly_speed;
         self.phys.tunables = self.tunables;
 
-        if self.grabbed {
-            self.player.look(input.mouse_delta);
+        let mario_active = self
+            .mario_mode
+            .as_ref()
+            .is_some_and(|m| m.is_active());
+
+        let mut mario_pos = Vec3::ZERO;
+
+        if mario_active {
+            // Mario mode: mouse look controls the third-person camera
+            if self.grabbed {
+                self.mario_mode.as_mut().unwrap().look(input.mouse_delta);
+            }
+            // Tick Mario's simulation
+            mario_pos = self
+                .mario_mode
+                .as_mut()
+                .map(|m| m.tick(&self.world, input, timing.dt_frame))
+                .unwrap_or(Vec3::ZERO);
+        } else {
+            // FPS mode: existing player controller
+            if self.grabbed {
+                self.player.look(input.mouse_delta);
+            }
+            {
+                let _t = ScopedTimer::new(&mut self.profile.player);
+                self.player
+                    .fixed_steps(&self.world, input, timing.physics_steps);
+            }
         }
-        {
-            let _t = ScopedTimer::new(&mut self.profile.player);
-            self.player
-                .fixed_steps(&self.world, input, timing.physics_steps);
-        }
-        if self.grabbed && !grabbed_this_frame {
+        if self.grabbed && !grabbed_this_frame && !mario_active {
             // Manual timing: apply_tools takes &mut self as a whole, which
             // would conflict with a live &mut self.profile.tools borrow.
             let tools_start = Instant::now();
@@ -636,10 +717,17 @@ impl App for VoxApp {
         }
         self.sync_debris_render(timing.alpha);
 
-        // Camera from the interpolated player eye.
-        self.camera.pos = eye;
-        self.camera.yaw = self.player.yaw;
-        self.camera.pitch = self.player.pitch;
+        // Camera: third-person around Mario in Mario mode, else player eye.
+        if mario_active {
+            let mode = self.mario_mode.as_ref().unwrap();
+            self.camera.pos = mode.camera_pos(mario_pos);
+            self.camera.yaw = mode.cam_yaw;
+            self.camera.pitch = mode.cam_pitch;
+        } else {
+            self.camera.pos = eye;
+            self.camera.yaw = self.player.yaw;
+            self.camera.pitch = self.player.pitch;
+        }
         let (w, h) = self.gpu.surface_size();
         let aspect = w as f32 / h.max(1) as f32;
         let view_proj = self.camera.view_proj(aspect);
@@ -726,6 +814,20 @@ impl App for VoxApp {
                 drawn: chunk_stats.drawn + body_stats.drawn,
                 culled: chunk_stats.culled + body_stats.culled,
             };
+            // Draw Mario if mode is active
+            if let Some(mode) = &self.mario_mode {
+                if mode.is_active() {
+                    mode.render(
+                        self.gpu.queue(),
+                        &mut pass,
+                        view_proj.to_cols_array_2d(),
+                        self.camera.pos,
+                        Vec3::new(-0.45, -0.8, -0.35).normalize(), // matches voxel pipeline
+                        FOG_END_M * 0.55,
+                        FOG_END_M,
+                    );
+                }
+            }
             if let Some(prepared) = &prepared_overlay {
                 self.debug_overlay.paint(&mut pass, prepared);
             }

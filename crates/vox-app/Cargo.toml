@@ -13,6 +13,7 @@ vox-mesh = { workspace = true }
 vox-physics = { workspace = true }
 vox-render = { workspace = true }
 vox-platform = { workspace = true }
+vox-sm64 = { workspace = true }
 vox-debug = { workspace = true }
 glam = { workspace = true }
 tracing = { workspace = true }
