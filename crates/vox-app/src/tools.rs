@@ -583,6 +583,13 @@ mod tests {
     }
 
     #[test]
+    fn hotbar_slot_six_selects_ember() {
+        let mut tools = Tools::new(&registry());
+        assert_eq!(tools.select_hotbar_slot(6), Some(Tool::Ember));
+        assert_eq!(tools.tool, Tool::Ember);
+    }
+
+    #[test]
     fn water_keeps_a_smaller_radius_than_bomb_tools() {
         let mut tools = Tools::new(&registry());
         let destructive_radius = tools.radius_m;
