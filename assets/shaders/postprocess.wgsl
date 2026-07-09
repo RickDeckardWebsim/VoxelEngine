@@ -94,9 +94,9 @@ fn fs(@builtin(position) frag_pos: vec4f) -> @location(0) vec4f {
     // contrast S-curve.
     c = c + 0.02;                           // shadow lift
     c = c * vec3f(1.02, 1.0, 0.98);         // warm tint
-    c = clamp(c, 0.0, 1.0);
+    c = clamp(c, vec3f(0.0), vec3f(1.0));
     // Gentle S-curve for contrast.
-    c = mix(c, smoothstep(0.0, 1.0, c), 0.15);
+    c = mix(c, smoothstep(vec3f(0.0), vec3f(1.0), c), 0.15);
 
     return vec4f(c, 1.0);
 }
