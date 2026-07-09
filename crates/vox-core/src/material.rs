@@ -39,6 +39,12 @@ pub struct MaterialDef {
     /// flag: a future decorative non-solid material (tall grass, say) should
     /// not be picked up by the fluid sim just because it's non-solid.
     pub fluid: bool,
+    /// Whether `vox-sim` simulates this material as a powder (falls when
+    /// unsupported, piles at an angle of repose, no pressure-driven
+    /// spreading). Implies `solid = false`, but is distinct from `fluid`:
+    /// a powder piles rather than seeking a flat level. Mud and sand are
+    /// powders; water is a fluid.
+    pub powder: bool,
 }
 
 /// Registry of material definitions with stable `u16` ids.
@@ -71,6 +77,7 @@ struct RawMaterial {
     strength: Option<f32>,
     solid: Option<bool>,
     fluid: Option<bool>,
+    powder: Option<bool>,
 }
 
 /// Validation error for a named material: `material '{name}': {detail}`.
@@ -92,6 +99,7 @@ impl MaterialRegistry {
             strength: 0.0,
             solid: false,
             fluid: false,
+            powder: false,
         };
         let mut by_name = HashMap::new();
         by_name.insert(air.name.clone(), MaterialId::AIR);
@@ -251,6 +259,7 @@ impl MaterialRegistry {
         }
         let solid = raw.solid.unwrap_or(true);
         let fluid = raw.fluid.unwrap_or(false);
+        let powder = raw.powder.unwrap_or(false);
 
         if self.defs.len() > usize::from(u16::MAX) {
             return Err(material_error(
@@ -270,6 +279,7 @@ impl MaterialRegistry {
             strength,
             solid,
             fluid,
+            powder,
         });
         Ok(())
     }
@@ -530,7 +540,13 @@ mod tests {
             .get(reg.id_by_name("mud").expect("mud registered"))
             .expect("mud present");
         assert_eq!(mud.density, 1700.0);
-        assert!(mud.solid, "mud is solid (walkable)");
+        assert!(!mud.solid, "mud is non-solid (a powder, not walkable)");
+        assert!(mud.powder, "mud is a powder");
+        let sand = reg
+            .get(reg.id_by_name("sand").expect("sand registered"))
+            .expect("sand present");
+        assert!(!sand.solid, "sand is non-solid (a powder, not walkable)");
+        assert!(sand.powder, "sand is a powder");
         let leaves = reg
             .get(reg.id_by_name("leaves").expect("leaves registered"))
             .expect("leaves present");
@@ -605,6 +621,34 @@ mod tests {
         assert!(!stone.fluid, "fluid must default to false");
         assert!(water.fluid, "explicit fluid = true must round-trip");
         assert!(!water.solid, "water must not be solid");
+    }
+
+    #[test]
+    fn powder_defaults_to_false_and_can_be_set_true() {
+        let reg = MaterialRegistry::from_toml_str(
+            r#"
+            [[material]]
+            name = "stone"
+            color = [0.5, 0.5, 0.5]
+            density = 2000.0
+            strength = 5.0
+
+            [[material]]
+            name = "sand"
+            color = [0.86, 0.79, 0.58]
+            density = 1600.0
+            strength = 1.0
+            solid = false
+            powder = true
+            "#,
+            "test.toml",
+        )
+        .expect("registry");
+        let stone = reg.get(reg.id_by_name("stone").unwrap()).unwrap();
+        let sand = reg.get(reg.id_by_name("sand").unwrap()).unwrap();
+        assert!(!stone.powder, "powder must default to false");
+        assert!(sand.powder, "explicit powder = true must round-trip");
+        assert!(!sand.solid, "sand must not be solid");
     }
 
     #[test]

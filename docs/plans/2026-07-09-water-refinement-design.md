@@ -152,6 +152,6 @@ All headless in `vox-sim` unless noted:
 ## 6. Explicitly out of scope
 
 - Infinite/source water blocks (needed for permanent rivers).
-- Sand behaving as a falling granular material.
+- ~~Sand behaving as a falling granular material.~~ **Implemented** in `2026-07-09-powder-design.md` — sand and mud are now powders.
 - Wetness rendering (darkened wet materials), partial-fill surfaces.
 - Erosion transporting sediment (sand re-deposits downstream).

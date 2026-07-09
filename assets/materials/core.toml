@@ -38,6 +38,8 @@ color = [0.86, 0.79, 0.58]
 jitter = 0.04
 density = 1600.0
 strength = 1.0
+solid = false
+powder = true
 
 [[material]]
 name = "wood"
@@ -82,3 +84,5 @@ color = [0.30, 0.22, 0.16]
 jitter = 0.05
 density = 1700.0
 strength = 1.0
+solid = false
+powder = true

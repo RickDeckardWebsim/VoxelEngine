@@ -55,6 +55,10 @@ pub struct FluidSim {
     /// construction -- never inferred from the active set (see `tick` and
     /// `wake_region` doc comments for why inference was fragile).
     water: Voxel,
+    /// Materials this sim treats as powders (fall + diagonal slide, no
+    /// spreading). Empty if the asset set defines no powders -- the sim
+    /// behaves as water-only. Set once at construction.
+    powders: Vec<Voxel>,
     /// xorshift64* state for randomized per-tick update order (same
     /// construction as `PhysicsWorld::lifetime_rng` / `ParticleSystem`'s
     /// spawn jitter) -- avoids a visible left/right or diagonal bias in how
@@ -66,10 +70,19 @@ pub struct FluidSim {
 
 impl FluidSim {
     pub fn new(water: Voxel) -> Self {
+        Self::with_powders(water, Vec::new())
+    }
+
+    /// Create a sim that also handles the given powder materials. Water
+    /// uses the full CA rule (`step_cell_with_momentum`); each powder uses
+    /// `step_powder` (fall + diagonal slide only). One active set, one tick
+    /// loop -- the material at each cell determines which rule applies.
+    pub fn with_powders(water: Voxel, powders: Vec<Voxel>) -> Self {
         Self {
             active: FxHashSet::default(),
             momentum: FxHashMap::default(),
             water,
+            powders,
             rng: 0x9E37_79B9_7F4A_7C15,
             events: Vec::new(),
         }
@@ -78,6 +91,16 @@ impl FluidSim {
     /// Take this tick's contact events (empties the buffer).
     pub fn drain_events(&mut self) -> Vec<ContactEvent> {
         std::mem::take(&mut self.events)
+    }
+
+    /// Whether `v` is a material this sim handles (water or a powder).
+    fn is_simmed(&self, v: Voxel) -> bool {
+        v == self.water || self.powders.contains(&v)
+    }
+
+    /// Whether `v` is a powder material this sim handles.
+    fn is_powder(&self, v: Voxel) -> bool {
+        self.powders.contains(&v)
     }
 
     /// Number of cells currently flowing (debug-overlay stat).
@@ -131,33 +154,31 @@ impl FluidSim {
         self.active.extend(filled);
     }
 
-    /// Advance every active cell by one tick: move it per `step_cell`, or
-    /// drop it from the active set if it has settled. A cell that moves
-    /// reactivates its destination plus water neighboring either the old or
-    /// new position -- the entire wake cascade, no separate propagation pass
-    /// needed.
+    /// Advance every active cell by one tick: move it per its material's
+    /// step rule (water: `step_cell_with_momentum`; powder: `step_powder`),
+    /// or drop it from the active set if it has settled. A cell that moves
+    /// reactivates its destination plus same-material neighbors of either
+    /// the old or new position -- the entire wake cascade, no separate
+    /// propagation pass needed.
     pub fn tick(&mut self, world: &mut World) -> usize {
         self.events.clear();
         let water = self.water;
 
-        // Snapshot exactly the positions that hold real water *before* any
-        // mutation this tick, and process only those. A live re-check of
-        // `world.get_voxel(pos) == water` inside the loop (as opposed to
-        // this upfront filter) is unsound: a mover's own wake neighbors
-        // include its future down-cell, so if that neighbor is iterated
-        // after the mover in the same `for` loop, the live check would see
-        // freshly-written water there and move it *again* within this same
-        // tick -- a cascade whose length depends on arbitrary hash-set
-        // iteration order. Filtering up front means every entry in `cells`
-        // is only ever cleared by its own move below, never by another
-        // mover's (a mover can never target a cell that already holds
-        // water -- `is_open` only accepts AIR), so each snapshot position
-        // is guaranteed to still be valid when its turn comes.
+        // Snapshot exactly the positions that hold a simmed material *before*
+        // any mutation this tick, and process only those. A live re-check
+        // inside the loop is unsound: a mover's wake neighbors include its
+        // future down-cell, so iterating that neighbor after the mover would
+        // see freshly-written material and move it *again* within this same
+        // tick. Filtering up front means every entry in `cells` is only ever
+        // cleared by its own move below, never by another mover's (a mover
+        // can never target a cell that already holds material -- `is_open`
+        // only accepts AIR), so each snapshot position is guaranteed to still
+        // be valid when its turn comes.
         let cells: Vec<IVec3> = self
             .active
             .iter()
             .copied()
-            .filter(|&p| world.get_voxel(p) == water)
+            .filter(|&p| self.is_simmed(world.get_voxel(p)))
             .collect();
 
         let mut next_active = FxHashSet::default();
@@ -174,27 +195,34 @@ impl FluidSim {
         let processed = cells.len();
 
         for pos in cells {
+            let v = world.get_voxel(pos);
+            let is_powder = self.is_powder(v);
             let coin = self.next_u64() & 1 == 0;
             let coin2 = self.next_u64() & 1 == 0;
             let dest = {
                 let mut is_open = |p: IVec3| world.in_bounds(p) && world.get_voxel(p) == AIR;
-                let mut is_supported = |p: IVec3| {
-                    world.in_bounds(p) && (world.solid(p) || world.get_voxel(p) == water)
-                };
-                let has_water_above = world.get_voxel(pos + IVec3::Y) == water;
-                step_cell_with_momentum(
-                    pos,
-                    &mut is_open,
-                    &mut is_supported,
-                    has_water_above,
-                    coin,
-                    coin2,
-                    self.momentum.get(&pos).copied(),
-                )
+                if is_powder {
+                    step_powder(pos, &mut is_open, coin, coin2)
+                } else {
+                    let mut is_supported = |p: IVec3| {
+                        world.in_bounds(p) && (world.solid(p) || world.get_voxel(p) == water)
+                    };
+                    let has_water_above = world.get_voxel(pos + IVec3::Y) == water;
+                    step_cell_with_momentum(
+                        pos,
+                        &mut is_open,
+                        &mut is_supported,
+                        has_water_above,
+                        coin,
+                        coin2,
+                        self.momentum.get(&pos).copied(),
+                    )
+                }
             };
             if let Some(dest) = dest {
+                // Write the cell's own material back -- water or powder.
                 world.set_voxel(pos, AIR);
-                world.set_voxel(dest, water);
+                world.set_voxel(dest, v);
                 next_active.insert(dest);
                 self.events.push(ContactEvent::Vacated(pos));
                 self.events.push(if dest.y < pos.y {
@@ -202,26 +230,40 @@ impl FluidSim {
                 } else {
                     ContactEvent::Flowed(dest)
                 });
-                let hdir = IVec3::new(dest.x - pos.x, 0, dest.z - pos.z);
-                // A pure vertical fall keeps whatever direction the cell
-                // already had; any horizontal component overwrites it.
-                let carried = if hdir != IVec3::ZERO { Some(hdir) } else { self.momentum.get(&pos).copied() };
-                if let Some(d) = carried {
-                    next_momentum.insert(dest, d);
+                // Momentum is water-only: powders don't carry direction.
+                if !is_powder {
+                    let hdir = IVec3::new(dest.x - pos.x, 0, dest.z - pos.z);
+                    let carried = if hdir != IVec3::ZERO {
+                        Some(hdir)
+                    } else {
+                        self.momentum.get(&pos).copied()
+                    };
+                    if let Some(d) = carried {
+                        next_momentum.insert(dest, d);
+                    }
                 }
-                // Wake only actual water, not generic non-solid cells (air
-                // used to be inserted here and inflated `active_count()` by
-                // one stale entry per neighboring empty voxel). Include the
-                // old position's neighbors too: if an upper cell was visited
-                // earlier in this snapshot, moving its support out from
-                // under it must give it another turn next tick.
+                // Wake same-material neighbors of both the old and new
+                // position: if an upper cell was visited earlier in this
+                // snapshot, moving its support out from under it must give
+                // it another turn next tick. Water wakes water; powder
+                // wakes powder -- they don't recruit each other.
                 for changed in [pos, dest] {
                     for n in NEIGHBORS_6 {
                         let neighbor = changed + n;
-                        if world.get_voxel(neighbor) == water {
+                        let nv = world.get_voxel(neighbor);
+                        if self.is_simmed(nv) {
                             next_active.insert(neighbor);
-                            if let Some(d) = carried {
-                                next_momentum.entry(neighbor).or_insert(d);
+                            // Only water inherits momentum.
+                            if !is_powder && nv == water {
+                                let hdir = IVec3::new(dest.x - pos.x, 0, dest.z - pos.z);
+                                let carried = if hdir != IVec3::ZERO {
+                                    Some(hdir)
+                                } else {
+                                    self.momentum.get(&pos).copied()
+                                };
+                                if let Some(d) = carried {
+                                    next_momentum.entry(neighbor).or_insert(d);
+                                }
                             }
                         }
                     }
@@ -236,11 +278,12 @@ impl FluidSim {
         processed
     }
 
-    /// Reactivate water inside or directly adjacent to `[min, max)`. World
-    /// edits report the cells they changed, rather than their neighbors: a
-    /// wall voxel just changed to air contains no water itself, so the
-    /// one-cell halo is what wakes the settled water immediately against that
-    /// new opening. Bounds are clipped before scanning.
+    /// Reactivate simmed material (water or powder) inside or directly
+    /// adjacent to `[min, max)`. World edits report the cells they changed,
+    /// rather than their neighbors: a wall voxel just changed to air
+    /// contains no material itself, so the one-cell halo is what wakes the
+    /// settled material immediately against that new opening. Bounds are
+    /// clipped before scanning.
     pub fn wake_region(&mut self, world: &World, min: IVec3, max: IVec3) {
         let (bounds_min, bounds_max) = world.bounds_voxels();
         let min = (min.max(bounds_min) - IVec3::ONE).max(bounds_min);
@@ -249,7 +292,7 @@ impl FluidSim {
             for y in min.y..max.y {
                 for z in min.z..max.z {
                     let p = IVec3::new(x, y, z);
-                    if world.get_voxel(p) == self.water {
+                    if self.is_simmed(world.get_voxel(p)) {
                         self.active.insert(p);
                     }
                 }
@@ -371,6 +414,37 @@ fn step_cell_with_momentum(
         }
     }
 
+    None
+}
+
+/// Where a powder cell at `pos` wants to move this tick, or `None` if it
+/// should settle. Simpler than the fluid rule: straight down if air below,
+/// else diagonal-down (all four, randomized), else settle. No flow-horizon
+/// search, no pressure-gated spreading -- powders pile at a natural ~45°
+/// angle of repose rather than seeking a flat level. `is_open` reports
+/// whether a cell can be moved into: air and in-bounds (same as water).
+fn step_powder(
+    pos: IVec3,
+    is_open: &mut impl FnMut(IVec3) -> bool,
+    coin: bool,
+    coin2: bool,
+) -> Option<IVec3> {
+    let down = pos + IVec3::NEG_Y;
+    if is_open(down) {
+        return Some(down);
+    }
+    // Diagonal slide: try all four diagonal-down cells in randomized order.
+    // Unlike water's separate X-then-Z diagonal check, powder tries all
+    // four at once since there's no momentum biasing. A powder on a slope
+    // slides down it one cell per tick.
+    let (dx1, dx2) = if coin { (1, -1) } else { (-1, 1) };
+    let (dz1, dz2) = if coin2 { (1, -1) } else { (-1, 1) };
+    for &(dx, dz) in &[(dx1, dz1), (dx1, dz2), (dx2, dz1), (dx2, dz2)] {
+        let diag = pos + IVec3::new(dx, -1, dz);
+        if is_open(diag) {
+            return Some(diag);
+        }
+    }
     None
 }
 
@@ -864,6 +938,144 @@ mod tests {
             ev.contains(&ContactEvent::Flowed(IVec3::new(9, 5, 8))),
             "a same-height flow step must emit Flowed: {ev:?}"
         );
+    }
+
+    // --- Powder tests ---
+
+    const POWDER: Voxel = Voxel(3);
+
+    fn powder_world() -> World {
+        let mut w = World::new(WorldConfig {
+            voxel_size_m: 1.0,
+            extent_m: [16.0, 16.0, 16.0],
+            ..WorldConfig::default()
+        });
+        // [air, water, floor, powder] -- powder is non-solid like water.
+        w.set_solid_table(vec![false, false, true, false]);
+        let (_, max) = w.bounds_voxels();
+        w.fill_box(IVec3::new(0, 0, 0), IVec3::new(max.x, 5, max.z), Voxel(2)); // floor top at y=5
+        w
+    }
+
+    fn powder_sim() -> FluidSim {
+        FluidSim::with_powders(WATER, vec![POWDER])
+    }
+
+    #[test]
+    fn powder_falls_straight_down_and_settles() {
+        let mut world = powder_world();
+        let mut sim = powder_sim();
+        world.set_voxel(IVec3::new(8, 8, 8), POWDER);
+        sim.active.insert(IVec3::new(8, 8, 8));
+        // Fall to the floor (y=5 is the top of the floor, so rest at y=5).
+        for _ in 0..10 {
+            sim.tick(&mut world);
+        }
+        assert_eq!(sim.active_count(), 0, "powder must settle on the floor");
+        assert_eq!(world.get_voxel(IVec3::new(8, 5, 8)), POWDER, "powder must rest on the floor");
+        assert_eq!(world.get_voxel(IVec3::new(8, 6, 8)), AIR, "nothing above the resting powder");
+    }
+
+    #[test]
+    fn powder_piles_and_sleeps() {
+        // A column of powder falls onto a flat floor and forms a stable
+        // pile (pyramid, not a straight stack -- powder slides diagonally
+        // off a column at its angle of repose). active_count reaches 0,
+        // not an infinite shuffle, and cell count is conserved.
+        let mut world = powder_world();
+        let mut sim = powder_sim();
+        // Drop a 4-cell column from above.
+        for y in 9..=12 {
+            world.set_voxel(IVec3::new(8, y, 8), POWDER);
+            sim.active.insert(IVec3::new(8, y, 8));
+        }
+        let before = count_voxel(&world, POWDER);
+        for _ in 0..80 {
+            sim.tick(&mut world);
+            if sim.active_count() == 0 {
+                break;
+            }
+        }
+        assert_eq!(sim.active_count(), 0, "powder pile must settle");
+        let after = count_voxel(&world, POWDER);
+        assert_eq!(before, after, "all powder cells must survive (conservation)");
+        // At least one cell must be resting on the floor (y=5, on top of
+        // the solid floor at y=4).
+        assert!(after > 0, "powder must not vanish");
+    }
+
+    #[test]
+    fn powder_on_a_slope_slides_diagonally() {
+        // Powder on a pillar can't fall straight (solid below), so it must
+        // slide to one of the four diagonal-down cells. `step_powder` tries
+        // the four corner diagonals (dx≠0 AND dz≠0), not the face-adjacent
+        // diagonals water uses. Assert it left the pillar and landed at a
+        // lower diagonal cell -- deterministic regardless of which one.
+        let mut world = powder_world();
+        let mut sim = powder_sim();
+        let pillar = IVec3::new(9, 6, 8);
+        let powder_pos = IVec3::new(9, 7, 8);
+        world.set_voxel(pillar, Voxel(2)); // pillar (solid, blocks straight fall)
+        world.set_voxel(powder_pos, POWDER);
+        sim.active.insert(powder_pos);
+        sim.tick(&mut world);
+        assert_eq!(world.get_voxel(powder_pos), AIR, "powder must leave the pillar top");
+        // It must have landed at one of the four diagonal-down cells.
+        let diagonals = [
+            powder_pos + IVec3::new(-1, -1, -1),
+            powder_pos + IVec3::new(-1, -1, 1),
+            powder_pos + IVec3::new(1, -1, -1),
+            powder_pos + IVec3::new(1, -1, 1),
+        ];
+        let landed = diagonals.iter().find(|&&d| world.get_voxel(d) == POWDER);
+        assert!(landed.is_some(), "powder must slide to a diagonal-down cell");
+    }
+
+    #[test]
+    fn powder_does_not_flow_sideways_on_flat_ground() {
+        // A flat sheet of powder on flat ground must sleep -- no lateral
+        // spreading (unlike water, which would level).
+        let mut world = powder_world();
+        let mut sim = powder_sim();
+        // Place a row of powder on the floor.
+        for x in 6..=10 {
+            world.set_voxel(IVec3::new(x, 5, 8), POWDER);
+            sim.active.insert(IVec3::new(x, 5, 8));
+        }
+        sim.tick(&mut world);
+        assert_eq!(sim.active_count(), 0, "flat powder on flat ground must sleep");
+        // All cells still in place.
+        for x in 6..=10 {
+            assert_eq!(world.get_voxel(IVec3::new(x, 5, 8)), POWDER, "powder must not shuffle");
+        }
+    }
+
+    #[test]
+    fn powder_cell_count_is_conserved() {
+        let mut world = powder_world();
+        let mut sim = powder_sim();
+        sim.place_blob(&mut world, IVec3::new(8, 10, 8), 2, POWDER);
+        let before = count_voxel(&world, POWDER);
+        for _ in 0..60 {
+            sim.tick(&mut world);
+        }
+        let after = count_voxel(&world, POWDER);
+        assert_eq!(before, after, "powder cell count must be conserved");
+    }
+
+    fn count_voxel(world: &World, v: Voxel) -> usize {
+        let (min, max) = world.bounds_voxels();
+        let mut n = 0;
+        for x in min.x..max.x {
+            for y in min.y..max.y {
+                for z in min.z..max.z {
+                    if world.get_voxel(IVec3::new(x, y, z)) == v {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
     }
 
     fn count_water(world: &World) -> usize {

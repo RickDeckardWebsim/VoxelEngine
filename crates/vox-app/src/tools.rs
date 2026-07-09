@@ -1190,12 +1190,16 @@ mod tests {
             color = [0.86, 0.79, 0.58]
             density = 1600.0
             strength = 1.0
+            solid = false
+            powder = true
 
             [[material]]
             name = "mud"
             color = [0.30, 0.22, 0.16]
             density = 1700.0
             strength = 1.0
+            solid = false
+            powder = true
 
             [[material]]
             name = "water"
@@ -1248,7 +1252,7 @@ mod tests {
             mud,
             sand: voxel_by_name(&reg, "sand"),
         };
-        let mut sim = FluidSim::new(water);
+        let mut sim = FluidSim::with_powders(water, vec![voxel_by_name(&reg, "mud"), voxel_by_name(&reg, "sand")]);
         let mut weathering = vox_sim::Weathering::new(table);
 
         // Place a small pool and run the loop the way the frame loop does:
@@ -1278,5 +1282,71 @@ mod tests {
             }
         }
         assert!(found_mud, "the pool's grass bed must turn to mud within the soak budget");
+    }
+
+    /// Sand placed in midair must fall, pile on the floor, and settle --
+    /// exercising the powder path end-to-end through the real registry and
+    /// `FluidSim::with_powders`, the same wiring `main.rs` uses.
+    #[test]
+    fn sand_falls_and_piles_as_a_powder() {
+        let reg = registry_with_weathering();
+        let water = voxel_by_name(&reg, "water");
+        let sand = voxel_by_name(&reg, "sand");
+        let stone = voxel_by_name(&reg, "stone");
+
+        let mut world = World::new(WorldConfig {
+            voxel_size_m: 1.0,
+            extent_m: [24.0, 24.0, 24.0],
+            ..WorldConfig::default()
+        });
+        world.set_solid_table(solid_table_for(&reg));
+        let (_, max) = world.bounds_voxels();
+        // Stone floor (top at y=4, powder rests at y=5).
+        world.fill_box(IVec3::ZERO, IVec3::new(max.x, 5, max.z), stone);
+
+        let mut sim = FluidSim::with_powders(water, vec![sand, voxel_by_name(&reg, "mud")]);
+
+        // Place a blob of sand in midair and let it fall.
+        sim.place_blob(&mut world, IVec3::new(12, 12, 12), 2, sand);
+        assert!(sim.active_count() > 0, "placing sand must activate cells");
+
+        let before = count_material(&world, sand);
+        for _ in 0..80 {
+            sim.tick(&mut world);
+            for (min, max) in world.drain_dirty_regions() {
+                sim.wake_region(&world, min, max);
+            }
+            if sim.active_count() == 0 {
+                break;
+            }
+        }
+        assert_eq!(sim.active_count(), 0, "sand pile must settle");
+        let after = count_material(&world, sand);
+        assert_eq!(before, after, "sand cell count must be conserved");
+        // Sand must have fallen to near the floor (y=5 is the resting surface).
+        let mut near_floor = false;
+        for x in 8..16 {
+            for z in 8..16 {
+                if world.get_voxel(IVec3::new(x, 5, z)) == sand {
+                    near_floor = true;
+                }
+            }
+        }
+        assert!(near_floor, "sand must pile on the floor, not stay suspended");
+    }
+
+    fn count_material(world: &World, v: Voxel) -> usize {
+        let (min, max) = world.bounds_voxels();
+        let mut n = 0;
+        for x in min.x..max.x {
+            for y in min.y..max.y {
+                for z in min.z..max.z {
+                    if world.get_voxel(IVec3::new(x, y, z)) == v {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
     }
 }

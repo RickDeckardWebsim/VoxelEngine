@@ -117,6 +117,19 @@ fn weather_table(registry: &MaterialRegistry) -> Option<vox_sim::WeatherTable> {
     })
 }
 
+/// All materials the registry marks as powders, as `Voxel` ids. Empty if
+/// the asset set defines no powders -- the sim runs water-only. The sim
+/// handles each powder with `step_powder` (fall + diagonal slide, no
+/// spreading); see `FluidSim::with_powders`.
+fn powder_materials(registry: &MaterialRegistry) -> Vec<Voxel> {
+    (1..registry.len())
+        .filter_map(|i| {
+            let def = registry.get(vox_core::MaterialId(i as u16))?;
+            def.powder.then(|| Voxel(i as u16))
+        })
+        .collect()
+}
+
 /// The engine application.
 struct VoxApp {
     window: Arc<Window>,
@@ -266,7 +279,7 @@ impl VoxApp {
             gpu,
             pipeline,
             world,
-            fluid: vox_sim::FluidSim::new(water_material(&registry)),
+            fluid: vox_sim::FluidSim::with_powders(water_material(&registry), powder_materials(&registry)),
             fluid_clock: vox_platform::FrameClock::new(vox_core::consts::FLUID_DT),
             weathering,
             registry,
