@@ -2371,6 +2371,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vox-sim"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "vox-core",
+ "vox-world",
+]
+
+[[package]]
 name = "vox-world"
 version = "0.1.0"
 dependencies = [

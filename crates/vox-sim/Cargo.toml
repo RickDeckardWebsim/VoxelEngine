@@ -1,0 +1,11 @@
+[package]
+name = "vox-sim"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vox-core = { workspace = true }
+vox-world = { workspace = true }
+glam = { workspace = true }

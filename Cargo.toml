@@ -14,6 +14,7 @@ vox-world = { path = "crates/vox-world" }
 vox-gen = { path = "crates/vox-gen" }
 vox-mesh = { path = "crates/vox-mesh" }
 vox-physics = { path = "crates/vox-physics" }
+vox-sim = { path = "crates/vox-sim" }
 vox-render = { path = "crates/vox-render" }
 vox-platform = { path = "crates/vox-platform" }
 vox-debug = { path = "crates/vox-debug" }
