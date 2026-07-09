@@ -153,7 +153,7 @@ impl FluidSim {
         // mover's (a mover can never target a cell that already holds
         // water -- `is_open` only accepts AIR), so each snapshot position
         // is guaranteed to still be valid when its turn comes.
-        let mut cells: Vec<IVec3> = self
+        let cells: Vec<IVec3> = self
             .active
             .iter()
             .copied()
