@@ -22,6 +22,13 @@ const NEIGHBORS_6: [IVec3; 6] = [
 /// extra ticks instead of spiking one frame.
 const FLUID_TICK_BUDGET: usize = 4096;
 
+/// How far sideways a blocked cell searches for a reachable drop (an open
+/// cell with air beneath it) before giving up and settling. Larger values
+/// flatten mounds over a wider area per wake, at O(4 * horizon) extra
+/// lookups per stuck-but-active cell per tick. Purely a grid count -- no
+/// meters involved, so scale invariance is preserved.
+const FLOW_HORIZON: i32 = 8;
+
 /// Tracks which water cells are still moving. A cell not in this set is
 /// settled and costs nothing to tick -- the entire performance story of
 /// this crate (mirrors `PhysicsWorld`'s sleep bookkeeping).
@@ -147,9 +154,11 @@ impl FluidSim {
             let coin2 = self.next_u64() & 1 == 0;
             let dest = {
                 let mut is_open = |p: IVec3| world.in_bounds(p) && world.get_voxel(p) == AIR;
-                let mut is_solid = |p: IVec3| world.solid(p);
+                let mut is_supported = |p: IVec3| {
+                    world.in_bounds(p) && (world.solid(p) || world.get_voxel(p) == water)
+                };
                 let has_water_above = world.get_voxel(pos + IVec3::Y) == water;
-                step_cell(pos, &mut is_open, &mut is_solid, has_water_above, coin, coin2)
+                step_cell(pos, &mut is_open, &mut is_supported, has_water_above, coin, coin2)
             };
             if let Some(dest) = dest {
                 world.set_voxel(pos, AIR);
@@ -200,14 +209,15 @@ impl FluidSim {
 /// Where a water cell at `pos` wants to move this tick, or `None` if it has
 /// nowhere to go (should settle). `is_open` reports whether a cell can be
 /// flowed into: empty (air) and in-bounds. Order of preference: straight
-/// down, then diagonal-down (randomized left/right), then pressure-gated
-/// sideways spread onto solid terrain (randomized left/right, then
-/// front/back) -- see the design doc §4 for why this shape and not
-/// fractional pressure levels.
+/// down, then diagonal-down (randomized left/right), then one step toward
+/// the nearest drop reachable within `FLOW_HORIZON` cells sideways, then
+/// pressure-gated sideways leveling onto supported terrain or water
+/// (randomized left/right, then front/back) -- see the design doc §4 for
+/// why this shape and not fractional pressure levels.
 fn step_cell(
     pos: IVec3,
     is_open: &mut impl FnMut(IVec3) -> bool,
-    is_solid: &mut impl FnMut(IVec3) -> bool,
+    is_supported: &mut impl FnMut(IVec3) -> bool,
     has_water_above: bool,
     coin: bool,
     coin2: bool,
@@ -232,32 +242,63 @@ fn step_cell(
         }
     }
 
+    // Flow: no immediate fall exists, so search each horizontal direction
+    // (randomized order) for a reachable drop -- an open run of same-height
+    // cells ending in one with air beneath -- and take one step toward the
+    // nearest. This is what keeps a mound from freezing into a stable
+    // stepped pyramid: its surface cells can walk over the water below them
+    // until they reach the pile's edge and fall off. Unlike an
+    // unconditional sideways shuffle, this only ever moves when a strictly
+    // lower destination is reachable, so a flat sheet or a full basin still
+    // has nowhere to go and sleeps.
+    let dirs = flow_dirs(coin, coin2);
+    for dir in dirs {
+        for k in 1..=FLOW_HORIZON {
+            let q = pos + dir * k;
+            if !is_open(q) {
+                break; // wall or water blocks this direction
+            }
+            if is_open(q + IVec3::NEG_Y) {
+                return Some(pos + dir); // one step toward the drop
+            }
+        }
+    }
+
     // A full/empty grid cannot represent a fractional, one-cell-deep water
     // surface. Letting an unpressurized surface cell trade places with any
     // equally-high air cell makes a partially filled puddle random-walk
-    // forever. Require water directly above the source, and real solid
-    // terrain below the destination, so a stack can drain while a shallow
-    // resting surface can sleep instead of shuffling across another water
-    // layer indefinitely.
+    // forever. Require water directly above the source, and support below
+    // the destination, so a stack can level across a shorter neighboring
+    // water column while a shallow resting surface can sleep instead of
+    // shuffling indefinitely.
     if !has_water_above {
         return None;
     }
     let (sx1, sx2) = if coin { (1, -1) } else { (-1, 1) };
     for dx in [sx1, sx2] {
         let side = pos + IVec3::new(dx, 0, 0);
-        if is_open(side) && is_solid(side + IVec3::NEG_Y) {
+        if is_open(side) && is_supported(side + IVec3::NEG_Y) {
             return Some(side);
         }
     }
     let (sz1, sz2) = if coin2 { (1, -1) } else { (-1, 1) };
     for dz in [sz1, sz2] {
         let side = pos + IVec3::new(0, 0, dz);
-        if is_open(side) && is_solid(side + IVec3::NEG_Y) {
+        if is_open(side) && is_supported(side + IVec3::NEG_Y) {
             return Some(side);
         }
     }
 
     None
+}
+
+/// The four horizontal step directions in a randomized order: `coin` picks
+/// the sign within each axis, `coin2` picks which axis is tried first --
+/// same de-biasing role the coins already play in the fall/spread rules.
+fn flow_dirs(coin: bool, coin2: bool) -> [IVec3; 4] {
+    let (x1, x2) = if coin { (IVec3::X, IVec3::NEG_X) } else { (IVec3::NEG_X, IVec3::X) };
+    let (z1, z2) = if coin { (IVec3::Z, IVec3::NEG_Z) } else { (IVec3::NEG_Z, IVec3::Z) };
+    if coin2 { [x1, x2, z1, z2] } else { [z1, z2, x1, x2] }
 }
 
 #[cfg(test)]
@@ -414,6 +455,97 @@ mod tests {
             .iter()
             .any(|&p| world.get_voxel(p) == WATER);
         assert!(neighbor_has_water, "water must spread onto at least one flat neighbor over 40 ticks");
+    }
+
+    #[test]
+    fn tall_column_levels_across_a_shorter_water_column() {
+        let mut world = World::new(WorldConfig {
+            voxel_size_m: 1.0,
+            extent_m: [16.0, 16.0, 16.0],
+            ..WorldConfig::default()
+        });
+        world.set_solid_table(vec![false, false, true]); // [air, water, stone]
+        let (_, max) = world.bounds_voxels();
+        world.fill_box(IVec3::ZERO, IVec3::new(max.x, 5, max.z), Voxel(2));
+
+        // A two-column, one-cell-wide trough. The only horizontal route is
+        // between x=7 and x=8, so a 3-high column beside a 1-high column
+        // must relax into two equally high columns rather than avalanche.
+        world.fill_box(IVec3::new(6, 5, 7), IVec3::new(10, 9, 10), Voxel(2));
+        world.fill_box(IVec3::new(7, 5, 8), IVec3::new(9, 8, 9), AIR);
+
+        let mut sim = FluidSim::new(WATER);
+        for p in [
+            IVec3::new(7, 5, 8),
+            IVec3::new(7, 6, 8),
+            IVec3::new(7, 7, 8),
+            IVec3::new(8, 5, 8),
+        ] {
+            sim.place_blob(&mut world, p, 0, WATER);
+        }
+
+        for _ in 0..10 {
+            sim.tick(&mut world);
+            if sim.active_count() == 0 {
+                break;
+            }
+        }
+
+        for p in [
+            IVec3::new(7, 5, 8),
+            IVec3::new(7, 6, 8),
+            IVec3::new(8, 5, 8),
+            IVec3::new(8, 6, 8),
+        ] {
+            assert_eq!(world.get_voxel(p), WATER, "the two columns must level to height two");
+        }
+        assert_eq!(sim.active_count(), 0, "the leveled surface must sleep");
+    }
+
+    #[test]
+    fn a_dropped_blob_flattens_into_a_sheet_instead_of_piling() {
+        // The sand-pile regression: a blob dropped onto a wide open floor
+        // used to settle as a stable stepped pyramid, because surface cells
+        // (no water above) could never move sideways and their diagonals
+        // were already water. Real water must keep flowing outward until it
+        // is one cell deep -- no cell may end up resting on top of another.
+        let mut world = World::new(WorldConfig {
+            voxel_size_m: 1.0,
+            extent_m: [40.0, 40.0, 40.0],
+            ..WorldConfig::default()
+        });
+        world.set_solid_table(vec![false, false, true]); // [air, water, stone]
+        let (_, max) = world.bounds_voxels();
+        world.fill_box(IVec3::ZERO, IVec3::new(max.x, 5, max.z), Voxel(2)); // floor top at y=5
+
+        let mut sim = FluidSim::new(WATER);
+        sim.place_blob(&mut world, IVec3::new(20, 9, 20), 2, WATER);
+        let before = count_water(&world);
+
+        for _ in 0..400 {
+            sim.tick(&mut world);
+            if sim.active_count() == 0 {
+                break;
+            }
+        }
+
+        assert_eq!(sim.active_count(), 0, "the spread sheet must sleep");
+        assert_eq!(count_water(&world), before, "flattening must conserve water");
+        let (min, max) = world.bounds_voxels();
+        for x in min.x..max.x {
+            for y in min.y..max.y {
+                for z in min.z..max.z {
+                    let p = IVec3::new(x, y, z);
+                    if world.get_voxel(p) == WATER {
+                        assert_ne!(
+                            world.get_voxel(p + IVec3::Y),
+                            WATER,
+                            "no water may rest on other water on an open floor (pile at {p})"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

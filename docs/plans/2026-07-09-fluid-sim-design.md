@@ -53,16 +53,23 @@ Pure, unit-testable core (mirrors `destruction.rs`'s carve functions: takes a `W
 
 1. **Fall**: if the cell directly below is empty and non-solid, move there.
 2. **Diagonal**: else, try down-left / down-right (random order) if empty.
-3. **Spread**: else, a cell with water directly above it may move sideways
-   onto an open cell supported by real solid terrain.
+3. **Flow**: else, scan each horizontal direction (random order) up to
+   `FLOW_HORIZON` open cells for a *drop* — an open cell with air beneath —
+   and take one step toward the nearest. This is the rule that stops mounds
+   from freezing into stable stepped pyramids ("piling like sand"): surface
+   cells walk over the water beneath them to the pile's edge and fall off,
+   so a blob dropped on open ground flattens into a one-deep sheet.
+4. **Spread**: else, a cell with water directly above it may move sideways
+   onto an open cell supported by terrain or another water cell.
+5. **Settle**: none apply — drop out of the active set.
 
-4. **Settle**: none apply — drop out of the active set.
-
-The pressure gate is important for a binary full/empty grid. An
-unpressurized one-cell-deep surface would otherwise trade places with any
-same-height air cell forever, continually remeshing a partially filled lake.
-Water still spreads while a column has vertical head, then sleeps once it has
-settled into a stable stepped surface.
+The flow rule is safe against random-walking because it only ever moves when
+a strictly lower destination is reachable — a flat sheet or a full basin has
+no drop in range and sleeps. The pressure gate on rule 4 remains important
+for the same reason: an unpressurized one-cell-deep surface must not trade
+places with any same-height air cell forever, continually remeshing a
+partially filled lake. Water still levels while a column has vertical head,
+then sleeps once the surface is stable.
 
 A move reactivates only water neighboring both its old and new positions. This wakes water whose support moved earlier in the same tick without keeping air cells active.
 

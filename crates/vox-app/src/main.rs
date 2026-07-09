@@ -842,11 +842,11 @@ impl App for VoxApp {
         }
         if input.key_pressed(KeyCode::BracketLeft) {
             self.tools.shrink_radius();
-            tracing::info!(radius_m = self.tools.radius_m, "tool radius");
+            tracing::info!(radius_m = self.tools.active_radius_m(), "tool radius");
         }
         if input.key_pressed(KeyCode::BracketRight) {
             self.tools.grow_radius();
-            tracing::info!(radius_m = self.tools.radius_m, "tool radius");
+            tracing::info!(radius_m = self.tools.active_radius_m(), "tool radius");
         }
         if input.key_pressed(KeyCode::F3) {
             self.debug_visible = !self.debug_visible;
@@ -971,7 +971,7 @@ impl App for VoxApp {
             radius_m: self
                 .tools
                 .has_adjustable_radius()
-                .then_some(self.tools.radius_m),
+                .then_some(self.tools.active_radius_m()),
             material_name: self
                 .material_names
                 .get(self.selected_material)
@@ -994,7 +994,7 @@ impl App for VoxApp {
             bodies_awake: self.phys.awake_count(),
             bodies_total: self.phys.body_count(),
             particles: self.particles.len(),
-            tool_radius: &mut self.tools.radius_m,
+            tool_radius: self.tools.active_radius_mut(),
             material_names: &self.material_names,
             selected_material: &mut self.selected_material,
         });

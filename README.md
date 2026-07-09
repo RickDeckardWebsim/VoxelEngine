@@ -53,7 +53,7 @@ world.
 | 2 | Scalable Dig | Carves a sphere of adjustable radius; severed material falls under gravity alone -- no impulse. |
 | 3 | Bomb | Carves a sphere of adjustable radius and gives the debris an outward blast impulse. |
 | 4 | Death Laser | An effectively infinite-range beam that tunnels straight through everything in its path in one shot -- no raycast gate, no impulse, just an instant, total cut. |
-| 5 | Place Water | Fills a sphere of adjustable radius with water at the crosshair target; it starts flowing immediately. |
+| 5 | Place Water | Fills a 0.5 m default, adjustable water source on the empty face of the targeted terrain; it starts flowing immediately. |
 
 Slots 6-9 are reserved for future tools.
 

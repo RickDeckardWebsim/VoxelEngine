@@ -4,7 +4,7 @@
 
 use glam::{IVec3, Vec3};
 use vox_core::consts::REACH;
-use vox_core::{MaterialRegistry, voxel_at, voxel_center_m};
+use vox_core::{MaterialRegistry, voxel_center_m};
 use vox_physics::{Aabb, BodyId, PhysicsWorld};
 use vox_sim::FluidSim;
 use vox_world::{AIR, Voxel, World, raycast};
@@ -26,8 +26,8 @@ pub enum Tool {
     /// through everything in its path in one shot -- no impulse, just an
     /// instant, precise cut.
     DeathLaser,
-    /// Slot 5: place a sphere of water at the crosshair target (radius
-    /// shares `Tools::radius_m` with Scalable Dig / Bomb).
+    /// Slot 5: place a sphere of water at the crosshair target using its own
+    /// adjustable source radius.
     PlaceWater,
 }
 
@@ -47,6 +47,11 @@ const TOOL_RADIUS_MIN: f32 = 0.5;
 const TOOL_RADIUS_MAX: f32 = 4.0;
 /// Per-keypress / per-wheel-notch radius step, in meters.
 const TOOL_RADIUS_STEP: f32 = 0.25;
+/// Water starts as a modest source rather than inheriting Bomb's 1.5 m
+/// radius. At the default 0.1 m voxel scale this is a radius-five blob,
+/// small enough to flow as a pool without immediately becoming a huge
+/// budget-limited avalanche.
+const WATER_RADIUS_DEFAULT: f32 = 0.5;
 /// Beam range for [`Tool::DeathLaser`], in meters -- deliberately far beyond
 /// any reasonable world size ("infinite reach"); [`vox_physics::laser`]
 /// clamps its own search box to the world's actual bounds, so this never
@@ -172,11 +177,12 @@ fn carve_body_sphere(
     body_outcome(phys, id, spawned)
 }
 
-/// Tool state: active tool, selected build material, and the shared
-/// dig/bomb radius.
+/// Tool state: active tool, selected build material, and independently
+/// adjustable destructive-tool and water-source radii.
 pub struct Tools {
     pub tool: Tool,
     pub radius_m: f32,
+    water_radius_m: f32,
     /// Index into the registry (skips air).
     material_index: usize,
     material_count: usize,
@@ -187,6 +193,7 @@ impl Tools {
         Self {
             tool: Tool::Dig,
             radius_m: vox_core::consts::BLAST_RADIUS,
+            water_radius_m: WATER_RADIUS_DEFAULT,
             material_index: 1,
             material_count: registry.len(),
         }
@@ -199,6 +206,24 @@ impl Tools {
         matches!(self.tool, Tool::ScalableDig | Tool::Bomb | Tool::PlaceWater)
     }
 
+    /// Radius currently controlled by the wheel, bracket keys, HUD, and
+    /// debug overlay. Water intentionally keeps its own source radius so a
+    /// prior large bomb cannot turn it into an enormous voxel avalanche.
+    pub fn active_radius_m(&self) -> f32 {
+        match self.tool {
+            Tool::PlaceWater => self.water_radius_m,
+            _ => self.radius_m,
+        }
+    }
+
+    /// Mutable counterpart to [`Tools::active_radius_m`].
+    pub fn active_radius_mut(&mut self) -> &mut f32 {
+        match self.tool {
+            Tool::PlaceWater => &mut self.water_radius_m,
+            _ => &mut self.radius_m,
+        }
+    }
+
     /// Select a hotbar slot (1-9) by key number. Slots not in [`HOTBAR`] do
     /// nothing. Returns the newly active tool if the slot changed it.
     pub fn select_hotbar_slot(&mut self, slot: u8) -> Option<Tool> {
@@ -209,19 +234,21 @@ impl Tools {
 
     /// Shrink the tool radius by one step, clamped to [`TOOL_RADIUS_MIN`].
     pub fn shrink_radius(&mut self) {
-        self.radius_m = (self.radius_m - TOOL_RADIUS_STEP).max(TOOL_RADIUS_MIN);
+        let radius = self.active_radius_mut();
+        *radius = (*radius - TOOL_RADIUS_STEP).max(TOOL_RADIUS_MIN);
     }
 
     /// Grow the tool radius by one step, clamped to [`TOOL_RADIUS_MAX`].
     pub fn grow_radius(&mut self) {
-        self.radius_m = (self.radius_m + TOOL_RADIUS_STEP).min(TOOL_RADIUS_MAX);
+        let radius = self.active_radius_mut();
+        *radius = (*radius + TOOL_RADIUS_STEP).min(TOOL_RADIUS_MAX);
     }
 
     /// Adjust the tool radius by `steps` notches (e.g. mouse wheel delta),
     /// clamped to [`TOOL_RADIUS_MIN`]/[`TOOL_RADIUS_MAX`].
     pub fn adjust_radius(&mut self, steps: i32) {
-        self.radius_m =
-            (self.radius_m + steps as f32 * TOOL_RADIUS_STEP).clamp(TOOL_RADIUS_MIN, TOOL_RADIUS_MAX);
+        let radius = self.active_radius_mut();
+        *radius = (*radius + steps as f32 * TOOL_RADIUS_STEP).clamp(TOOL_RADIUS_MIN, TOOL_RADIUS_MAX);
     }
 
     /// Currently selected build material.
@@ -448,7 +475,7 @@ impl Tools {
         }
     }
 
-    /// Place Water: fill a sphere of [`Tools::radius_m`] with water at the
+    /// Place Water: fill a sphere of the water-source radius with water at the
     /// crosshair target and hand the filled cells to `fluid` so they start
     /// flowing immediately. Unlike every other tool, this never touches
     /// `PhysicsWorld` -- it can't hit or carve a body, only the static
@@ -471,9 +498,12 @@ impl Tools {
         let Some(water_id) = registry.id_by_name("water") else {
             return; // asset set doesn't define water; nothing to place
         };
+        let Some(face) = hit.face else {
+            return; // Eye started inside terrain, so there is no empty hit face.
+        };
         let s = world.cfg.voxel_size_m;
-        let center_vox = voxel_at(eye_m + dir * hit.dist_m, s);
-        let radius_vox = (self.radius_m / s).round() as i32;
+        let center_vox = hit.voxel + face;
+        let radius_vox = (self.water_radius_m / s).round() as i32;
         fluid.place_blob(world, center_vox, radius_vox, Voxel(water_id.0));
     }
 }
@@ -509,6 +539,20 @@ mod tests {
 
         assert_eq!(tools.select_hotbar_slot(5), Some(Tool::PlaceWater));
         assert_eq!(tools.tool, Tool::PlaceWater);
+    }
+
+    #[test]
+    fn water_keeps_a_smaller_radius_than_bomb_tools() {
+        let mut tools = Tools::new(&registry());
+        let destructive_radius = tools.radius_m;
+
+        tools.select_hotbar_slot(5);
+        assert_eq!(tools.active_radius_m(), WATER_RADIUS_DEFAULT);
+        tools.grow_radius();
+        assert!(tools.active_radius_m() > WATER_RADIUS_DEFAULT);
+
+        tools.select_hotbar_slot(3);
+        assert_eq!(tools.active_radius_m(), destructive_radius);
     }
 
     /// A 1-voxel-wide wood pillar at a fixed, known footprint (x,z = 5,5),
@@ -920,6 +964,38 @@ mod tests {
     }
 
     #[test]
+    fn place_water_uses_the_empty_voxel_on_the_hit_face() {
+        // With 2 m voxels, Water's 0.5 m default radius rounds to zero
+        // voxels. That makes the test distinguish the face-adjacent target
+        // from the struck solid voxel exactly.
+        let reg = registry_with_water();
+        let water = water_voxel(&reg);
+        let stone = stone_id(&reg);
+        let mut world = World::new(WorldConfig {
+            voxel_size_m: 2.0,
+            extent_m: [32.0, 32.0, 32.0],
+            ..WorldConfig::default()
+        });
+        world.set_solid_table(solid_table_for(&reg));
+        let hit_voxel = IVec3::new(4, 4, 4);
+        let target = hit_voxel + IVec3::NEG_X;
+        world.set_voxel(hit_voxel, stone);
+
+        let mut sim = FluidSim::new(water);
+        let tools = Tools::new(&reg);
+        tools.place_water(
+            &mut world,
+            &mut sim,
+            &reg,
+            Vec3::new(5.0, 9.0, 9.0),
+            Vec3::X,
+        );
+
+        assert_eq!(world.get_voxel(hit_voxel), stone, "water must not overwrite the struck terrain voxel");
+        assert_eq!(world.get_voxel(target), water, "water must begin on the hit face's adjacent air voxel");
+    }
+
+    #[test]
     fn place_water_fills_a_sphere_at_the_crosshair_and_activates_it() {
         let reg = registry_with_water();
         let mut world = World::new(WorldConfig {
@@ -1031,20 +1107,13 @@ mod tests {
              was ever breached)"
         );
 
-        // Give the water at the spillway a one-cell head. Full/empty water
-        // uses vertical head for equal-height spreading, which lets a pool
-        // sleep without an exposed one-cell-deep surface random-walking.
-        // The large settled basin already fills its floor; this is the
-        // smallest extra head needed to make the drain path deterministic.
-        let head_base = IVec3::new(10, 5, 15);
-        let head = head_base + IVec3::Y;
-        assert_eq!(world.get_voxel(head_base), water, "the settled lake must cover the spillway floor cell");
-        if world.get_voxel(head) == AIR {
-            sim.place_blob(&mut world, head, 0, water);
-            sim.tick(&mut world);
-        }
-        assert_eq!(world.get_voxel(head), water, "the spillway must have vertical water head");
-        assert_eq!(sim.active_count(), 0, "the added head must settle before the breach is dug");
+        // No manufactured vertical head needed: the flow rule lets a
+        // blocked cell walk toward any drop within its horizon, so opening
+        // the breach below is enough for the water beside it to find the
+        // way out. Just confirm the settled lake actually reaches the wall
+        // that's about to be breached.
+        let spillway = IVec3::new(10, 5, 15);
+        assert_eq!(world.get_voxel(spillway), water, "the settled lake must cover the spillway floor cell");
 
         // Model the real frame-loop handoff precisely: discard all old
         // regions, make the two terrain edits, then wake from exactly the
