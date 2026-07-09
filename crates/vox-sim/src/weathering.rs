@@ -6,7 +6,7 @@
 //! `docs/plans/2026-07-09-water-refinement-design.md` §3.
 
 use glam::IVec3;
-use vox_core::FxHashMap;
+use vox_core::{FxHashMap, FxHashSet};
 use vox_world::{Voxel, World};
 
 use crate::fluid::ContactEvent;
@@ -17,8 +17,9 @@ pub const GRASS_SOAK_TICKS: u32 = 45; // ~3 s
 pub const DIRT_SOAK_TICKS: u32 = 105; // ~7 s
 /// Soak ticks of *flowing* contact before stone erodes to sand.
 pub const STONE_ERODE_TICKS: u32 = 450; // ~30 s
-/// Waterfall multiplier: stone touched by *falling* water accrues this many
-/// soak ticks per tick.
+/// Waterfall multiplier: stone touched by a `Fell` event *this tick* accrues
+/// this many soak ticks per tick (re-derived each tick, not stored -- a
+/// waterfall that pools into still water slows to 1x once the falling stops).
 pub const STONE_FALL_BOOST: u32 = 5;
 /// Dry ticks (no adjacent water) before mud firms back to dirt.
 pub const MUD_DRY_TICKS: u32 = 300; // ~20 s
@@ -44,16 +45,9 @@ pub struct WeatherTable {
     pub sand: Voxel,
 }
 
-#[derive(Clone, Copy)]
-struct Soak {
-    ticks: u32,
-    /// Stone touched by falling water accrues `STONE_FALL_BOOST` per tick.
-    fall_boost: bool,
-}
-
 pub struct Weathering {
     table: WeatherTable,
-    soaking: FxHashMap<IVec3, Soak>,
+    soaking: FxHashMap<IVec3, u32>,
     drying: FxHashMap<IVec3, u32>,
 }
 
@@ -76,7 +70,12 @@ impl Weathering {
         // 1. Register: water contact puts transformable neighbors on the
         // soak clock; any contact re-wets mud (cancels drying). Stone only
         // registers for *moving* water -- a settled lake never eats its
-        // basin.
+        // basin. `fell_this_tick` is the set of stone cells a `Fell` event
+        // touched *this tick*; the boost is re-derived every tick from it
+        // rather than stored, so a waterfall that pools into still water
+        // slows to 1x the moment the falling stops (design §3.2: "~5x
+        // faster" is while falling, not once fell, forever).
+        let mut fell_this_tick: FxHashSet<IVec3> = FxHashSet::default();
         for &ev in events {
             let (pos, moving, fell) = match ev {
                 ContactEvent::Fell(p) => (p, true, true),
@@ -99,8 +98,10 @@ impl Weathering {
                 if v == t.mud {
                     self.drying.remove(&q); // re-wetted
                 } else if v == t.grass || v == t.dirt || (v == t.stone && moving) {
-                    let entry = self.soaking.entry(q).or_insert(Soak { ticks: 0, fall_boost: false });
-                    entry.fall_boost |= fell && v == t.stone;
+                    self.soaking.entry(q).or_insert(0);
+                    if fell && v == t.stone {
+                        fell_this_tick.insert(q);
+                    }
                 }
             }
         }
@@ -108,7 +109,7 @@ impl Weathering {
         // 2. Advance soaking. Entries whose water left, or whose material
         // changed under them (blasted, dug), simply drop out.
         let mut converted = Vec::new();
-        self.soaking.retain(|&pos, soak| {
+        self.soaking.retain(|&pos, ticks| {
             let v = world.get_voxel(pos);
             let threshold = if v == t.grass {
                 GRASS_SOAK_TICKS
@@ -123,8 +124,8 @@ impl Weathering {
             if !NEIGHBORS_6.iter().any(|&n| world.get_voxel(pos + n) == t.water) {
                 return false;
             }
-            soak.ticks += if v == t.stone && soak.fall_boost { STONE_FALL_BOOST } else { 1 };
-            if soak.ticks >= threshold {
+            *ticks += if v == t.stone && fell_this_tick.contains(&pos) { STONE_FALL_BOOST } else { 1 };
+            if *ticks >= threshold {
                 converted.push((pos, v));
                 return false;
             }
@@ -142,7 +143,7 @@ impl Weathering {
             // Fresh dirt under standing water keeps soaking toward mud --
             // this is the grass -> dirt -> mud progression.
             if to == t.dirt {
-                self.soaking.insert(pos, Soak { ticks: 0, fall_boost: false });
+                self.soaking.insert(pos, 0);
             }
         }
 
@@ -251,16 +252,20 @@ mod tests {
         }
         assert_eq!(world.get_voxel(cell), SAND);
 
-        // Falling: a second stone cell erodes ~5x sooner.
+        // Falling: a continuous waterfall -- a Fell event *every tick* --
+        // erodes ~5x sooner than the horizontal flow. (The boost is
+        // re-derived per tick from this tick's Fell events, so it only
+        // applies while water is actually falling onto the stone.)
         let mut world = world_with_floor(STONE);
         let mut weathering = Weathering::new(table());
         world.set_voxel(cell + IVec3::Y, WATER);
         let mut ticks_falling = 0;
+        // Seed the soak entry with one Fell, then keep falling every tick.
         weathering.tick(&mut world, &[ContactEvent::Fell(cell + IVec3::Y)]);
         while world.get_voxel(cell) == STONE {
-            weathering.tick(&mut world, &[]);
+            weathering.tick(&mut world, &[ContactEvent::Fell(cell + IVec3::Y)]);
             ticks_falling += 1;
-            assert!(ticks_falling <= STONE_ERODE_TICKS / STONE_FALL_BOOST + 2, "waterfall erosion must be ~5x faster");
+            assert!(ticks_falling <= STONE_ERODE_TICKS / STONE_FALL_BOOST + 2, "continuous waterfall erosion must be ~5x faster");
         }
         assert!(ticks_falling < ticks_flowing / 3, "falling ({ticks_falling}) must be much faster than flowing ({ticks_flowing})");
     }
@@ -277,5 +282,46 @@ mod tests {
         weathering.tick(&mut world, &[]);
         assert_eq!(weathering.soaking_count(), 0, "no adjacent water -> entry removed");
         assert_eq!(world.get_voxel(cell), GRASS, "and the grass survives");
+    }
+
+    // A waterfall that registers stone, then pools into still water, must
+    // slow to 1x the moment the falling stops. The boost is re-derived each
+    // tick from that tick's Fell events, not stored on the soak entry -- so
+    // once only Settled events arrive, erosion continues at the normal
+    // still-water-adjacency rate (design §3.2 step 2 re-verifies adjacency,
+    // not motion). This guards against regressing back to a sticky flag.
+    #[test]
+    fn waterfall_that_settles_slows_to_normal_rate() {
+        let mut world = world_with_floor(STONE);
+        let mut weathering = Weathering::new(table());
+        let cell = IVec3::new(8, 4, 8);
+        let above = cell + IVec3::Y;
+        world.set_voxel(above, WATER);
+
+        // One Fell registers the stone; thereafter only Settled (still water).
+        weathering.tick(&mut world, &[ContactEvent::Fell(above)]);
+        assert_eq!(weathering.soaking_count(), 1, "Fell must register the stone");
+
+        // Run under still water up to just past the boosted threshold. If the
+        // boost were sticky, stone would erode by ~90 ticks. At the 1x rate
+        // it must still be stone well past 90.
+        for _ in 0..(STONE_ERODE_TICKS / STONE_FALL_BOOST + 10) {
+            weathering.tick(&mut world, &[ContactEvent::Settled(above)]);
+            assert_eq!(world.get_voxel(cell), STONE,
+                "stone must not erode at the 5x rate once water has settled");
+        }
+        // ...but it must still erode at the normal 1x rate eventually, since
+        // the entry persists (adjacency continuation is by design).
+        let mut ticks = 0;
+        while world.get_voxel(cell) == STONE {
+            weathering.tick(&mut world, &[ContactEvent::Settled(above)]);
+            ticks += 1;
+            assert!(ticks < STONE_ERODE_TICKS, "must erode near the normal threshold, not never");
+        }
+        assert_eq!(world.get_voxel(cell), SAND);
+        // Total ticks (excluding the seed) is close to STONE_ERODE_TICKS, the
+        // 1x rate -- NOT STONE_ERODE_TICKS / 5.
+        assert!(ticks > STONE_ERODE_TICKS / 2,
+            "settled-water erosion must run at ~1x, not the 5x waterfall rate: {ticks}");
     }
 }
