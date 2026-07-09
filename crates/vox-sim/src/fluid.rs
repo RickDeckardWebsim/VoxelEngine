@@ -95,8 +95,9 @@ impl FluidSim {
 
     /// Advance every active cell by one tick: move it per `step_cell`, or
     /// drop it from the active set if it has settled. A cell that moves
-    /// reactivates itself, its destination, and the destination's neighbors
-    /// -- the entire wake cascade, no separate propagation pass needed.
+    /// reactivates its destination plus water neighboring either the old or
+    /// new position -- the entire wake cascade, no separate propagation pass
+    /// needed.
     pub fn tick(&mut self, world: &mut World) -> usize {
         let water = self.water;
 
@@ -144,21 +145,28 @@ impl FluidSim {
         for pos in cells {
             let coin = self.next_u64() & 1 == 0;
             let coin2 = self.next_u64() & 1 == 0;
-            let mut is_open = |p: IVec3| world.in_bounds(p) && world.get_voxel(p) == AIR;
-            let dest = step_cell(pos, &mut is_open, coin, coin2);
+            let dest = {
+                let mut is_open = |p: IVec3| world.in_bounds(p) && world.get_voxel(p) == AIR;
+                let mut is_solid = |p: IVec3| world.solid(p);
+                let has_water_above = world.get_voxel(pos + IVec3::Y) == water;
+                step_cell(pos, &mut is_open, &mut is_solid, has_water_above, coin, coin2)
+            };
             if let Some(dest) = dest {
                 world.set_voxel(pos, AIR);
                 world.set_voxel(dest, water);
                 next_active.insert(dest);
-                // Only wake neighbors that could ever actually flow -- solid
-                // terrain (e.g. the floor a settled cell rests on) never
-                // moves and never becomes water on its own, so adding it
-                // here would violate the crate's own invariant that "not in
-                // the active set" means settled/inert (see the struct doc).
-                for n in NEIGHBORS_6 {
-                    let neighbor = dest + n;
-                    if !world.solid(neighbor) {
-                        next_active.insert(neighbor);
+                // Wake only actual water, not generic non-solid cells (air
+                // used to be inserted here and inflated `active_count()` by
+                // one stale entry per neighboring empty voxel). Include the
+                // old position's neighbors too: if an upper cell was visited
+                // earlier in this snapshot, moving its support out from
+                // under it must give it another turn next tick.
+                for changed in [pos, dest] {
+                    for n in NEIGHBORS_6 {
+                        let neighbor = changed + n;
+                        if world.get_voxel(neighbor) == water {
+                            next_active.insert(neighbor);
+                        }
                     }
                 }
             } // else: settled -- not re-added
@@ -167,11 +175,15 @@ impl FluidSim {
         processed
     }
 
-    /// Reactivate any water cell inside `[min, max)` -- called from the same
-    /// dirty-region drain loop that already wakes physics bodies on a world
-    /// edit (`PhysicsWorld::wake_region`), so digging into a lake or
-    /// blasting open a reservoir wall lets it flow immediately.
+    /// Reactivate water inside or directly adjacent to `[min, max)`. World
+    /// edits report the cells they changed, rather than their neighbors: a
+    /// wall voxel just changed to air contains no water itself, so the
+    /// one-cell halo is what wakes the settled water immediately against that
+    /// new opening. Bounds are clipped before scanning.
     pub fn wake_region(&mut self, world: &World, min: IVec3, max: IVec3) {
+        let (bounds_min, bounds_max) = world.bounds_voxels();
+        let min = (min.max(bounds_min) - IVec3::ONE).max(bounds_min);
+        let max = (max.min(bounds_max) + IVec3::ONE).min(bounds_max);
         for x in min.x..max.x {
             for y in min.y..max.y {
                 for z in min.z..max.z {
@@ -188,11 +200,18 @@ impl FluidSim {
 /// Where a water cell at `pos` wants to move this tick, or `None` if it has
 /// nowhere to go (should settle). `is_open` reports whether a cell can be
 /// flowed into: empty (air) and in-bounds. Order of preference: straight
-/// down, then diagonal-down (randomized left/right), then sideways spread
-/// along a supported flat surface (randomized left/right, then randomized
+/// down, then diagonal-down (randomized left/right), then pressure-gated
+/// sideways spread onto solid terrain (randomized left/right, then
 /// front/back) -- see the design doc §4 for why this shape and not
 /// fractional pressure levels.
-fn step_cell(pos: IVec3, is_open: &mut impl FnMut(IVec3) -> bool, coin: bool, coin2: bool) -> Option<IVec3> {
+fn step_cell(
+    pos: IVec3,
+    is_open: &mut impl FnMut(IVec3) -> bool,
+    is_solid: &mut impl FnMut(IVec3) -> bool,
+    has_water_above: bool,
+    coin: bool,
+    coin2: bool,
+) -> Option<IVec3> {
     let down = pos + IVec3::NEG_Y;
     if is_open(down) {
         return Some(down);
@@ -213,19 +232,27 @@ fn step_cell(pos: IVec3, is_open: &mut impl FnMut(IVec3) -> bool, coin: bool, co
         }
     }
 
-    // Sideways spread requires support directly below the destination --
-    // otherwise this degenerates into the diagonal case, which already ran.
+    // A full/empty grid cannot represent a fractional, one-cell-deep water
+    // surface. Letting an unpressurized surface cell trade places with any
+    // equally-high air cell makes a partially filled puddle random-walk
+    // forever. Require water directly above the source, and real solid
+    // terrain below the destination, so a stack can drain while a shallow
+    // resting surface can sleep instead of shuffling across another water
+    // layer indefinitely.
+    if !has_water_above {
+        return None;
+    }
     let (sx1, sx2) = if coin { (1, -1) } else { (-1, 1) };
     for dx in [sx1, sx2] {
         let side = pos + IVec3::new(dx, 0, 0);
-        if is_open(side) && !is_open(side + IVec3::NEG_Y) {
+        if is_open(side) && is_solid(side + IVec3::NEG_Y) {
             return Some(side);
         }
     }
     let (sz1, sz2) = if coin2 { (1, -1) } else { (-1, 1) };
     for dz in [sz1, sz2] {
         let side = pos + IVec3::new(0, 0, dz);
-        if is_open(side) && !is_open(side + IVec3::NEG_Y) {
+        if is_open(side) && is_solid(side + IVec3::NEG_Y) {
             return Some(side);
         }
     }
@@ -302,59 +329,34 @@ mod tests {
     }
 
     #[test]
+    fn active_set_contains_only_water_after_a_move() {
+        let mut world = test_world();
+        let mut sim = FluidSim::new(WATER);
+        sim.place_blob(&mut world, IVec3::new(8, 6, 8), 0, WATER);
+
+        sim.tick(&mut world);
+
+        assert_eq!(world.get_voxel(IVec3::new(8, 5, 8)), WATER);
+        assert_eq!(sim.active_count(), 1, "only the moved water cell should remain active");
+    }
+
+    #[test]
     fn water_settles_on_a_flat_floor_and_leaves_the_active_set() {
-        // Deviation from the plan's verbatim test: placed at y=6 with a
-        // comment claiming it "sits directly on the floor," but
-        // `test_world()`'s `fill_box` is half-open ([min, max)), so the
-        // floor's solid top is y=4 and the open resting surface is y=5 --
-        // a cell at y=6 has one cell of air beneath it and falls first.
-        // Moved to y=5 to match the actual resting surface (same fix
-        // already applied to `a_single_cell_falls_under_gravity`'s target).
-        //
-        // Second, deeper deviation: on `test_world()`'s open, unobstructed
-        // floor, a lone settled droplet can *never* reach `step_cell`'s
-        // `None` branch, for any tick count -- away from the world edge at
-        // least one sideways neighbor is always open+supported (down and
-        // both diagonals are blocked by the same flat floor, but sideways
-        // has no equivalent "why would I move" check for an isolated
-        // droplet with no other water pushing it). Verified both by hand
-        // trace and empirically: run to 200 ticks under the original open
-        // floor, `active_count()` never dropped below 7. So this test
-        // walls the drop point in on all 4 sides -- matching what its own
-        // "nowhere to spread" comment actually describes -- rather than
-        // leaving it on the open floor the given `test_world()` builds.
-        // `step_cell` itself is untouched; only this test's setup changed.
         let mut world = test_world();
         let center = IVec3::new(8, 5, 8);
-        for wall in [IVec3::new(9, 5, 8), IVec3::new(7, 5, 8), IVec3::new(8, 5, 9), IVec3::new(8, 5, 7)] {
-            world.set_voxel(wall, Voxel(2)); // stone -- blocks every sideways direction
-        }
         let mut sim = FluidSim::new(WATER);
         sim.place_blob(&mut world, center, 0, WATER);
-        for _ in 0..10 {
-            sim.tick(&mut world);
-        }
-        assert_eq!(sim.active_count(), 0, "a single cell walled in on every side with nowhere to spread must settle");
+        sim.tick(&mut world);
+        assert_eq!(sim.active_count(), 0, "a shallow cell on solid ground must sleep");
     }
 
     #[test]
     fn wake_region_reactivates_settled_water_inside_it() {
-        // Same adaptation as `water_settles_on_a_flat_floor_and_leaves_the_active_set`
-        // above: `test_world()`'s resting surface is y=5 (not the plan's
-        // literal y=6), and a lone unwalled cell on that open floor never
-        // settles (`active_count()` never reaches 0, since sideways is
-        // always open) -- so this walls the drop point in on all 4 sides,
-        // same as the settle test, before checking it actually settles.
         let mut world = test_world();
         let center = IVec3::new(8, 5, 8);
-        for wall in [IVec3::new(9, 5, 8), IVec3::new(7, 5, 8), IVec3::new(8, 5, 9), IVec3::new(8, 5, 7)] {
-            world.set_voxel(wall, Voxel(2)); // stone -- blocks every sideways direction
-        }
         let mut sim = FluidSim::new(WATER);
         sim.place_blob(&mut world, center, 0, WATER);
-        for _ in 0..10 {
-            sim.tick(&mut world);
-        }
+        sim.tick(&mut world);
         assert_eq!(sim.active_count(), 0, "must have settled first");
 
         sim.wake_region(&world, IVec3::new(7, 4, 7), IVec3::new(10, 6, 10));
@@ -362,18 +364,36 @@ mod tests {
     }
 
     #[test]
-    fn wake_region_does_not_touch_settled_water_outside_it() {
-        // Same walled-in settle setup as `wake_region_reactivates_settled_water_inside_it`.
+    fn wake_region_reactivates_water_adjacent_to_an_exact_dirty_cell() {
         let mut world = test_world();
         let center = IVec3::new(8, 5, 8);
-        for wall in [IVec3::new(9, 5, 8), IVec3::new(7, 5, 8), IVec3::new(8, 5, 9), IVec3::new(8, 5, 7)] {
-            world.set_voxel(wall, Voxel(2)); // stone -- blocks every sideways direction
-        }
         let mut sim = FluidSim::new(WATER);
         sim.place_blob(&mut world, center, 0, WATER);
-        for _ in 0..10 {
-            sim.tick(&mut world);
+        sim.tick(&mut world);
+        assert_eq!(sim.active_count(), 0, "must have settled first");
+
+        // Build a wall after the water has settled, discard that setup edit,
+        // then remove exactly one wall cell. `World` reports only that one
+        // changed cell; the sim must include its neighboring water itself.
+        let wall = center + IVec3::X;
+        world.drain_dirty_regions();
+        world.set_voxel(wall, Voxel(2));
+        world.drain_dirty_regions();
+        world.set_voxel(wall, AIR);
+        for (min, max) in world.drain_dirty_regions() {
+            sim.wake_region(&world, min, max);
         }
+
+        assert!(sim.active_count() > 0, "an adjacent water cell must wake for an exact dirty region");
+    }
+
+    #[test]
+    fn wake_region_does_not_touch_settled_water_outside_it() {
+        let mut world = test_world();
+        let center = IVec3::new(8, 5, 8);
+        let mut sim = FluidSim::new(WATER);
+        sim.place_blob(&mut world, center, 0, WATER);
+        sim.tick(&mut world);
         assert_eq!(sim.active_count(), 0, "must have settled first");
 
         sim.wake_region(&world, IVec3::new(0, 0, 0), IVec3::new(2, 2, 2)); // nowhere near the water
@@ -382,33 +402,8 @@ mod tests {
 
     #[test]
     fn water_spreads_sideways_across_a_flat_floor() {
-        // Two deviations from the plan's verbatim test, both required to
-        // make this test meaningfully check "spread" rather than luck:
-        //
-        // 1. Same y=6->y=5 floor-surface fix as the settle test above: the
-        //    resting surface on `test_world()`'s floor is y=5, not y=6.
-        //
-        // 2. The verbatim test placed a *single* cell (`place_blob(..., 0,
-        //    WATER)`) and checked whether it was, after exactly 40 ticks,
-        //    at one of 4 positions exactly distance-1 from where it
-        //    started. But once a lone cell lands on this open, unobstructed
-        //    floor, `step_cell` never has down/diagonal open (flat floor)
-        //    and always has an unblocked sideways cell away from the world
-        //    edge -- so it moves exactly once per tick, every tick, with no
-        //    way to stand still. That makes its x-offset from the start
-        //    parity-locked to the tick count (even ticks -> even offset),
-        //    so distance-1 can *never* be reached after an even number of
-        //    ticks like 40, for any RNG seed -- confirmed this isn't a
-        //    per-seed fluke by scanning every tick count 1..80: only
-        //    total=1,3,5 ever passed, then never again as the random walk
-        //    drifted away. A lone droplet models a random walk, not
-        //    "spread." Switched to the same multi-cell blob shape Task 6's
-        //    own tests already use (center above the floor so placement
-        //    doesn't already touch it, radius 2 so multiple cells actively
-        //    fall and slide at once) -- this passed at every tick count
-        //    from 2 through 79 except a handful of isolated misses, i.e.
-        //    it's the tick count that no longer matters, which is what
-        //    "spreads over many ticks" should mean.
+        // A multi-cell blob has vertical head, so its lower cells can spread
+        // onto the solid floor. A single shallow cell deliberately sleeps.
         let mut world = test_world();
         let mut sim = FluidSim::new(WATER);
         sim.place_blob(&mut world, IVec3::new(8, 8, 8), 2, WATER);
@@ -419,6 +414,39 @@ mod tests {
             .iter()
             .any(|&p| world.get_voxel(p) == WATER);
         assert!(neighbor_has_water, "water must spread onto at least one flat neighbor over 40 ticks");
+    }
+
+    #[test]
+    fn partially_filled_basin_sleeps_after_spreading() {
+        let mut world = World::new(WorldConfig {
+            voxel_size_m: 1.0,
+            extent_m: [20.0, 20.0, 20.0],
+            ..WorldConfig::default()
+        });
+        world.set_solid_table(vec![false, false, true]); // [air, water, stone]
+        let (_, max) = world.bounds_voxels();
+        world.fill_box(IVec3::ZERO, IVec3::new(max.x, 5, max.z), Voxel(2));
+
+        // An 8x8 open basin with room well above the blob. Its bottom holds
+        // only 64 cells, while the radius-3 blob contains more, so the final
+        // state necessarily has a partially filled upper layer.
+        world.fill_box(IVec3::new(3, 5, 3), IVec3::new(13, 16, 13), Voxel(2));
+        world.fill_box(IVec3::new(4, 5, 4), IVec3::new(12, 16, 12), AIR);
+
+        let mut sim = FluidSim::new(WATER);
+        sim.place_blob(&mut world, IVec3::new(8, 9, 8), 3, WATER);
+        let before = count_water(&world);
+        assert!(before > 64, "the test needs more water than one basin layer holds");
+
+        for _ in 0..300 {
+            sim.tick(&mut world);
+            if sim.active_count() == 0 {
+                break;
+            }
+        }
+
+        assert_eq!(sim.active_count(), 0, "a partially filled basin must eventually sleep");
+        assert_eq!(count_water(&world), before, "settling must conserve water cells");
     }
 
     #[test]
@@ -477,22 +505,8 @@ mod tests {
         // documented trade-off -- see design doc §6 -- not a bug this test
         // is checking for.)
         //
-        // Deviation from the plan's verbatim test: placed at y=6 as if that
-        // were the resting surface, same as every other test in this file
-        // that assumed that before hitting `test_world()`'s actual
-        // half-open floor geometry (top solid voxel at y=4, open resting
-        // surface at y=5). Left at y=6 anyway here on purpose: this test
-        // does not assert anything about *where* the water ends up, only
-        // that the two scales end up in the *same relative place* as each
-        // other. A lone cell dropped at y=6 falls one tick to y=5 and then
-        // performs Task 7's already-documented tick-parity-locked
-        // single-cell random walk on the open floor -- deterministic, and
-        // driven by the same `rng` sequence and the same grid-relative
-        // start position at both scales, so both runs diverge from y=6
-        // identically. Confirmed empirically below (not just reasoned
-        // abstractly): the two runs match, and the result set is neither
-        // empty (the cell exists somewhere) nor sitting at the literal
-        // start position (it must have moved).
+        // Start one voxel above the floor: the cell falls once, then sleeps.
+        // The final grid-space pattern must remain independent of scale.
         fn run(scale: f32) -> Vec<IVec3> {
             let mut world = World::new(WorldConfig {
                 voxel_size_m: scale,

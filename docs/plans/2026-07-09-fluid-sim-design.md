@@ -43,9 +43,9 @@ New crate, `vox-core` + `vox-world` dependencies only (no `vox-physics` dependen
 
 - **No separate fluid grid.** Water lives in `World`'s real chunk storage as an ordinary material. This means chunk storage, dirty-region tracking, streaming-readiness, and the greedy mesher all apply to water automatically — the "add a system = add a crate" philosophy holds because the new crate adds *behavior*, not a second copy of *storage*.
 - **Active-cell set**: `FxHashSet<IVec3>` of currently-flowing water positions — the only state genuinely new to this crate, mirroring `PhysicsWorld`'s sleep bookkeeping. Settled water isn't in this set and costs nothing to tick.
-- **`FluidSim::tick(&mut self, world: &mut World, registry: &MaterialRegistry)`**: processes the active set once (see algorithm below), capped per call by a budget constant (same pattern as `MAX_DEBRIS_BODIES`) so a single tick can't spike frame time — overflow carries into the next tick.
-- **`FluidSim::wake_region(&mut self, min: IVec3, max: IVec3)`**: reactivates any settled water inside/adjacent to an edited region. Called from the same `drain_dirty_regions()` loop in `main.rs` that already wakes physics bodies.
-- **`FluidSim::place_blob(&mut self, world: &mut World, center: IVec3, radius: i32)`**: fills a sphere with water and activates every cell — backs the new hotbar tool.
+- **`FluidSim::tick(&mut self, world: &mut World)`**: processes the active set once (see algorithm below), capped per call by a budget constant (same pattern as `MAX_DEBRIS_BODIES`) so a single tick can't spike frame time — overflow carries into the next tick.
+- **`FluidSim::wake_region(&mut self, world: &World, min: IVec3, max: IVec3)`**: reactivates settled water inside or adjacent to an edited region. Called from the same `drain_dirty_regions()` loop in `main.rs` that already wakes physics bodies.
+- **`FluidSim::place_blob(&mut self, world: &mut World, center: IVec3, radius: i32, water: Voxel)`**: fills a sphere with water and activates every cell — backs the new hotbar tool.
 
 ## 4. The algorithm
 
@@ -53,10 +53,18 @@ Pure, unit-testable core (mirrors `destruction.rs`'s carve functions: takes a `W
 
 1. **Fall**: if the cell directly below is empty and non-solid, move there.
 2. **Diagonal**: else, try down-left / down-right (random order) if empty.
-3. **Spread**: else, try one cell sideways along a flat, supported surface.
+3. **Spread**: else, a cell with water directly above it may move sideways
+   onto an open cell supported by real solid terrain.
+
 4. **Settle**: none apply — drop out of the active set.
 
-A cell that moves reactivates its old position, new position, and the new position's neighbors for the next tick — this is the entire wake cascade; no separate propagation pass is needed.
+The pressure gate is important for a binary full/empty grid. An
+unpressurized one-cell-deep surface would otherwise trade places with any
+same-height air cell forever, continually remeshing a partially filled lake.
+Water still spreads while a column has vertical head, then sleeps once it has
+settled into a stable stepped surface.
+
+A move reactivates only water neighboring both its old and new positions. This wakes water whose support moved earlier in the same tick without keeping air cells active.
 
 This is deliberately full/empty, not fractional: total water-cell count is conserved by construction (moves are swaps, never creates/destroys), and rendering is exactly "is this cell water" with no threshold tuning. The cost is chunkier-looking flow than a pressure-equalized surface — accepted trade-off for the "heavily optimized, any voxel scale" goal.
 
@@ -75,8 +83,8 @@ Per the engine's existing unit contract (README: "every system is written agains
 ## 7. Testing plan
 
 All of `vox-sim` runs headless (mirrors every crate below `vox-render`):
-- Algorithm unit tests: a single water cell falls under gravity; spreads across a flat floor; settles and leaves the active set; two isolated puddles conserve total cell count.
-- Wake-on-edit: a settled lake reactivates when an adjacent cell is dug out; an edit far away leaves it settled.
+- Algorithm unit tests: a single water cell falls under gravity; a pressurized blob spreads across a flat floor; shallow water and a partially filled basin settle; total cell count is conserved.
+- Wake-on-edit: a settled lake reactivates when an adjacent cell is dug out using the exact dirty region; an edit far away leaves it settled.
 - Budget: a tick given more active cells than the per-tick cap processes exactly the cap and carries the rest.
 - Integration test in `vox-app` (mirrors the existing "drive the actual raycast-based blast entry point end to end" test): place a water blob, dig a channel, confirm water reaches the channel within N ticks.
 - Scale-invariance test: same water placement at 0.1 m and 1.0 m scale produces the matching relative flow pattern (adjusted for the ticks-per-cell finding in §6).

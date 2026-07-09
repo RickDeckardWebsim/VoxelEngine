@@ -503,6 +503,14 @@ mod tests {
         .expect("registry")
     }
 
+    #[test]
+    fn hotbar_slot_five_selects_place_water() {
+        let mut tools = Tools::new(&registry());
+
+        assert_eq!(tools.select_hotbar_slot(5), Some(Tool::PlaceWater));
+        assert_eq!(tools.tool, Tool::PlaceWater);
+    }
+
     /// A 1-voxel-wide wood pillar at a fixed, known footprint (x,z = 5,5),
     /// resting on a thick stone floor, rising to `height_vox` voxels above
     /// it. Single-voxel cross-section: no corners, so a centered sphere
@@ -928,5 +936,159 @@ mod tests {
         tools.place_water(&mut world, &mut sim, &reg, Vec3::new(16.0, 15.0, 16.0), Vec3::new(0.0, -1.0, 0.0));
 
         assert!(sim.active_count() > 0, "placing water must activate at least one cell");
+    }
+
+    /// True if any voxel in the half-open box `[min, max)` holds `water`.
+    fn any_water_in(world: &World, water: Voxel, min: IVec3, max: IVec3) -> bool {
+        for x in min.x..max.x {
+            for y in min.y..max.y {
+                for z in min.z..max.z {
+                    if world.get_voxel(IVec3::new(x, y, z)) == water {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// End-to-end simulation integration: a water blob settles in a basin,
+    /// a terrain edit is drained through World's real dirty-region API, and
+    /// the resulting wake drives water through the new downhill spillway.
+    /// `Tools::place_water` is covered separately above; this test keeps the
+    /// setup grid-exact while exercising the same headless simulation path
+    /// used by the application frame loop.
+    #[test]
+    fn digging_into_a_settled_lake_lets_it_drain() {
+        let reg = registry_with_water();
+        let water = water_voxel(&reg);
+        let mut world = World::new(WorldConfig {
+            voxel_size_m: 1.0,
+            extent_m: [40.0, 20.0, 40.0],
+            ..WorldConfig::default()
+        });
+        world.set_solid_table(solid_table_for(&reg));
+        let (_, max) = world.bounds_voxels();
+
+        // Global floor under the whole world footprint: `fill_box` is
+        // half-open, so this leaves y=4 as the top solid layer and y=5 as
+        // the open resting surface everywhere, both inside and outside the
+        // basin -- water that escapes through the breach lands on this same
+        // floor instead of free-falling into a void once it clears the
+        // wall.
+        world.fill_box(IVec3::ZERO, IVec3::new(max.x, 5, max.z), stone_id(&reg));
+
+        // Basin: a 12x12 stone box (walls spanning y=5..15, i.e. resting on
+        // the floor) with its interior (x/z 10..20) hollowed back out to
+        // air. The hollow-out must happen *after* the solid walls are
+        // built: `place_blob` (and `fill_box` in general) writes whatever
+        // it's told regardless of what's already there, so building the
+        // walls first and clearing the interior second is what leaves a
+        // 1-voxel-thick wall standing on every side rather than either no
+        // walls or no interior.
+        world.fill_box(IVec3::new(9, 5, 9), IVec3::new(21, 15, 21), stone_id(&reg));
+        world.fill_box(IVec3::new(10, 5, 10), IVec3::new(20, 15, 20), AIR);
+
+        let mut sim = FluidSim::new(water);
+        // A blob comfortably inside the 9-voxel-wide interior (radius 3, so
+        // diameter 7), centered well above the floor so it genuinely falls
+        // and spreads rather than starting already at rest -- and clear of
+        // every wall, so it starts out fully confined by construction, not
+        // by luck.
+        sim.place_blob(&mut world, IVec3::new(15, 10, 15), 3, water);
+        assert!(sim.active_count() > 0, "placing the blob must activate cells");
+
+        let basin_interior = (IVec3::new(10, 5, 10), IVec3::new(20, 15, 20));
+        assert!(
+            any_water_in(&world, water, basin_interior.0, basin_interior.1),
+            "basin must actually contain water right after placement"
+        );
+
+        // Let it settle. Determined empirically (not guessed): this basin's
+        // radius-3 blob (~123 cells) reaches `active_count() == 0` well
+        // before 150 ticks once it has finished falling and spreading
+        // across the 9x9 interior floor; 300 leaves real margin without
+        // masking a genuine convergence problem (a basin that never settles
+        // at all would still fail this at any reasonable budget).
+        const SETTLE_TICK_BUDGET: usize = 300;
+        let mut settled = false;
+        for _ in 0..SETTLE_TICK_BUDGET {
+            sim.tick(&mut world);
+            if sim.active_count() == 0 {
+                settled = true;
+                break;
+            }
+        }
+        assert!(
+            settled,
+            "lake must settle to 0 active cells within {SETTLE_TICK_BUDGET} ticks -- if it \
+             doesn't, either the basin isn't actually confining the water (an unintended \
+             escape route) or convergence is genuinely this slow at this basin size"
+        );
+        assert!(
+            any_water_in(&world, water, basin_interior.0, basin_interior.1),
+            "basin must still hold water once settled (didn't all leak out before the wall \
+             was ever breached)"
+        );
+
+        // Give the water at the spillway a one-cell head. Full/empty water
+        // uses vertical head for equal-height spreading, which lets a pool
+        // sleep without an exposed one-cell-deep surface random-walking.
+        // The large settled basin already fills its floor; this is the
+        // smallest extra head needed to make the drain path deterministic.
+        let head_base = IVec3::new(10, 5, 15);
+        let head = head_base + IVec3::Y;
+        assert_eq!(world.get_voxel(head_base), water, "the settled lake must cover the spillway floor cell");
+        if world.get_voxel(head) == AIR {
+            sim.place_blob(&mut world, head, 0, water);
+            sim.tick(&mut world);
+        }
+        assert_eq!(world.get_voxel(head), water, "the spillway must have vertical water head");
+        assert_eq!(sim.active_count(), 0, "the added head must settle before the breach is dug");
+
+        // Model the real frame-loop handoff precisely: discard all old
+        // regions, make the two terrain edits, then wake from exactly the
+        // regions reported by World. The opening is at floor height; the
+        // lowered exterior cell gives the water a diagonal gravity path out
+        // of the basin rather than relying on an unphysical flat random walk.
+        world.drain_dirty_regions();
+        let breach = IVec3::new(9, 5, 15);
+        assert_eq!(world.get_voxel(breach), stone_id(&reg), "sanity: the breach point must start as a real wall");
+        world.set_voxel(breach, AIR);
+        let downhill = IVec3::new(8, 4, 15);
+        assert_eq!(world.get_voxel(downhill), stone_id(&reg), "sanity: the spillway must begin with solid terrain below it");
+        world.set_voxel(downhill, AIR);
+        for (min, max) in world.drain_dirty_regions() {
+            sim.wake_region(&world, min, max);
+        }
+        assert!(
+            sim.active_count() > 0,
+            "digging into the settled lake must reactivate water near the breach"
+        );
+
+        // Tick forward and confirm water reaches *outside* the basin
+        // (x < 9, the wall's outer face) through the breach specifically,
+        // not just "some water somewhere moved".
+        const DRAIN_TICK_BUDGET: usize = 300;
+        let outside = (IVec3::new(0, 0, 0), IVec3::new(9, 15, max.z));
+        let mut escaped = false;
+        for _ in 0..DRAIN_TICK_BUDGET {
+            sim.tick(&mut world);
+            // This is the same post-tick dirty drain that the app uses.
+            // It keeps the test on the real wake-on-edit path instead of
+            // relying on a manually padded wake box.
+            for (min, max) in world.drain_dirty_regions() {
+                sim.wake_region(&world, min, max);
+            }
+            if any_water_in(&world, water, outside.0, outside.1) {
+                escaped = true;
+                break;
+            }
+        }
+        assert!(
+            escaped,
+            "water must flow out through the breach and reach outside the basin within \
+             {DRAIN_TICK_BUDGET} ticks"
+        );
     }
 }
