@@ -8,7 +8,7 @@ use vox_core::WorldConfig;
 pub fn usage() -> String {
     "voxelengine [--scale 0.1|1.0] [--mario-scale N] [--seed N] [--extent X,Y,Z] [--help]\n\n\
      --scale       voxel edge length in meters (default 0.1)\n\
-     --mario-scale SM64 units per meter — higher = smaller Mario (default 60, Mario ~2.7m)\n\
+     --mario-scale SM64 units per meter — higher = smaller Mario (default 75, Mario ~2.1m)
      --seed        world generation seed (default 1337)\n\
      --extent      world size in meters, comma-separated X,Y,Z (default 128,48,128)\n\
      --help        show this message"
@@ -35,7 +35,7 @@ pub struct CliConfig {
 /// [`WorldConfig::validate`].
 pub fn parse<'a>(args: impl Iterator<Item = &'a str>) -> Result<CliConfig, String> {
     let mut cfg = WorldConfig::default();
-    let mut mario_units_per_meter: f32 = 60.0;
+    let mut mario_units_per_meter: f32 = 75.0;
     let args: Vec<&str> = args.collect();
     let mut i = 0;
     while i < args.len() {
@@ -109,7 +109,7 @@ mod tests {
         let cfg = parse_str("").expect("empty args must parse");
         assert_eq!(cfg.world.seed, WorldConfig::default().seed);
         assert_eq!(cfg.world.voxel_size_m, WorldConfig::default().voxel_size_m);
-        assert_eq!(cfg.mario_units_per_meter, 60.0);
+        assert_eq!(cfg.mario_units_per_meter, 75.0);
     }
 
     #[test]
