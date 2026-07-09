@@ -27,6 +27,10 @@ const FLUID_TICK_BUDGET: usize = 4096;
 /// this crate (mirrors `PhysicsWorld`'s sleep bookkeeping).
 pub struct FluidSim {
     active: FxHashSet<IVec3>,
+    /// The single voxel material this sim treats as water. Set once at
+    /// construction -- never inferred from the active set (see `tick` and
+    /// `wake_region` doc comments for why inference was fragile).
+    water: Voxel,
     /// xorshift64* state for randomized per-tick update order (same
     /// construction as `PhysicsWorld::lifetime_rng` / `ParticleSystem`'s
     /// spawn jitter) -- avoids a visible left/right or diagonal bias in how
@@ -34,16 +38,11 @@ pub struct FluidSim {
     rng: u64,
 }
 
-impl Default for FluidSim {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl FluidSim {
-    pub fn new() -> Self {
+    pub fn new(water: Voxel) -> Self {
         Self {
             active: FxHashSet::default(),
+            water,
             rng: 0x9E37_79B9_7F4A_7C15,
         }
     }
@@ -99,24 +98,7 @@ impl FluidSim {
     /// reactivates itself, its destination, and the destination's neighbors
     /// -- the entire wake cascade, no separate propagation pass needed.
     pub fn tick(&mut self, world: &mut World) -> usize {
-        // NOTE: `self.active` also holds the 6 air neighbors woken by last
-        // tick's movers (see below), so a plain `.next()` over the set can
-        // land on one of those placeholder entries and misinfer `water` as
-        // AIR, freezing the sim on every subsequent tick. Scan for the first
-        // entry that still holds real water instead of trusting iteration
-        // order. This is still the same fragile single-material inference
-        // flagged in the doc comment above (Task 9 replaces it with an
-        // explicit field) -- this only fixes the deterministic freeze, not
-        // the underlying fragility.
-        let water = self
-            .active
-            .iter()
-            .map(|&p| world.get_voxel(p))
-            .find(|&v| v != AIR)
-            .unwrap_or(AIR);
-        if water == AIR {
-            return 0; // nothing active, or (shouldn't happen) it already drained
-        }
+        let water = self.water;
 
         // Snapshot exactly the positions that hold real water *before* any
         // mutation this tick, and process only those. A live re-check of
@@ -146,10 +128,9 @@ impl FluidSim {
         // yield, then carry the overflow straight into `next_active`
         // untouched. Each carried-over position still holds real water (it
         // was filtered above and nothing this tick has mutated it yet), so
-        // it is exactly as scan-safe for next tick's `water` inference at
-        // the top of this function as any settled/woken cell already in
-        // `next_active` -- it's simply processed on a later call instead of
-        // this one.
+        // it is exactly as valid for next tick's snapshot filter as any
+        // settled/woken cell already in `next_active` -- it's simply
+        // processed on a later call instead of this one.
         if cells.len() > FLUID_TICK_BUDGET {
             for i in (1..cells.len()).rev() {
                 let j = (self.next_u64() as usize) % (i + 1);
@@ -173,10 +154,7 @@ impl FluidSim {
                 // terrain (e.g. the floor a settled cell rests on) never
                 // moves and never becomes water on its own, so adding it
                 // here would violate the crate's own invariant that "not in
-                // the active set" means settled/inert (see the struct doc),
-                // and would corrupt the `water` inference above the next
-                // time it's scanned (a solid neighbor's non-AIR material
-                // gets mistaken for the fluid material).
+                // the active set" means settled/inert (see the struct doc).
                 for n in NEIGHBORS_6 {
                     let neighbor = dest + n;
                     if !world.solid(neighbor) {
@@ -187,6 +165,23 @@ impl FluidSim {
         }
         self.active = next_active;
         processed
+    }
+
+    /// Reactivate any water cell inside `[min, max)` -- called from the same
+    /// dirty-region drain loop that already wakes physics bodies on a world
+    /// edit (`PhysicsWorld::wake_region`), so digging into a lake or
+    /// blasting open a reservoir wall lets it flow immediately.
+    pub fn wake_region(&mut self, world: &World, min: IVec3, max: IVec3) {
+        for x in min.x..max.x {
+            for y in min.y..max.y {
+                for z in min.z..max.z {
+                    let p = IVec3::new(x, y, z);
+                    if world.get_voxel(p) == self.water {
+                        self.active.insert(p);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -259,14 +254,14 @@ mod tests {
 
     #[test]
     fn new_sim_has_no_active_cells() {
-        let sim = FluidSim::new();
+        let sim = FluidSim::new(WATER);
         assert_eq!(sim.active_count(), 0);
     }
 
     #[test]
     fn place_blob_fills_a_sphere_with_water_and_activates_every_filled_cell() {
         let mut world = test_world();
-        let mut sim = FluidSim::new();
+        let mut sim = FluidSim::new(WATER);
         let center = IVec3::new(8, 8, 8);
         sim.place_blob(&mut world, center, 2, WATER);
 
@@ -283,7 +278,7 @@ mod tests {
     fn place_blob_does_not_overwrite_existing_solid_terrain() {
         let mut world = test_world();
         world.set_voxel(IVec3::new(8, 8, 8), Voxel(2)); // pretend id 2 = stone
-        let mut sim = FluidSim::new();
+        let mut sim = FluidSim::new(WATER);
         sim.place_blob(&mut world, IVec3::new(8, 8, 8), 2, WATER);
         assert_eq!(
             world.get_voxel(IVec3::new(8, 8, 8)),
@@ -295,7 +290,7 @@ mod tests {
     #[test]
     fn a_single_cell_falls_under_gravity() {
         let mut world = test_world();
-        let mut sim = FluidSim::new();
+        let mut sim = FluidSim::new(WATER);
         sim.place_blob(&mut world, IVec3::new(8, 10, 8), 0, WATER); // 1 cell
         assert_eq!(world.get_voxel(IVec3::new(8, 10, 8)), WATER);
 
@@ -334,12 +329,55 @@ mod tests {
         for wall in [IVec3::new(9, 5, 8), IVec3::new(7, 5, 8), IVec3::new(8, 5, 9), IVec3::new(8, 5, 7)] {
             world.set_voxel(wall, Voxel(2)); // stone -- blocks every sideways direction
         }
-        let mut sim = FluidSim::new();
+        let mut sim = FluidSim::new(WATER);
         sim.place_blob(&mut world, center, 0, WATER);
         for _ in 0..10 {
             sim.tick(&mut world);
         }
         assert_eq!(sim.active_count(), 0, "a single cell walled in on every side with nowhere to spread must settle");
+    }
+
+    #[test]
+    fn wake_region_reactivates_settled_water_inside_it() {
+        // Same adaptation as `water_settles_on_a_flat_floor_and_leaves_the_active_set`
+        // above: `test_world()`'s resting surface is y=5 (not the plan's
+        // literal y=6), and a lone unwalled cell on that open floor never
+        // settles (`active_count()` never reaches 0, since sideways is
+        // always open) -- so this walls the drop point in on all 4 sides,
+        // same as the settle test, before checking it actually settles.
+        let mut world = test_world();
+        let center = IVec3::new(8, 5, 8);
+        for wall in [IVec3::new(9, 5, 8), IVec3::new(7, 5, 8), IVec3::new(8, 5, 9), IVec3::new(8, 5, 7)] {
+            world.set_voxel(wall, Voxel(2)); // stone -- blocks every sideways direction
+        }
+        let mut sim = FluidSim::new(WATER);
+        sim.place_blob(&mut world, center, 0, WATER);
+        for _ in 0..10 {
+            sim.tick(&mut world);
+        }
+        assert_eq!(sim.active_count(), 0, "must have settled first");
+
+        sim.wake_region(&world, IVec3::new(7, 4, 7), IVec3::new(10, 6, 10));
+        assert!(sim.active_count() > 0, "water inside the woken region must reactivate");
+    }
+
+    #[test]
+    fn wake_region_does_not_touch_settled_water_outside_it() {
+        // Same walled-in settle setup as `wake_region_reactivates_settled_water_inside_it`.
+        let mut world = test_world();
+        let center = IVec3::new(8, 5, 8);
+        for wall in [IVec3::new(9, 5, 8), IVec3::new(7, 5, 8), IVec3::new(8, 5, 9), IVec3::new(8, 5, 7)] {
+            world.set_voxel(wall, Voxel(2)); // stone -- blocks every sideways direction
+        }
+        let mut sim = FluidSim::new(WATER);
+        sim.place_blob(&mut world, center, 0, WATER);
+        for _ in 0..10 {
+            sim.tick(&mut world);
+        }
+        assert_eq!(sim.active_count(), 0, "must have settled first");
+
+        sim.wake_region(&world, IVec3::new(0, 0, 0), IVec3::new(2, 2, 2)); // nowhere near the water
+        assert_eq!(sim.active_count(), 0, "an unrelated edit must not wake distant settled water");
     }
 
     #[test]
@@ -372,7 +410,7 @@ mod tests {
         //    it's the tick count that no longer matters, which is what
         //    "spreads over many ticks" should mean.
         let mut world = test_world();
-        let mut sim = FluidSim::new();
+        let mut sim = FluidSim::new(WATER);
         sim.place_blob(&mut world, IVec3::new(8, 8, 8), 2, WATER);
         for _ in 0..40 {
             sim.tick(&mut world);
@@ -386,7 +424,7 @@ mod tests {
     #[test]
     fn total_water_cell_count_is_conserved_across_many_ticks() {
         let mut world = test_world();
-        let mut sim = FluidSim::new();
+        let mut sim = FluidSim::new(WATER);
         sim.place_blob(&mut world, IVec3::new(8, 10, 8), 2, WATER);
         let before = count_water(&world);
         for _ in 0..60 {
@@ -413,7 +451,7 @@ mod tests {
             ..WorldConfig::default()
         });
         world.set_solid_table(vec![false, false, true]); // [air, water, floor]
-        let mut sim = FluidSim::new();
+        let mut sim = FluidSim::new(WATER);
         sim.place_blob(&mut world, IVec3::new(20, 20, 20), 12, WATER);
         assert!(
             sim.active_count() > FLUID_TICK_BUDGET,
