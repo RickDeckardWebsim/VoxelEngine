@@ -7,6 +7,11 @@ pub const CHUNK_SIZE: usize = 32;
 pub const GRAVITY: f32 = 9.81;
 /// Fixed physics timestep in seconds (60 Hz).
 pub const PHYSICS_DT: f32 = 1.0 / 60.0;
+/// Fixed fluid-sim timestep in seconds (~15 Hz) -- deliberately decoupled
+/// from `PHYSICS_DT` (60 Hz). Settled water costs nothing regardless of
+/// tick rate (active-cell sleeping), so this mainly caps worst-case cost
+/// during a big flood event, not steady-state cost.
+pub const FLUID_DT: f32 = 1.0 / 15.0;
 /// Physics substeps per fixed step.
 pub const SUBSTEPS: u32 = 2;
 /// Velocity solver iterations per substep.

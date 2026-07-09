@@ -2287,6 +2287,7 @@ dependencies = [
  "vox-physics",
  "vox-platform",
  "vox-render",
+ "vox-sim",
  "vox-world",
  "wgpu",
  "winit",

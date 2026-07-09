@@ -66,6 +66,7 @@ fn build_terrain_world(
 ) -> Result<World, Box<dyn std::error::Error + Send + Sync>> {
     cfg.validate()?;
     let mut world = World::new(cfg);
+    world.set_solid_table(solid_table(registry));
     let mats = TerrainMaterials::from_registry(registry)?;
     let terrain = TerrainGen::new(&world.cfg);
     terrain.generate(&mut world, mats);
@@ -73,6 +74,31 @@ fn build_terrain_world(
     let planted = generate_trees(&mut world, &terrain, tree_mats);
     tracing::info!(trees = planted, "forest planted");
     Ok(world)
+}
+
+/// Build `World`'s per-material-id solidity table from the registry (index
+/// = material id, air included). See `World::set_solid_table`'s doc comment
+/// for why this must be attached before any gameplay system (raycasts,
+/// character collision, rigidbody contacts, the destruction flood) runs.
+fn solid_table(registry: &MaterialRegistry) -> Vec<bool> {
+    (0..registry.len())
+        .map(|i| {
+            registry
+                .get(vox_core::MaterialId(i as u16))
+                .is_some_and(|d| d.solid)
+        })
+        .collect()
+}
+
+/// The registry's `water` material, or a harmless fallback if the asset
+/// set doesn't define one (keeps the engine bootable with a stripped-down
+/// material set, e.g. in a test fixture) -- mirrors the existing
+/// `id_by_name("wood").unwrap_or(...)` pattern in `spawn_debris`.
+fn water_material(registry: &MaterialRegistry) -> Voxel {
+    registry
+        .id_by_name("water")
+        .map(|m| Voxel(m.0))
+        .unwrap_or(Voxel(1))
 }
 
 /// The engine application.
@@ -90,6 +116,10 @@ struct VoxApp {
     /// why bodies don't need the generation/staleness tracking chunks do).
     body_mesh: BodyMeshQueue,
     phys: PhysicsWorld,
+    fluid: vox_sim::FluidSim,
+    /// Fluid ticks run at their own fixed rate (`FLUID_DT`), independent of
+    /// the 60 Hz physics loop -- see the design doc §5.
+    fluid_clock: vox_platform::FrameClock,
     /// Incrementing seed so repeated blasts get varied debris spin.
     blast_seed: u32,
     /// Incrementing seed so repeated impact-fracture chips get varied
@@ -212,6 +242,8 @@ impl VoxApp {
             gpu,
             pipeline,
             world,
+            fluid: vox_sim::FluidSim::new(water_material(&registry)),
+            fluid_clock: vox_platform::FrameClock::new(vox_core::consts::FLUID_DT),
             registry,
             player: Player::new(Vec3::ZERO),
             camera: Camera::new(Vec3::ZERO),
@@ -848,6 +880,11 @@ impl App for VoxApp {
         self.enforce_debris_budget();
         self.expire_clutter(timing.physics_steps as f32 * vox_core::consts::PHYSICS_DT);
 
+        let fluid_timing = self.fluid_clock.advance(timing.dt_frame);
+        for _ in 0..fluid_timing.physics_steps {
+            self.fluid.tick(&mut self.world);
+        }
+
         // Wake any resting debris whose ground was just carved/edited from
         // under it, then remesh: absorb edits, dispatch to workers, upload.
         let eye = self.player.eye(timing.alpha);
@@ -856,6 +893,7 @@ impl App for VoxApp {
             let s = self.world.cfg.voxel_size_m;
             for (min, max) in self.world.drain_dirty_regions() {
                 self.phys.wake_region(min.as_vec3() * s, max.as_vec3() * s);
+                self.fluid.wake_region(&self.world, min, max);
             }
             self.remesh.absorb_dirty(&mut self.world);
             self.remesh.dispatch(&self.world, eye);
