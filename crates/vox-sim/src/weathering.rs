@@ -324,4 +324,84 @@ mod tests {
         assert!(ticks > STONE_ERODE_TICKS / 2,
             "settled-water erosion must run at ~1x, not the 5x waterfall rate: {ticks}");
     }
+
+    #[test]
+    fn mud_dries_back_to_dirt_only_after_water_leaves() {
+        let mut world = world_with_floor(MUD);
+        let mut weathering = Weathering::new(table());
+        let cell = IVec3::new(8, 4, 8);
+        let above = cell + IVec3::Y;
+        world.set_voxel(above, WATER);
+
+        // Wet mud is untracked and stable.
+        weathering.tick(&mut world, &[ContactEvent::Settled(above)]);
+        assert_eq!(weathering.drying_count(), 0, "wet mud must not be on the drying clock");
+
+        // Water leaves -> drying starts.
+        world.set_voxel(above, AIR);
+        weathering.tick(&mut world, &[ContactEvent::Vacated(above)]);
+        assert_eq!(weathering.drying_count(), 1);
+        for _ in 0..(MUD_DRY_TICKS - 2) {
+            weathering.tick(&mut world, &[]);
+            assert_eq!(world.get_voxel(cell), MUD, "must not dry early");
+        }
+        weathering.tick(&mut world, &[]);
+        assert_eq!(world.get_voxel(cell), DIRT, "dry mud must firm back to dirt");
+        assert_eq!(weathering.drying_count(), 0);
+    }
+
+    #[test]
+    fn returning_water_resets_the_drying_clock() {
+        let mut world = world_with_floor(MUD);
+        let mut weathering = Weathering::new(table());
+        let cell = IVec3::new(8, 4, 8);
+        let above = cell + IVec3::Y;
+        weathering.tick(&mut world, &[ContactEvent::Vacated(above)]);
+        assert_eq!(weathering.drying_count(), 1);
+        for _ in 0..(MUD_DRY_TICKS / 2) {
+            weathering.tick(&mut world, &[]);
+        }
+        world.set_voxel(above, WATER); // water returns halfway
+        weathering.tick(&mut world, &[ContactEvent::Fell(above)]);
+        assert_eq!(weathering.drying_count(), 0, "re-wetted mud must leave the drying clock");
+        assert_eq!(world.get_voxel(cell), MUD, "and stays mud");
+    }
+
+    #[test]
+    fn a_fully_weathered_pool_reaches_zero_tracked_cells() {
+        // The sleep guarantee, extended: settle a pool on grass, run until the
+        // whole shoreline has finished transforming -- both weathering maps
+        // must be empty and the fluid asleep. Steady state costs nothing.
+        let mut world = world_with_floor(GRASS);
+        let mut sim = crate::FluidSim::new(WATER);
+        let mut weathering = Weathering::new(table());
+        sim.place_blob(&mut world, IVec3::new(8, 7, 8), 1, WATER);
+        for _ in 0..((GRASS_SOAK_TICKS + DIRT_SOAK_TICKS) * 3) {
+            sim.tick(&mut world);
+            let events = sim.drain_events();
+            weathering.tick(&mut world, &events);
+            for (min, max) in world.drain_dirty_regions() {
+                sim.wake_region(&world, min, max);
+            }
+            if sim.active_count() == 0 && weathering.soaking_count() == 0 && weathering.drying_count() == 0 {
+                break;
+            }
+        }
+        assert_eq!(sim.active_count(), 0, "water must sleep");
+        assert_eq!(weathering.soaking_count(), 0, "soak map must drain to empty");
+        assert_eq!(weathering.drying_count(), 0, "drying map must drain to empty");
+        // And the ground under the pool actually transformed.
+        let mut mud_count = 0;
+        let (min, max) = world.bounds_voxels();
+        for x in min.x..max.x {
+            for y in min.y..max.y {
+                for z in min.z..max.z {
+                    if world.get_voxel(IVec3::new(x, y, z)) == MUD {
+                        mud_count += 1;
+                    }
+                }
+            }
+        }
+        assert!(mud_count > 0, "the pool's bed must have become mud");
+    }
 }
