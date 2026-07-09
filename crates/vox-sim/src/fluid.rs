@@ -246,7 +246,11 @@ fn step_cell(
     // directions -- the four axes, then the four diagonals, each group in
     // randomized order -- for a reachable drop -- an open run of same-height
     // cells ending in one with air beneath -- and take one step toward the
-    // nearest. This is what keeps a mound from freezing into a stable
+    // first one found. Diagonal rays deliberately check only the cells on
+    // the ray, never the two orthogonal neighbors, so water can slip
+    // through the seam where two solid blocks touch only at a corner --
+    // accepted for a coarse voxel fluid, not an oversight.
+    // This is what keeps a mound from freezing into a stable
     // stepped pyramid: its surface cells can walk over the water below them
     // until they reach the pile's edge and fall off. Unlike an
     // unconditional sideways shuffle, this only ever moves when a strictly
