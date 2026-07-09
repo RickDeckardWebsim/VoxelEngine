@@ -45,6 +45,12 @@ pub struct MaterialDef {
     /// a powder piles rather than seeking a flat level. Mud and sand are
     /// powders; water is a fluid.
     pub powder: bool,
+    /// Whether `vox-sim`'s fire system can ignite this material. Wood,
+    /// leaves, planks, grass, and ember are flammable; stone, dirt, char,
+    /// water, etc. are not. Distinct from `solid`/`fluid`/`powder` — a
+    /// flammable material can be solid (wood) or non-solid (none yet, but
+    /// dry grass could be).
+    pub flammable: bool,
 }
 
 /// Registry of material definitions with stable `u16` ids.
@@ -78,6 +84,7 @@ struct RawMaterial {
     solid: Option<bool>,
     fluid: Option<bool>,
     powder: Option<bool>,
+    flammable: Option<bool>,
 }
 
 /// Validation error for a named material: `material '{name}': {detail}`.
@@ -100,6 +107,7 @@ impl MaterialRegistry {
             solid: false,
             fluid: false,
             powder: false,
+            flammable: false,
         };
         let mut by_name = HashMap::new();
         by_name.insert(air.name.clone(), MaterialId::AIR);
@@ -260,6 +268,7 @@ impl MaterialRegistry {
         let solid = raw.solid.unwrap_or(true);
         let fluid = raw.fluid.unwrap_or(false);
         let powder = raw.powder.unwrap_or(false);
+        let flammable = raw.flammable.unwrap_or(false);
 
         if self.defs.len() > usize::from(u16::MAX) {
             return Err(material_error(
@@ -280,6 +289,7 @@ impl MaterialRegistry {
             solid,
             fluid,
             powder,
+            flammable,
         });
         Ok(())
     }
@@ -534,7 +544,7 @@ mod tests {
             fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let reg = MaterialRegistry::from_toml_str(&source, "assets/materials/core.toml")
             .expect("shipped core.toml must parse");
-        assert_eq!(reg.len(), 11, "air + 10 shipped materials");
+        assert_eq!(reg.len(), 13, "air + 12 shipped materials");
         assert_eq!(reg.id_by_name("stone"), Some(MaterialId(1)));
         let mud = reg
             .get(reg.id_by_name("mud").expect("mud registered"))
@@ -547,11 +557,26 @@ mod tests {
             .expect("sand present");
         assert!(!sand.solid, "sand is non-solid (a powder, not walkable)");
         assert!(sand.powder, "sand is a powder");
+        let wood = reg
+            .get(reg.id_by_name("wood").expect("wood registered"))
+            .expect("wood present");
+        assert!(wood.flammable, "wood must be flammable");
+        let ember = reg
+            .get(reg.id_by_name("ember").expect("ember registered"))
+            .expect("ember present");
+        assert!(ember.flammable, "ember must be flammable");
+        assert!(ember.solid, "ember is solid");
+        let char_mat = reg
+            .get(reg.id_by_name("char").expect("char registered"))
+            .expect("char present");
+        assert!(!char_mat.flammable, "char must not be flammable");
+        assert_eq!(char_mat.strength, 0.5);
         let leaves = reg
             .get(reg.id_by_name("leaves").expect("leaves registered"))
             .expect("leaves present");
         assert_eq!(leaves.jitter, 0.10);
         assert!(leaves.solid, "solid defaults to true in shipped file");
+        assert!(leaves.flammable, "leaves must be flammable");
     }
 
     /// Pins `deny_unknown_fields`: a typo'd optional key must fail loudly

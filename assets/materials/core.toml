@@ -31,7 +31,7 @@ color = [0.33, 0.55, 0.25]
 jitter = 0.06
 density = 1400.0
 strength = 2.0
-
+flammable = true
 [[material]]
 name = "sand"
 color = [0.86, 0.79, 0.58]
@@ -47,14 +47,14 @@ color = [0.52, 0.37, 0.23]
 jitter = 0.05
 density = 700.0
 strength = 4.0
-
+flammable = true
 [[material]]
 name = "leaves"
 color = [0.28, 0.48, 0.22]
 jitter = 0.10
 density = 200.0
 strength = 0.5
-
+flammable = true
 [[material]]
 name = "brick"
 color = [0.68, 0.34, 0.28]
@@ -68,7 +68,7 @@ color = [0.62, 0.47, 0.30]
 jitter = 0.04
 density = 600.0
 strength = 4.0
-
+flammable = true
 [[material]]
 name = "water"
 color = [0.16, 0.35, 0.62]
@@ -86,3 +86,18 @@ density = 1700.0
 strength = 1.0
 solid = false
 powder = true
+
+[[material]]
+name = "ember"
+color = [0.85, 0.35, 0.10]
+jitter = 0.08
+density = 600.0
+strength = 2.0
+flammable = true
+
+[[material]]
+name = "char"
+color = [0.12, 0.10, 0.09]
+jitter = 0.03
+density = 300.0
+strength = 0.5

@@ -9,7 +9,7 @@ use vox_physics::{Aabb, BodyId, PhysicsWorld};
 use vox_sim::FluidSim;
 use vox_world::{AIR, Voxel, World, raycast};
 
-/// The selectable hotbar tools. Slots 6-9 are reserved (not yet assigned to
+/// The selectable hotbar tools. Slots 7-9 are reserved (not yet assigned to
 /// a tool); selecting one of them leaves the previously active tool in
 /// place.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -29,15 +29,19 @@ pub enum Tool {
     /// Slot 5: place a sphere of water at the crosshair target using its own
     /// adjustable source radius.
     PlaceWater,
+    /// Slot 6: place a single ember block that ignites nearby flammable
+    /// materials and starts a fire.
+    Ember,
 }
 
 /// Hotbar key (1-9) to tool mapping. Slots past the array select nothing.
-pub const HOTBAR: [(u8, Tool); 5] = [
+pub const HOTBAR: [(u8, Tool); 6] = [
     (1, Tool::Dig),
     (2, Tool::ScalableDig),
     (3, Tool::Bomb),
     (4, Tool::DeathLaser),
     (5, Tool::PlaceWater),
+    (6, Tool::Ember),
 ];
 
 /// Radius bounds for [`Tool::ScalableDig`] and [`Tool::Bomb`], adjustable
@@ -505,6 +509,43 @@ impl Tools {
         let center_vox = hit.voxel + face;
         let radius_vox = (self.water_radius_m / s).round() as i32;
         fluid.place_blob(world, center_vox, radius_vox, Voxel(water_id.0));
+    }
+
+    /// Place Ember: put a single ember block at the crosshair target.
+    /// Like `place_voxel` but always places ember, regardless of the
+    /// selected build material. The fire sim will pick it up and ignite
+    /// nearby flammable materials.
+    pub fn place_ember(
+        &self,
+        world: &mut World,
+        registry: &MaterialRegistry,
+        eye_m: Vec3,
+        look: Vec3,
+        player: Aabb,
+    ) {
+        let dir = look.normalize_or_zero();
+        if dir == Vec3::ZERO {
+            return;
+        }
+        let Some(hit) = raycast(world, eye_m, dir, REACH) else {
+            return;
+        };
+        let Some(ember_id) = registry.id_by_name("ember") else {
+            return; // asset set doesn't define ember; nothing to place
+        };
+        let Some(face) = hit.face else {
+            return;
+        };
+        let target = hit.voxel + face;
+        let s = world.cfg.voxel_size_m;
+        let c = voxel_center_m(target, s);
+        let half = s * 0.5;
+        let overlaps = (c.x + half > player.min.x && c.x - half < player.max.x)
+            && (c.y + half > player.min.y && c.y - half < player.max.y)
+            && (c.z + half > player.min.z && c.z - half < player.max.z);
+        if !overlaps {
+            world.set_voxel(target, Voxel(ember_id.0));
+        }
     }
 }
 

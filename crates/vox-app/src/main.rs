@@ -130,6 +130,36 @@ fn powder_materials(registry: &MaterialRegistry) -> Vec<Voxel> {
         .collect()
 }
 
+/// Fire material table, or `None` (fire disabled) if any required material
+/// is missing from the asset set. Mirrors `weather_table`'s pattern.
+fn fire_table(registry: &MaterialRegistry) -> Option<vox_sim::FireTable> {
+    let id = |name: &str| registry.id_by_name(name).map(|m| Voxel(m.0));
+    let water = id("water")?;
+    let ember = id("ember")?;
+    let char = id("char")?;
+    let wood = id("wood")?;
+    let leaves = id("leaves")?;
+    let planks = id("planks")?;
+    let grass = id("grass")?;
+    // Collect all flammable material ids from the registry.
+    let flammable: Vec<Voxel> = (1..registry.len())
+        .filter_map(|i| {
+            let def = registry.get(vox_core::MaterialId(i as u16))?;
+            def.flammable.then(|| Voxel(i as u16))
+        })
+        .collect();
+    Some(vox_sim::FireTable {
+        water,
+        ember,
+        char,
+        wood,
+        leaves,
+        planks,
+        grass,
+        flammable,
+    })
+}
+
 /// The engine application.
 struct VoxApp {
     window: Arc<Window>,
@@ -153,6 +183,9 @@ struct VoxApp {
     /// fed by the fluid tick's contact events. `None` when the asset set
     /// is missing a material weathering needs (see `weather_table`).
     weathering: Option<vox_sim::Weathering>,
+    /// Fire spreading and consumption, ticked alongside the fluid sim.
+    /// `None` when the asset set is missing a material fire needs.
+    fire: Option<vox_sim::FireSim>,
     /// Incrementing seed so repeated blasts get varied debris spin.
     blast_seed: u32,
     /// Incrementing seed so repeated impact-fracture chips get varied
@@ -282,6 +315,7 @@ impl VoxApp {
             fluid: vox_sim::FluidSim::with_powders(water_material(&registry), powder_materials(&registry)),
             fluid_clock: vox_platform::FrameClock::new(vox_core::consts::FLUID_DT),
             weathering,
+            fire: fire_table(&registry).map(vox_sim::FireSim::new),
             registry,
             player: Player::new(Vec3::ZERO),
             camera: Camera::new(Vec3::ZERO),
@@ -662,6 +696,25 @@ impl VoxApp {
                         .place_water(&mut self.world, &mut self.fluid, &self.registry, eye, look);
                     CarveOutcome::default()
                 }
+                Tool::Ember => {
+                    self.tools.place_ember(
+                        &mut self.world,
+                        &self.registry,
+                        eye,
+                        look,
+                        self.player.ctrl.aabb(),
+                    );
+                    if let Some(f) = &mut self.fire {
+                        // Wake fire sim at the placement so it ignites the ember.
+                        if let Some(hit) = vox_world::raycast(&self.world, eye, look, vox_core::consts::REACH) {
+                            if let Some(face) = hit.face {
+                                let pos = hit.voxel + face;
+                                f.ignite(&self.world, pos);
+                            }
+                        }
+                    }
+                    CarveOutcome::default()
+                }
             };
             // A carved body is despawned and replaced, not updated in
             // place. `removed` is empty for a carve that only ever touched
@@ -796,11 +849,10 @@ impl VoxApp {
                     buoyant: false,
                 });
             }
-            // Placing water never carves anything -- `outcome.impact_m` is
-            // always `None` for it, so the early return above already
-            // exits before this match runs; kept here only to stay
-            // exhaustive.
-            Tool::PlaceWater => {}
+            // Placing water or ember never carves anything — `impact_m`
+            // is always `None` for them, so the early return above already
+            // exits before this match runs; kept here to stay exhaustive.
+            Tool::PlaceWater | Tool::Ember => {}
         }
     }
 
@@ -935,6 +987,54 @@ impl App for VoxApp {
                 let events = self.fluid.drain_events();
                 w.tick(&mut self.world, &events);
             }
+            if let Some(f) = &mut self.fire {
+                f.tick(&mut self.world);
+                // Emit smoke particles from burning cells.
+                let s = self.world.cfg.voxel_size_m;
+                for ev in f.drain_events() {
+                    match ev {
+                        vox_sim::FireEvent::Burning(pos, _) => {
+                            let center = vox_core::voxel_center_m(pos, s);
+                            self.particles.burst(Burst {
+                                center,
+                                count: 2,
+                                color: [0.35, 0.34, 0.33],
+                                speed: 0.3,
+                                upward: 0.4,
+                                life: 3.0,
+                                size: 0.2,
+                                buoyant: true,
+                            });
+                        }
+                        vox_sim::FireEvent::Extinguished(pos) => {
+                            let center = vox_core::voxel_center_m(pos, s);
+                            self.particles.burst(Burst {
+                                center,
+                                count: 8,
+                                color: [0.7, 0.7, 0.75],
+                                speed: 0.5,
+                                upward: 0.6,
+                                life: 2.0,
+                                size: 0.15,
+                                buoyant: true,
+                            });
+                        }
+                        vox_sim::FireEvent::Consumed(pos) => {
+                            let center = vox_core::voxel_center_m(pos, s);
+                            self.particles.burst(Burst {
+                                center,
+                                count: 5,
+                                color: [0.25, 0.22, 0.20],
+                                speed: 0.4,
+                                upward: 0.3,
+                                life: 2.5,
+                                size: 0.18,
+                                buoyant: true,
+                            });
+                        }
+                    }
+                }
+            }
         }
 
         // Wake any resting debris whose ground was just carved/edited from
@@ -946,6 +1046,9 @@ impl App for VoxApp {
             for (min, max) in self.world.drain_dirty_regions() {
                 self.phys.wake_region(min.as_vec3() * s, max.as_vec3() * s);
                 self.fluid.wake_region(&self.world, min, max);
+                if let Some(f) = &mut self.fire {
+                    f.wake_region(&self.world, min, max);
+                }
             }
             self.remesh.absorb_dirty(&mut self.world);
             self.remesh.dispatch(&self.world, eye);
@@ -1146,6 +1249,7 @@ fn tool_label(tool: Tool) -> &'static str {
         Tool::Bomb => "Bomb",
         Tool::DeathLaser => "Laser",
         Tool::PlaceWater => "Water",
+        Tool::Ember => "Ember",
     }
 }
 
