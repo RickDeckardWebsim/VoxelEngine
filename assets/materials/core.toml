@@ -5,7 +5,9 @@
 #
 # `strength` is relative destruction resistance: the blast/carve tools compare
 # against it, so higher values survive bigger blasts. `solid = false` means
-# air-like: no collision and skipped by the mesher.
+# no collision (raycasts, the player, rigidbody contacts, and the
+# destruction connectivity flood all pass through) -- it does NOT affect
+# rendering, which is keyed on air vs. non-air only.
 # Every *.toml in this directory is loaded in case-insensitive filename order;
 # a material name declared in two files is an error.
 
@@ -64,3 +66,12 @@ color = [0.62, 0.47, 0.30]
 jitter = 0.04
 density = 600.0
 strength = 4.0
+
+[[material]]
+name = "water"
+color = [0.16, 0.35, 0.62]
+jitter = 0.02
+density = 1000.0
+strength = 0.0
+solid = false
+fluid = true
