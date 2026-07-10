@@ -61,6 +61,7 @@ impl Gpu {
             "selected GPU adapter"
         );
 
+
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("vox-device"),
