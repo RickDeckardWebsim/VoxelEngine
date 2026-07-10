@@ -1384,6 +1384,14 @@ mod tests {
             strength = 0.0
             solid = false
             fluid = true
+ 
+            [[material]]
+            name = "muddy_water"
+            color = [0.30, 0.22, 0.16]
+            density = 1100.0
+            strength = 0.0
+            solid = false
+            fluid = true
             "#,
             "test_weathering.toml",
         )
@@ -1431,6 +1439,7 @@ mod tests {
             dirt: voxel_by_name(&reg, "dirt"),
             mud,
             sand: voxel_by_name(&reg, "sand"),
+            muddy_water: voxel_by_name(&reg, "muddy_water"),
         };
         let mut sim = FluidSim::with_powders(
             water,
