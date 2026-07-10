@@ -811,8 +811,13 @@ impl VoxApp {
                     CarveOutcome::default()
                 }
                 Tool::Ember => {
-                    self.tools
-                        .place_ember(&mut self.world, &self.registry, eye, look, self.player.ctrl.aabb());
+                    if let Some(pos) = self.tools
+                        .place_ember(&mut self.world, &self.registry, eye, look, self.player.ctrl.aabb())
+                    {
+                        if let Some(f) = &mut self.fire {
+                            f.ignite(&mut self.world, pos);
+                        }
+                    }
                     CarveOutcome::default()
                 }
             };

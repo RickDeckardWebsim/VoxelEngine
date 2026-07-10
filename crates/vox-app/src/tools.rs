@@ -535,19 +535,19 @@ impl Tools {
         eye_m: Vec3,
         look: Vec3,
         player: Aabb,
-    ) {
+    ) -> Option<IVec3> {
         let dir = look.normalize_or_zero();
         if dir == Vec3::ZERO {
-            return;
+            return None;
         }
         let Some(hit) = raycast(world, eye_m, dir, REACH) else {
-            return;
+            return None;
         };
         let Some(ember_id) = registry.id_by_name("ember") else {
-            return; // asset set doesn't define ember; nothing to place
+            return None;
         };
         let Some(face) = hit.face else {
-            return;
+            return None;
         };
         let target = hit.voxel + face;
         let s = world.cfg.voxel_size_m;
@@ -558,6 +558,9 @@ impl Tools {
             && (c.z + half > player.min.z && c.z - half < player.max.z);
         if !overlaps {
             world.set_voxel(target, Voxel(ember_id.0));
+            Some(target)
+        } else {
+            None
         }
     }
 
