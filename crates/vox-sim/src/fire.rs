@@ -55,6 +55,7 @@ pub struct FireTable {
     pub leaves: Voxel,
     pub planks: Voxel,
     pub grass: Voxel,
+    pub muddy_water: Voxel,
     /// All flammable material ids (wood, leaves, planks, grass, ember).
     pub flammable: Vec<Voxel>,
 }
@@ -62,6 +63,12 @@ pub struct FireTable {
 impl FireTable {
     fn is_flammable(&self, v: Voxel) -> bool {
         self.flammable.contains(&v)
+    }
+
+    /// Whether `v` is a water-like fluid (water or muddy_water).
+    #[inline]
+    pub fn is_wet(&self, v: Voxel) -> bool {
+        v == self.water || v == self.muddy_water
     }
 
     /// Burn duration for a given flammable material, in ticks.
@@ -220,7 +227,7 @@ impl FireSim {
             }
             let water_adjacent = NEIGHBORS_6
                 .iter()
-                .any(|&n| world.get_voxel(pos + n) == table.water);
+                .any(|&n| table.is_wet(world.get_voxel(pos + n)));
             if water_adjacent {
                 extinguished.push(pos);
                 false
@@ -237,7 +244,7 @@ impl FireSim {
                 if world.get_voxel(q) == table.ash
                     && NEIGHBORS_6
                         .iter()
-                        .any(|&d| world.get_voxel(q + d) == table.water)
+                        .any(|&d| table.is_wet(world.get_voxel(q + d)))
                 {
                     world.set_voxel(q, table.dark_ash);
                 }
@@ -437,6 +444,7 @@ mod tests {
     const CHAR: Voxel = Voxel(7);
     const ASH: Voxel = Voxel(9);
     const DARK_ASH: Voxel = Voxel(10);
+    const MUDDY_WATER: Voxel = Voxel(11);
     const STONE: Voxel = Voxel(8);
 
     fn table() -> FireTable {
@@ -450,6 +458,7 @@ mod tests {
             leaves: LEAVES,
             planks: PLANKS,
             grass: GRASS,
+            muddy_water: MUDDY_WATER,
             flammable: vec![WOOD, LEAVES, GRASS, PLANKS, EMBER],
         }
     }
@@ -460,7 +469,7 @@ mod tests {
             extent_m: [16.0, 16.0, 16.0],
             ..WorldConfig::default()
         });
-        w.set_solid_table(vec![false, false, true, true, true, true, true, true, true]);
+        w.set_solid_table(vec![false, false, true, true, true, true, true, true, true, true, true, false]);
         let (_, max) = w.bounds_voxels();
         w.fill_box(IVec3::ZERO, IVec3::new(max.x, 5, max.z), STONE);
         w.fill_box(IVec3::new(0, 5, 0), IVec3::new(max.x, 6, max.z), top);
@@ -561,6 +570,28 @@ mod tests {
             world.get_voxel(pos),
             CHAR,
             "ember extinguished by water → char"
+        );
+    }
+
+    #[test]
+    fn muddy_water_extinguishes_fire() {
+        let mut world = world_with_floor(STONE);
+        let mut sim = FireSim::new(table());
+        let pos = IVec3::new(8, 5, 8);
+        world.set_voxel(pos, WOOD);
+        sim.ignite(&mut world, pos);
+        // Place muddy_water next to the burning wood
+        world.set_voxel(pos + IVec3::X, MUDDY_WATER);
+        sim.tick(&mut world);
+        assert_eq!(
+            sim.burning_count(),
+            0,
+            "muddy_water-adjacent fire must be extinguished"
+        );
+        assert_eq!(
+            world.get_voxel(pos),
+            CHAR,
+            "extinguished burning cell must become char"
         );
     }
 
