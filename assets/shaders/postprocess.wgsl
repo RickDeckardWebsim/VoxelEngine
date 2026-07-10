@@ -71,15 +71,14 @@ fn fs(@builtin(position) frag_pos: vec4f) -> @location(0) vec4f {
     // Sample base color.
     var c = textureSample(color_tex, samp, uv).rgb;
 
-    // ACES filmic tone mapping (approximation) for realistic contrast.
-    c = c * (2.51 * c + 0.03) / (c * (2.43 * c + 0.59) + 0.14);
+    // Very subtle tone mapping — just a soft knee in highlights to
+    // prevent harsh clipping, not full ACES which creates artifacts
+    // with the water's flat color values.
+    c = c / (c + vec3f(0.6));
     c = clamp(c, vec3f(0.0), vec3f(1.0));
 
-    // Subtle warm tint for natural outdoor feel.
+    // Subtle warm tint.
     c = c * vec3f(1.01, 1.0, 0.99);
-
-    // Slight contrast boost.
-    c = mix(c, smoothstep(vec3f(0.0), vec3f(1.0), c), 0.1);
 
     return vec4f(c, 1.0);
 }

@@ -121,31 +121,14 @@ fn fs(in: VOut) -> FOut {
     var c: vec3f;
 
     if is_water {
-        // Water: flat, uniform lighting — no per-face normal shading,
-        // no AO. This makes the surface look like a continuous body of
-        // water instead of a grid of differently-lit cubes.
-        let up = vec3f(0.0, 1.0, 0.0);
-        let view_dir = normalize(in.world_pos - cam.cam_pos.xyz);
+        // Water: flat, uniform color — no per-face lighting, no AO, no
+        // specular, no Fresnel. Just the base water color darkened by
+        // depth. This looks clean and smooth, not glitchy.
+        c = in.color * 0.8;
 
-        // Base water color with gentle ambient only.
-        c = in.color * AMBIENT_SKY * AMBIENT_STRENGTH;
-
-        // Fresnel sky reflection: stronger at grazing angles, like real
-        // water. Makes the surface feel reflective and wet.
-        let fresnel = pow(1.0 - abs(dot(view_dir, up)), 3.0);
-        c = mix(c, SKY_COLOR * 0.9, fresnel * 0.5);
-
-        // Specular sparkle from the sun (Blinn-Phong on up vector).
-        let sun_dir = normalize(-cam.sun_dir.xyz);
-        let half_v = normalize(sun_dir - view_dir);
-        let spec = pow(max(dot(up, half_v), 0.0), 64.0);
-        c = c + vec3f(spec * 0.6);
-
-        // Depth-based darkening. The jitter field holds water column
-        // depth (baked by the mesher). Gentle, capped absorption so
-        // transitions between merged quads are smooth.
+        // Gentle depth-based darkening.
         let water_depth = in.jitter_raw / 255.0;
-        let absorption = clamp(1.0 - exp(-water_depth * 15.0), 0.0, 0.7);
+        let absorption = clamp(1.0 - exp(-water_depth * 15.0), 0.0, 0.6);
         let deep_color = vec3f(0.02, 0.06, 0.12);
         c = mix(c, deep_color, absorption);
     } else {
