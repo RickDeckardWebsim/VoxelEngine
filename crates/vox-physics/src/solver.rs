@@ -12,7 +12,7 @@ use vox_core::consts::{
     CLUTTER_LIFETIME_MAX_S, CLUTTER_LIFETIME_MIN_S, CLUTTER_MAX_VOXELS, CONTACT_SLOP, GRAVITY,
     SLEEP_FRAMES, SOLVER_ITERS, SUBSTEPS,
 };
-use vox_world::{Voxel, World};
+use vox_world::{SolidLookup, Voxel, World};
 
 use crate::body::{Body, BodyId};
 use crate::broadphase::Broadphase;
@@ -459,8 +459,9 @@ impl PhysicsWorld {
             body.inv_iw = body.inv_inertia_world();
         }
 
-        // Integrate velocities and collect contacts.
+        let mut lookup = SolidLookup::new(world);
         let mut contacts: Vec<Contact> = Vec::new();
+        // Integrate velocities and collect contacts.
         for (slot, entry) in self.slots.iter_mut().enumerate() {
             let Some(body) = entry else { continue };
             if body.sleep.asleep {
@@ -506,7 +507,7 @@ impl PhysicsWorld {
                 body.omega = body.omega.normalize() * MAX_ANGULAR_SPEED_RAD_S;
             }
             debug_assert!(body.vel.is_finite() && body.pos.is_finite());
-            world_contacts(body, slot, world, &mut contacts);
+            world_contacts(body, slot, &mut contacts, &mut lookup);
         }
 
         // Body-body narrowphase over broadphase candidates. One staging
