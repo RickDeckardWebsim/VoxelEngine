@@ -247,8 +247,9 @@ fn fs(in: VOut) -> @location(0) vec4f {
         let t = cam.sun_color.w;
         let ripple = sin(in.world_pos.x * 3.0 + t * 2.0) * 0.5 + sin(in.world_pos.z * 2.3 + t * 1.7) * 0.5;
         c = mix(c, cam.sky_color.xyz, clamp(f * f + ripple * 0.04, 0.0, 1.0));
-        // Blue tint for translucent water
-        c = mix(c, vec3f(0.12, 0.28, 0.50), 0.30);
+        // Blue tint — scaled by sun strength so water dims at night
+        let night_factor = 0.15 + 0.85 * cam.sun_dir.w;
+        c = mix(c, vec3f(0.12, 0.28, 0.50) * night_factor, 0.30);
     }
 
     return vec4f(c, alpha);
