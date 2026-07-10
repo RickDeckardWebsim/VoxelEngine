@@ -196,12 +196,20 @@ fn vs(v: VIn, inst: Inst) -> VOut {
 // has depth_write_enabled=true, the water pipeline has it false so terrain
 // behind water is not depth-culled.
 override water_pass: u32 = 0u;
+// Specialization constant: the material id for muddy_water, or 0 if absent.
+// 0 = air, which is_fluid will never match, so muddy_water rendering is
+// disabled cleanly when the material doesn't exist.
+override muddy_water_id: u32 = 0u;
+
+fn is_fluid(id: u32) -> bool {
+    return id == 9u || id == muddy_water_id;
+}
 
 @fragment
 fn fs(in: VOut) -> @location(0) vec4f {
     // Pass selection: each pipeline variant only draws its own materials.
-    if (water_pass == 0u && in.mat_id == 9u) { discard; }
-    if (water_pass == 1u && in.mat_id != 9u) { discard; }
+    if (water_pass == 0u && is_fluid(in.mat_id)) { discard; }
+    if (water_pass == 1u && !is_fluid(in.mat_id)) { discard; }
 
     let n = normalize(in.world_normal);
     let ndotl = dot(n, cam.sun_dir.xyz);
@@ -220,7 +228,7 @@ fn fs(in: VOut) -> @location(0) vec4f {
     // ~0) the sun term is already zero, so skip the texture fetch entirely.
     // Water (mat 9) is excluded from receiving shadows -- a transparent
     // surface darkening under shadow reads wrong.
-    if (cam.sun_dir.w > 0.0 && in.mat_id != 9u) {
+    if (cam.sun_dir.w > 0.0 && !is_fluid(in.mat_id)) {
         let vis = shadow_visibility(in.world_pos);
         // vis=1 fully lit (sun unchanged); vis=0 fully shadowed (sun halved).
         // Ambient and fill light are untouched, so shadowed terrain dims
@@ -238,7 +246,7 @@ fn fs(in: VOut) -> @location(0) vec4f {
     // driven by cam.ambient_sky.w. Intensity 0 => no cracks (clean multiply
     // by 0). Water (mat 9) is skipped — cracks belong on solid terrain.
     // Applied to lit color before fog so distant cracked voxels still fog.
-    if (cam.ambient_sky.w > 0.0 && in.mat_id != 9u) {
+    if (cam.ambient_sky.w > 0.0 && !is_fluid(in.mat_id)) {
         let k = crack_factor(in.world_pos / cam.fog.z) * cam.ambient_sky.w;
         c = mix(c, vec3f(0.05, 0.04, 0.03), clamp(k, 0.0, 1.0) * 0.55);
     }
@@ -248,7 +256,7 @@ fn fs(in: VOut) -> @location(0) vec4f {
     c = mix(c, cam.sky_color.xyz, f * f);
     // Water (material ID 9): semi-transparent with a subtle refraction ripple
     // that perturbs the fog mix slightly via a sin wave on world XZ + time.
-    let alpha = select(1.0, 0.85, in.mat_id == 9u);
+    let alpha = select(1.0, select(0.85, 0.80, in.mat_id == muddy_water_id), is_fluid(in.mat_id));
     if (in.mat_id == 9u) {
         let t = cam.sun_color.w;
         let ripple = sin(in.world_pos.x * 3.0 + t * 2.0) * 0.5 + sin(in.world_pos.z * 2.3 + t * 1.7) * 0.5;
