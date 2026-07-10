@@ -144,7 +144,10 @@ pub fn mesh_slab(slab: &VoxelSlab, jitter_seed: IVec3) -> MeshData {
                     p[axis] = slice;
                     p[u_axis] = u;
                     p[v_axis] = v;
-                    let cell = if slab.solid(p) && !slab.solid(p + normal) {
+                    let is_water = slab.get(p) == vox_world::Voxel(9);
+                    let cell = if (slab.opaque(p) && !slab.opaque(p + normal))
+                        || (is_water && !slab.solid(p + normal))
+                    {
                         let outer = p + normal;
                         let mut ao4 = [0u8; 4];
                         for (i, (cu, cv)) in
@@ -153,9 +156,9 @@ pub fn mesh_slab(slab: &VoxelSlab, jitter_seed: IVec3) -> MeshData {
                             let u_off = if cu == 0 { -u_dir } else { u_dir };
                             let v_off = if cv == 0 { -v_dir } else { v_dir };
                             ao4[i] = ao(
-                                slab.solid(outer + u_off),
-                                slab.solid(outer + v_off),
-                                slab.solid(outer + u_off + v_off),
+                                slab.opaque(outer + u_off),
+                                slab.opaque(outer + v_off),
+                                slab.opaque(outer + u_off + v_off),
                             );
                         }
                         Some(Cell {

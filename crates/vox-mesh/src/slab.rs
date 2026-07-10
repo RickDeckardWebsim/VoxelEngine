@@ -109,6 +109,17 @@ impl VoxelSlab {
     pub fn solid(&self, rel: IVec3) -> bool {
         self.get(rel) != AIR
     }
+
+    /// Like [`solid`](Self::solid) but treats water (material 9) as
+    /// non-solid. Used for face culling so that faces between solid
+    /// terrain and water ARE generated (visible through translucent water),
+    /// while faces between water and water, or between two solid voxels,
+    /// are still culled.
+    #[inline]
+    pub fn opaque(&self, rel: IVec3) -> bool {
+        let v = self.get(rel);
+        v != AIR && v != vox_world::Voxel(9)
+    }
 }
 
 #[cfg(test)]
