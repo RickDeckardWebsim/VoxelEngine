@@ -11,7 +11,7 @@ use vox_render::GrassVertex;
 use vox_world::{AIR, World};
 
 /// How far around the camera to generate grass blades (meters).
-const GRASS_RADIUS_M: f32 = 60.0;
+const GRASS_RADIUS_M: f32 = 30.0; // Reduced from 60 for performance
 
 /// Cached grass blade vertices. Regenerated at most every N frames.
 /// Wind sway is applied in the vertex shader via game_time, so the blade
@@ -83,88 +83,70 @@ pub fn generate_grass(
 
     for cx in min_chunk.x..=max_chunk.x {
         for cz in min_chunk.z..=max_chunk.z {
-            let chunk_key = IVec3::new(cx, 0, cz);
-            // Scan all Y slices in the chunk for grass tops.
-            // We check each voxel: if it's grass and the voxel above is air,
-            // it's a grass-top surface — generate blades there.
-            let origin = chunk_origin(chunk_key);
-            for lx in 0..CHUNK_SIZE as i32 {
-                for lz in 0..CHUNK_SIZE as i32 {
-                    for ly in 0..CHUNK_SIZE as i32 {
-                        let pos = IVec3::new(origin.x + lx, origin.y + ly, origin.z + lz);
-                        // Distance check in XZ only (grass is on the ground).
-                        let dx = pos.x as f32 * vs - cam_pos.x;
-                        let dz = pos.z as f32 * vs - cam_pos.z;
-                        if dx * dx + dz * dz > GRASS_RADIUS_M * GRASS_RADIUS_M {
-                            continue;
-                        }
-                        let voxel = world.get_voxel(pos);
-                        if voxel != vox_world::Voxel(3) {
-                            continue; // not grass
-                        }
-                        let above = world.get_voxel(pos + IVec3::Y);
-                        if above != AIR {
-                            continue; // something on top, no grass blades
-                        }
-                        // Generate blades for this grass-top voxel.
-                        let center = Vec3::new(
-                            pos.x as f32 * vs + vs * 0.5,
-                            pos.y as f32 * vs + vs,
-                            pos.z as f32 * vs + vs * 0.5,
-                        );
-                        for b in 0..BLADES_PER_VOXEL {
-                            // Per-blade hash for position/height variation.
-                        let bi = b as i32;
-                        let h = hash01(pos.x * 17 + bi, pos.y * 31 + bi, pos.z * 13 + bi);
-                        let h2 = hash01(pos.x * 7 + bi * 3, pos.y * 11 + bi * 5, pos.z * 19 + bi * 7);
-                        let h3 = hash01(pos.x * 23 + bi * 11, pos.y * 5 + bi * 17, pos.z * 29 + bi * 2);
-
-                            // Blade position within the voxel (offset from center).
-                            let offset_x = (h - 0.5) * vs * 0.7;
-                            let offset_z = (h2 - 0.5) * vs * 0.7;
-                            let base = Vec3::new(center.x + offset_x, center.y, center.z + offset_z);
-
-                            // Blade height: 0.4 to 1.2 voxel heights.
-                            let height = vs * (0.4 + h3 * 0.8);
-                            // Blade width: thin, 0.04 to 0.08 voxel widths.
-                            let width = vs * (0.04 + h * 0.04);
-
-                            // Wind sway: tip offsets with time.
-                            let wind = (game_time * 1.5 + pos.x as f32 * 0.7 + pos.z as f32 * 0.5 + b as f32 * 1.3).sin();
-                            let tip_offset_x = wind * height * 0.15;
-                            let wind2 = (game_time * 1.1 + pos.z as f32 * 0.9 + b as f32 * 2.1).cos();
-                            let tip_offset_z = wind2 * height * 0.10;
-
-                            // Facing direction: perpendicular to wind for a natural look.
-                            let facing = h2 * std::f32::consts::TAU;
-                            let fx = facing.cos();
-                            let fz = facing.sin();
-
-                            // 4 vertices: base-left, base-right, tip-left, tip-right
-                            // Blade is a quad aligned with the facing direction.
-                            let half_w = width * 0.5;
-                            let tip = Vec3::new(
-                                base.x + tip_offset_x,
-                                base.y + height,
-                                base.z + tip_offset_z,
+            // Scan Y chunks from top down — grass is on the surface.
+            let max_y_chunk = (world.cfg.extent_m[1] / (CHUNK_SIZE as f32 * vs)) as i32 + 1;
+            for cy in (0..=max_y_chunk).rev() {
+                let chunk_key = IVec3::new(cx, cy, cz);
+                let origin = chunk_origin(chunk_key);
+                let mut found_grass = false;
+                for lx in 0..CHUNK_SIZE as i32 {
+                    for lz in 0..CHUNK_SIZE as i32 {
+                        for ly in (0..CHUNK_SIZE as i32).rev() {
+                            let pos = IVec3::new(origin.x + lx, origin.y + ly, origin.z + lz);
+                            let dx = pos.x as f32 * vs - cam_pos.x;
+                            let dz = pos.z as f32 * vs - cam_pos.z;
+                            if dx * dx + dz * dz > GRASS_RADIUS_M * GRASS_RADIUS_M {
+                                continue;
+                            }
+                            let voxel = world.get_voxel(pos);
+                            if voxel != vox_world::Voxel(3) {
+                                continue;
+                            }
+                            let above = world.get_voxel(pos + IVec3::Y);
+                            if above != AIR {
+                                continue;
+                            }
+                            found_grass = true;
+                            let center = Vec3::new(
+                                pos.x as f32 * vs + vs * 0.5,
+                                pos.y as f32 * vs + vs,
+                                pos.z as f32 * vs + vs * 0.5,
                             );
-
-                            // Base corners (perpendicular to facing).
-                            let bl = Vec3::new(base.x - fx * half_w, base.y, base.z - fz * half_w);
-                            let br = Vec3::new(base.x + fx * half_w, base.y, base.z + fz * half_w);
-                            let tl = Vec3::new(tip.x - fx * half_w * 0.3, tip.y, tip.z - fz * half_w * 0.3);
-                            let tr = Vec3::new(tip.x + fx * half_w * 0.3, tip.y, tip.z + fz * half_w * 0.3);
-
-                            // Two triangles: (bl, br, tl) and (br, tr, tl)
-                            // height_factor: 0 at base, 1 at tip
-                            vertices.push(GrassVertex { position: [bl.x, bl.y, bl.z], height_factor: 0.0 });
-                            vertices.push(GrassVertex { position: [br.x, br.y, br.z], height_factor: 0.0 });
-                            vertices.push(GrassVertex { position: [tl.x, tl.y, tl.z], height_factor: 1.0 });
-                            vertices.push(GrassVertex { position: [tr.x, tr.y, tr.z], height_factor: 1.0 });
-                            vertices.push(GrassVertex { position: [br.x, br.y, br.z], height_factor: 0.0 });
-                            vertices.push(GrassVertex { position: [tr.x, tr.y, tr.z], height_factor: 1.0 });
+                            for b in 0..BLADES_PER_VOXEL {
+                                let bi = b as i32;
+                                let h = hash01(pos.x * 17 + bi, pos.y * 31 + bi, pos.z * 13 + bi);
+                                let h2 = hash01(pos.x * 7 + bi * 3, pos.y * 11 + bi * 5, pos.z * 19 + bi * 7);
+                                let h3 = hash01(pos.x * 23 + bi * 11, pos.y * 5 + bi * 17, pos.z * 29 + bi * 2);
+                                let offset_x = (h - 0.5) * vs * 0.7;
+                                let offset_z = (h2 - 0.5) * vs * 0.7;
+                                let base = Vec3::new(center.x + offset_x, center.y, center.z + offset_z);
+                                let height = vs * (0.4 + h3 * 0.8);
+                                let width = vs * (0.04 + h * 0.04);
+                                let wind = (game_time * 1.5 + pos.x as f32 * 0.7 + pos.z as f32 * 0.5 + b as f32 * 1.3).sin();
+                                let tip_offset_x = wind * height * 0.15;
+                                let wind2 = (game_time * 1.1 + pos.z as f32 * 0.9 + b as f32 * 2.1).cos();
+                                let tip_offset_z = wind2 * height * 0.10;
+                                let facing = h2 * std::f32::consts::TAU;
+                                let fx = facing.cos();
+                                let fz = facing.sin();
+                                let half_w = width * 0.5;
+                                let tip = Vec3::new(base.x + tip_offset_x, base.y + height, base.z + tip_offset_z);
+                                let bl = Vec3::new(base.x - fx * half_w, base.y, base.z - fz * half_w);
+                                let br = Vec3::new(base.x + fx * half_w, base.y, base.z + fz * half_w);
+                                let tl = Vec3::new(tip.x - fx * half_w * 0.3, tip.y, tip.z - fz * half_w * 0.3);
+                                let tr = Vec3::new(tip.x + fx * half_w * 0.3, tip.y, tip.z + fz * half_w * 0.3);
+                                vertices.push(GrassVertex { position: [bl.x, bl.y, bl.z], height_factor: 0.0 });
+                                vertices.push(GrassVertex { position: [br.x, br.y, br.z], height_factor: 0.0 });
+                                vertices.push(GrassVertex { position: [tl.x, tl.y, tl.z], height_factor: 1.0 });
+                                vertices.push(GrassVertex { position: [tr.x, tr.y, tr.z], height_factor: 1.0 });
+                                vertices.push(GrassVertex { position: [br.x, br.y, br.z], height_factor: 0.0 });
+                                vertices.push(GrassVertex { position: [tr.x, tr.y, tr.z], height_factor: 1.0 });
+                            }
                         }
                     }
+                }
+                if found_grass {
+                    break; // Found grass in this XZ column, skip lower Y chunks.
                 }
             }
         }
