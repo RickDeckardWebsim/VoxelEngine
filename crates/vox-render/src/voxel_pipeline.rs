@@ -77,10 +77,10 @@ pub type BodyMeshKey = (u32, u32);
 /// mesh store.
 pub struct VoxelPipeline {
     pipeline: wgpu::RenderPipeline,
-    /// Water-only pipeline variant: alpha blending, depth_write disabled,
+    /// Water-only pipeline variant: alpha blending, depth_write enabled,
     /// specialization constant water_pass=1 so only mat_id==9 fragments
     /// survive. Draws after the opaque pass so terrain behind water is
-    /// already in the depth buffer and is not occluded by water.
+    /// already in the depth buffer and shows through the alpha blend.
     water_pipeline: wgpu::RenderPipeline,
     camera_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -265,8 +265,9 @@ impl VoxelPipeline {
         });
 
         // Water pipeline: same shader/layout, but specialization constant
-        // water_pass=1 (only mat_id==9 fragments survive), alpha blending,
-        // and depth writes disabled so terrain behind water is visible.
+        // water_pass=1 (only mat_id==9 fragments survive), alpha blending.
+        // Depth writes enabled so void behind water is properly occluded —
+        // terrain (drawn in opaque pass) still shows through the alpha blend.
         let water_constants = wgpu::PipelineCompilationOptions {
             constants: &std::collections::HashMap::from([("water_pass".into(), 1.0_f64)]),
             ..Default::default()
@@ -298,10 +299,10 @@ impl VoxelPipeline {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: false,
+                depth_write_enabled: true,
                 depth_compare: wgpu::CompareFunction::LessEqual,
-                stencil: Default::default(),
-                bias: Default::default(),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
             }),
             multisample: Default::default(),
             multiview: None,
