@@ -80,10 +80,15 @@ fn vs(v: VIn, inst: Inst) -> VOut {
     // flicker on its surface -- chunks never move, so they never showed it,
     // matching the exact "only on detached bodies" symptom this fixed.
     let h = f32(v.norm_mat.y) / 255.0;
+    let mat_id_v = v.norm_mat.z | (v.norm_mat.w << 8u);
+    let water_id_v = u32(cam.fog.w);
+    // For water faces, the jitter field holds water depth, not color
+    // jitter — don't apply it as color variation.
+    let color_jitter = select(h, 0.5, mat_id_v == water_id_v);
 
     var out: VOut;
     out.clip = cam.view_proj * vec4f(wp, 1.0);
-    out.color = base.rgb * (1.0 + (h - 0.5) * 2.0 * base.a);
+    out.color = base.rgb * (1.0 + (color_jitter - 0.5) * 2.0 * base.a);
     // Chunks never rotate, so their local and world axes coincide -- but a
     // debris body's instance matrix carries real rotation (it tumbles), and
     // lighting a tumbling body against its *local* (un-rotated) face normal
@@ -110,46 +115,58 @@ struct FOut {
 fn fs(in: VOut) -> FOut {
     let n = normalize(in.world_normal);
     let ndotl = dot(n, -cam.sun_dir.xyz);
+    let water_id = u32(cam.fog.w);
+    let is_water = u32(in.mat_id) == water_id;
 
-    // Smooth half-Lambert lighting (realistic, not cel-shaded).
-    let sun = pow(clamp(ndotl * 0.5 + 0.5, 0.0, 1.0), 1.5) * SUN_STRENGTH;
+    var c: vec3f;
 
-    let fill = max(-ndotl, 0.0) * FILL_STRENGTH;
+    if is_water {
+        // Water: flat, uniform lighting — no per-face normal shading,
+        // no AO. This makes the surface look like a continuous body of
+        // water instead of a grid of differently-lit cubes.
+        let up = vec3f(0.0, 1.0, 0.0);
+        let view_dir = normalize(in.world_pos - cam.cam_pos.xyz);
 
-    let hemi_t = clamp(0.5 + 0.5 * n.y, 0.0, 1.0);
-    let ambient = mix(AMBIENT_GROUND, AMBIENT_SKY, hemi_t) * AMBIENT_STRENGTH;
+        // Base water color with gentle ambient only.
+        c = in.color * AMBIENT_SKY * AMBIENT_STRENGTH;
 
-    let ao = 0.45 + 0.55 * in.ao;
-    var c = in.color * (ambient + vec3f(sun + fill)) * ao;
+        // Fresnel sky reflection: stronger at grazing angles, like real
+        // water. Makes the surface feel reflective and wet.
+        let fresnel = pow(1.0 - abs(dot(view_dir, up)), 3.0);
+        c = mix(c, SKY_COLOR * 0.9, fresnel * 0.5);
+
+        // Specular sparkle from the sun (Blinn-Phong on up vector).
+        let sun_dir = normalize(-cam.sun_dir.xyz);
+        let half_v = normalize(sun_dir - view_dir);
+        let spec = pow(max(dot(up, half_v), 0.0), 64.0);
+        c = c + vec3f(spec * 0.6);
+
+        // Depth-based darkening. The jitter field holds water column
+        // depth (baked by the mesher). Gentle, capped absorption so
+        // transitions between merged quads are smooth.
+        let water_depth = in.jitter_raw / 255.0;
+        let absorption = clamp(1.0 - exp(-water_depth * 15.0), 0.0, 0.7);
+        let deep_color = vec3f(0.02, 0.06, 0.12);
+        c = mix(c, deep_color, absorption);
+    } else {
+        // Standard lighting for non-water materials.
+        let sun = pow(clamp(ndotl * 0.5 + 0.5, 0.0, 1.0), 1.5) * SUN_STRENGTH;
+        let fill = max(-ndotl, 0.0) * FILL_STRENGTH;
+        let hemi_t = clamp(0.5 + 0.5 * n.y, 0.0, 1.0);
+        let ambient = mix(AMBIENT_GROUND, AMBIENT_SKY, hemi_t) * AMBIENT_STRENGTH;
+        let ao = 0.45 + 0.55 * in.ao;
+        c = in.color * (ambient + vec3f(sun + fill)) * ao;
+    }
 
     let dist = length(in.world_pos - cam.cam_pos.xyz);
     let f = clamp((dist - cam.fog.x) / (cam.fog.y - cam.fog.x), 0.0, 1.0);
     c = mix(c, SKY_COLOR, f * f);
 
-    // Encode normal to 0..1 for the post-process edge detection pass.
-    // Blend toward the clear color (0.5, 0.5, 0.5) in fog so fogged
-    // pixels don't produce false normal edges against the sky.
     let enc_n = n * 0.5 + 0.5;
     let fog_n = mix(enc_n, vec3f(0.5, 0.5, 0.5), f * f);
 
     var out: FOut;
-    // Water: depth-based darkening. The mesher bakes water column depth
-    // (how many water voxels below this face until terrain) into the
-    // jitter field for water faces. Deeper water = darker + slightly
-    // more opaque-looking (achieved by darkening, not alpha blending).
-    let water_id = u32(cam.fog.w);
-    if u32(in.mat_id) == water_id {
-        // Jitter field holds water depth (0=surface, higher=deeper).
-        let water_depth = in.jitter_raw;
-        // Exponential absorption: shallow water is bright, deep water
-        // darkens quickly. Tunes to ~10 voxels for full darkening.
-        let absorption = 1.0 - exp(-water_depth * 0.25);
-        let deep_color = vec3f(0.03, 0.08, 0.15);
-        let water_color = mix(c, deep_color, absorption);
-        out.color = vec4f(water_color, 1.0);
-    } else {
-        out.color = vec4f(c, 1.0);
-    }
+    out.color = vec4f(c, 1.0);
     out.normal = vec4f(fog_n, 1.0);
     let ndc_depth = in.clip.z / in.clip.w;
     out.depth_out = vec4f(ndc_depth, 0.0, 0.0, 1.0);
