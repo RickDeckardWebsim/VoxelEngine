@@ -252,6 +252,7 @@ impl PostProcessPipeline {
     /// Draw the fullscreen post-process pass into the given target view
     /// (the swapchain frame).
     pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.draw(0..3, 0..1);
     }

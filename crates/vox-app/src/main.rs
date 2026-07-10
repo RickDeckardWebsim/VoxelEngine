@@ -1377,7 +1377,23 @@ impl App for VoxApp {
                 occlusion_query_set: None,
             });
             self.postprocess.draw(&mut pass);
-            // Debug overlay on top of post-processed scene.
+        }
+        // Pass 3: debug overlay → swapchain (on top of post-processed scene).
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("overlay-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: frame.view(),
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
             self.debug_overlay.paint(&mut pass, &prepared_overlay);
         }
         self.gpu.queue().submit([encoder.finish()]);
