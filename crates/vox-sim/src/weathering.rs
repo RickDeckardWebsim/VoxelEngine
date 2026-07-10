@@ -26,6 +26,8 @@ pub const MUD_DRY_TICKS: u32 = 300; // ~20 s
 /// Dissolve ticks (at the fluid tick rate, ~15 Hz) before mud adjacent to
 /// water dissolves into muddy_water.
 pub const MUD_DISSOLVE_TICKS: u32 = 60; // ~4 s
+/// Contact ticks before clean water adjacent to muddy_water becomes muddy.
+pub const POLLUTE_SPREAD_TICKS: u32 = 90; // ~6 s
 
 const NEIGHBORS_6: [IVec3; 6] = [
     IVec3::new(1, 0, 0),
@@ -62,6 +64,7 @@ pub struct Weathering {
     soaking: FxHashMap<IVec3, u32>,
     drying: FxHashMap<IVec3, u32>,
     dissolving: FxHashMap<IVec3, u32>,
+    polluting: FxHashMap<IVec3, u32>,
 }
 
 impl Weathering {
@@ -71,6 +74,7 @@ impl Weathering {
             soaking: FxHashMap::default(),
             drying: FxHashMap::default(),
             dissolving: FxHashMap::default(),
+            polluting: FxHashMap::default(),
         }
     }
 
@@ -83,6 +87,9 @@ impl Weathering {
     }
     pub fn dissolving_count(&self) -> usize {
         self.dissolving.len()
+    }
+    pub fn polluting_count(&self) -> usize {
+        self.polluting.len()
     }
 
     pub fn tick(&mut self, world: &mut World, events: &[ContactEvent]) {
@@ -123,6 +130,16 @@ impl Weathering {
                     self.soaking.entry(q).or_insert(0);
                     if fell && v == t.stone {
                         fell_this_tick.insert(q);
+                    }
+                }
+            }
+            // When the event cell itself is muddy_water, any clean water
+            // neighbor is a candidate for contact pollution.
+            if world.get_voxel(pos) == t.muddy_water {
+                for n in NEIGHBORS_6 {
+                    let q = pos + n;
+                    if world.get_voxel(q) == t.water {
+                        self.polluting.entry(q).or_insert(0);
                     }
                 }
             }
@@ -197,6 +214,29 @@ impl Weathering {
             true
         });
         for pos in dissolved {
+            world.set_voxel(pos, t.muddy_water);
+        }
+        // 2c. Advance polluting: clean water adjacent to muddy_water counts
+        // toward pollution; at threshold, becomes muddy_water.
+        let mut polluted = Vec::new();
+        self.polluting.retain(|&pos, ticks| {
+            if world.get_voxel(pos) != t.water {
+                return false;
+            }
+            if !NEIGHBORS_6
+                .iter()
+                .any(|&n| world.get_voxel(pos + n) == t.muddy_water)
+            {
+                return false; // no muddy neighbor
+            }
+            *ticks += 1;
+            if *ticks >= POLLUTE_SPREAD_TICKS {
+                polluted.push(pos);
+                return false;
+            }
+            true
+        });
+        for pos in polluted {
             world.set_voxel(pos, t.muddy_water);
         }
 
@@ -577,6 +617,31 @@ mod tests {
             world.get_voxel(cell),
             MUDDY_WATER,
             "mud must dissolve to muddy_water at the threshold"
+        );
+    }
+    #[test]
+    fn clean_water_adjacent_to_muddy_water_becomes_muddy() {
+        let mut world = world_with_floor(STONE);
+        let mut weathering = Weathering::new(table());
+        let water_cell = IVec3::new(7, 5, 8);
+        let muddy_cell = IVec3::new(8, 5, 8);
+        world.set_voxel(water_cell, WATER);
+        world.set_voxel(muddy_cell, MUDDY_WATER);
+        world.set_solid_table(vec![false, false, true, true, true, true, true, false]);
+        // Seed: Settled on the muddy_water cell registers the clean water for polluting
+        weathering.tick(&mut world, &[ContactEvent::Settled(muddy_cell)]);
+        assert_eq!(
+            weathering.polluting_count(),
+            1,
+            "clean water adjacent to muddy_water must enter polluting"
+        );
+        for _ in 0..(POLLUTE_SPREAD_TICKS - 1) {
+            weathering.tick(&mut world, &[]);
+        }
+        assert_eq!(
+            world.get_voxel(water_cell),
+            MUDDY_WATER,
+            "clean water must become muddy_water at the pollute threshold"
         );
     }
 }
