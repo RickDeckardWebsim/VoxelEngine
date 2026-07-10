@@ -81,6 +81,9 @@ pub struct CarveOutcome {
     pub impact_material: Voxel,
     /// Voxel diff for undo: (position, old_voxel) pairs of every world voxel
     /// that was changed by this operation. Empty for body-only carves.
+    /// NOTE: only safe to undo when `spawned` is empty — destruction tools
+    /// that spawn debris bodies leave holes from detach_unsupported and
+    /// flying bodies that aren't captured in this diff.
     pub voxel_diff: Vec<(IVec3, Voxel)>,
 }
 

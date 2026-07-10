@@ -687,11 +687,16 @@ impl VoxApp {
             // until every replacement fragment is ready (see its own doc
             // comment).
             self.emit_tool_particles(&outcome);
-            // Push voxel diff onto undo stack (if any world voxels changed).
-            if !outcome.voxel_diff.is_empty() {
+            // Push voxel diff onto undo stack — but only for operations that
+            // didn't spawn debris bodies. Destruction tools (blast, scalable_dig,
+            // laser) call detach_unsupported which deletes voxels NOT in the
+            // diff and spawns physics bodies we can't despawn on undo. So we
+            // only undo safe operations: dig (single voxel, no debris) and
+            // place_voxel. This is an honest limitation — destruction undo
+            // needs body despawning + full diff capture, deferred.
+            if !outcome.voxel_diff.is_empty() && outcome.spawned.is_empty() {
                 self.undo_stack.push(outcome.voxel_diff);
                 self.redo_stack.clear();
-                // Cap undo history to 50 operations.
                 if self.undo_stack.len() > 50 {
                     self.undo_stack.remove(0);
                 }
