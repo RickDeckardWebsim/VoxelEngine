@@ -20,7 +20,7 @@ mod weathering;
 pub use fluid::{ContactEvent, FluidSim};
 pub use fire::{
     EMBER_BURN_TICKS, FireEvent, FireSim, FireTable, GRASS_BURN_TICKS, LEAVES_BURN_TICKS,
-    PLANKS_BURN_TICKS, SPREAD_DELAY_TICKS, WOOD_BURN_TICKS,
+    PLANKS_BURN_TICKS, SPREAD_DELAY_TICKS, WOOD_BURN_TICKS, SmokeKind,
 };
 pub use weathering::{
     DIRT_SOAK_TICKS, GRASS_SOAK_TICKS, MUD_DRY_TICKS, STONE_ERODE_TICKS, STONE_FALL_BOOST,

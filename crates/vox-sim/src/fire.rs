@@ -3,9 +3,11 @@
 //! that drains to empty at steady state (all fire burns out or is
 //! extinguished → zero cost). See `docs/plans/2026-07-09-fire-system-design.md`.
 
+use std::collections::VecDeque;
+
 use glam::IVec3;
-use vox_core::FxHashMap;
-use vox_world::{Voxel, World};
+use vox_core::{FxHashMap, FxHashSet};
+use vox_world::{AIR, Voxel, World};
 
 const NEIGHBORS_6: [IVec3; 6] = [
     IVec3::new(1, 0, 0),
@@ -15,6 +17,18 @@ const NEIGHBORS_6: [IVec3; 6] = [
     IVec3::new(0, 0, 1),
     IVec3::new(0, 0, -1),
 ];
+
+/// Face preference for smoke outlets. Smoke should leave the highest open
+/// face first, then a side, and only travel downward as a last resort.
+const SMOKE_FACES: [IVec3; 6] = [
+    IVec3::Y,
+    IVec3::X,
+    IVec3::NEG_X,
+    IVec3::Z,
+    IVec3::NEG_Z,
+    IVec3::NEG_Y,
+];
+const SMOKE_INTERVAL_TICKS: u32 = 10;
 
 /// Burn ticks (at ~15 Hz) before a fire can spread to neighbors.
 pub const SPREAD_DELAY_TICKS: u32 = 30; // ~2s
@@ -78,21 +92,39 @@ struct BurnState {
     original: Voxel,
 }
 
+/// Why a smoke particle is being emitted. Consumers can give brief
+/// extinguish/consumption puffs different presets from ongoing fire smoke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmokeKind {
+    Burning,
+    Extinguished,
+    Consumed,
+}
+
 /// Events emitted during a tick, drained by the app for particle effects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FireEvent {
-    /// A cell was consumed by fire and became char.
+    /// A cell was consumed by fire and became ash (or char for raw ember).
     Consumed(IVec3),
     /// A fire was extinguished by water contact.
     Extinguished(IVec3),
-    /// A cell is actively burning this tick (for smoke particle emission).
-    /// The intensity (0..1) scales with how far through its burn it is.
-    Burning(IVec3, u32), // position, ticks burning
+    /// Smoke may leave only through a face-adjacent, in-bounds air voxel.
+    Smoke {
+        pos: IVec3,
+        face: IVec3,
+        kind: SmokeKind,
+    },
 }
 
 pub struct FireSim {
     table: FireTable,
     burning: FxHashMap<IVec3, BurnState>,
+    /// Spread-eligible cells that still have a possible fuel neighbor. Cells
+    /// that find no fuel go dormant until a nearby world edit wakes them.
+    spread_frontier: VecDeque<IVec3>,
+    spread_queued: FxHashSet<IVec3>,
+    /// Exact half-open bounds around `burning`, maintained after each tick.
+    burning_bounds: Option<(IVec3, IVec3)>,
     events: Vec<FireEvent>,
     /// xorshift64* for randomized spread order.
     rng: u64,
@@ -103,21 +135,30 @@ impl FireSim {
         Self {
             table,
             burning: FxHashMap::default(),
+            spread_frontier: VecDeque::new(),
+            spread_queued: FxHashSet::default(),
+            burning_bounds: None,
             events: Vec::new(),
             rng: 0x9E37_79B9_7F4A_7C15,
         }
     }
 
-    fn next_u64(&mut self) -> u64 {
-        self.rng ^= self.rng << 13;
-        self.rng ^= self.rng >> 7;
-        self.rng ^= self.rng << 17;
-        self.rng
-    }
-
     /// Debug/test stats.
     pub fn burning_count(&self) -> usize {
         self.burning.len()
+    }
+
+    /// Whether this exact world cell is tracked as actively burning.
+    #[inline]
+    pub fn is_burning(&self, pos: IVec3) -> bool {
+        self.burning.contains_key(&pos)
+    }
+
+    /// Half-open world-voxel bounds containing every actively burning cell.
+    /// Returns `None` when the simulation is idle.
+    #[inline]
+    pub fn burning_bounds(&self) -> Option<(IVec3, IVec3)> {
+        self.burning_bounds
     }
 
     /// Ignite a cell at `pos`. If the cell is flammable, it enters the burn
@@ -126,21 +167,29 @@ impl FireSim {
     /// selection (ash for full burn, char for extinguished). Called by the
     /// app when placing an ember, or internally during spread.
     pub fn ignite(&mut self, world: &mut World, pos: IVec3) {
+        if self.burning.contains_key(&pos) {
+            return;
+        }
         let v = world.get_voxel(pos);
-        if self.table.is_flammable(v) && !self.burning.contains_key(&pos) {
-            if v != self.table.ember {
-                world.set_voxel(pos, self.table.ember);
-            }
-            self.burning.insert(pos, BurnState {
+        if !self.table.is_flammable(v) {
+            return;
+        }
+        if v != self.table.ember {
+            world.set_voxel(pos, self.table.ember);
+        }
+        self.burning.insert(
+            pos,
+            BurnState {
                 ticks: 0,
                 original: v,
-            });
-        }
+            },
+        );
+        include_in_bounds(&mut self.burning_bounds, pos);
     }
 
-    /// Take this tick's events (empties the buffer).
-    pub fn drain_events(&mut self) -> Vec<FireEvent> {
-        std::mem::take(&mut self.events)
+    /// Drain this tick's events while retaining the allocation for reuse.
+    pub fn drain_events(&mut self) -> std::vec::Drain<'_, FireEvent> {
+        self.events.drain(..)
     }
 
     /// Advance the fire simulation by one tick. Checks extinguishing,
@@ -148,19 +197,30 @@ impl FireSim {
     /// consumes cells that have burned long enough.
     pub fn tick(&mut self, world: &mut World) {
         self.events.clear();
-        let table = self.table.clone();
+        let Self {
+            table,
+            burning,
+            spread_frontier,
+            spread_queued,
+            burning_bounds,
+            events,
+            rng,
+        } = self;
 
         // 1. Extinguish: remove burning cells adjacent to water. Any
         //    burning cell (now ember visually) extinguished by water
         //    becomes char (partial burn residue).
         let mut extinguished: Vec<IVec3> = Vec::new();
-        self.burning.retain(|&pos, _| {
+        let count_before_extinguish = burning.len();
+        burning.retain(|&pos, _| {
             // Skip stale entries (cell extracted as debris — no longer
             // ember in the world).
             if world.get_voxel(pos) != table.ember {
                 return false;
             }
-            let water_adjacent = NEIGHBORS_6.iter().any(|&n| world.get_voxel(pos + n) == table.water);
+            let water_adjacent = NEIGHBORS_6
+                .iter()
+                .any(|&n| world.get_voxel(pos + n) == table.water);
             if water_adjacent {
                 extinguished.push(pos);
                 false
@@ -168,93 +228,102 @@ impl FireSim {
                 true
             }
         });
-        for pos in &extinguished {
-            world.set_voxel(*pos, table.char);
+        let mut removed_any = burning.len() != count_before_extinguish;
+        for pos in extinguished {
+            world.set_voxel(pos, table.char);
             // Wet any ash neighbors of the extinguished cell.
             for n in NEIGHBORS_6 {
-                let q = *pos + n;
+                let q = pos + n;
                 if world.get_voxel(q) == table.ash
-                    && NEIGHBORS_6.iter().any(|&d| world.get_voxel(q + d) == table.water)
+                    && NEIGHBORS_6
+                        .iter()
+                        .any(|&d| world.get_voxel(q + d) == table.water)
                 {
                     world.set_voxel(q, table.dark_ash);
                 }
             }
-            self.events.push(FireEvent::Extinguished(*pos));
+            events.push(FireEvent::Extinguished(pos));
+            emit_smoke(events, world, pos, SmokeKind::Extinguished);
         }
 
-        // 2. Spread: each burning cell that has burned long enough can
-        //    ignite one flammable neighbor per tick (randomized order).
-        //    Collect spread-eligible positions first (can't call
-        //    self.next_u64 while borrowing &self.burning).
-        let spreaders: Vec<IVec3> = self.burning.iter()
-            .filter(|(_, s)| s.ticks >= SPREAD_DELAY_TICKS)
-            .map(|(&p, _)| p)
-            .collect();
-        let mut new_ignitions: Vec<(IVec3, Voxel)> = Vec::new();
-        for pos in &spreaders {
+        // 2. Spread: process only cells that became eligible, successfully
+        //    spread last tick, or were explicitly woken by a nearby edit.
+        //    Capturing the queue length prevents a successful spreader from
+        //    running twice in the same tick after it requeues itself.
+        let spread_attempts = spread_frontier.len();
+        for _ in 0..spread_attempts {
+            let Some(pos) = spread_frontier.pop_front() else {
+                break;
+            };
+            spread_queued.remove(&pos);
+            if !burning
+                .get(&pos)
+                .is_some_and(|state| state.ticks >= SPREAD_DELAY_TICKS)
+            {
+                continue;
+            }
+
             let mut dirs: [IVec3; 6] = NEIGHBORS_6;
             for i in (1..6).rev() {
-                let j = (self.next_u64() as usize) % (i + 1);
+                let j = (next_u64(rng) as usize) % (i + 1);
                 dirs.swap(i, j);
             }
+            let mut spread = false;
             for dir in &dirs {
-                let neighbor = *pos + *dir;
-                if self.burning.contains_key(&neighbor) || new_ignitions.iter().any(|(p, _)| p == &neighbor) {
+                let neighbor = pos + *dir;
+                if burning.contains_key(&neighbor) {
                     continue;
                 }
-                let nv = world.get_voxel(neighbor);
-                if table.is_flammable(nv) {
-                    new_ignitions.push((neighbor, nv));
+                let original = world.get_voxel(neighbor);
+                if table.is_flammable(original) {
+                    if original != table.ember {
+                        world.set_voxel(neighbor, table.ember);
+                    }
+                    burning.insert(neighbor, BurnState { ticks: 0, original });
+                    include_in_bounds(burning_bounds, neighbor);
+                    spread = true;
                     break;
                 }
             }
-        }
-        for (pos, original) in &new_ignitions {
-            if *original != table.ember {
-                world.set_voxel(*pos, table.ember);
+            if spread && spread_queued.insert(pos) {
+                spread_frontier.push_back(pos);
             }
-            self.burning.insert(*pos, BurnState {
-                ticks: 0,
-                original: *original,
-            });
         }
 
         // 3. Advance + consume: increment tick counters, consume cells
         //    that reached their burn duration. Full burn → ash; original
         //    ember → char. Emit events.
         let mut consumed: Vec<(IVec3, Voxel)> = Vec::new();
-        let mut stale: Vec<IVec3> = Vec::new();
-        for (&pos, state) in &mut self.burning {
+        for (&pos, state) in burning.iter_mut() {
             state.ticks += 1;
-            // If the cell is no longer ember in the world (e.g. it was
-            // extracted as a debris body by detach_unsupported), drop it
-            // silently — no residue, no event. The burn continues on the
-            // body, not in the world grid.
-            if world.get_voxel(pos) != table.ember {
-                stale.push(pos);
-                continue;
-            }
             let duration = table.burn_ticks(state.original);
             if state.ticks >= duration {
                 consumed.push((pos, state.original));
             } else {
-                if state.ticks % 10 == 0 {
-                    self.events.push(FireEvent::Burning(pos, state.ticks));
-            }
+                if state.ticks == SPREAD_DELAY_TICKS && spread_queued.insert(pos) {
+                    spread_frontier.push_back(pos);
+                }
+                if smoke_due(pos, state.ticks) {
+                    emit_smoke(events, world, pos, SmokeKind::Burning);
+                }
             }
         }
-        for pos in &stale {
-            self.burning.remove(pos);
-        }
-        for (pos, original) in &consumed {
-            if *original == table.ember {
-                world.set_voxel(*pos, table.char);
+        for (pos, original) in consumed {
+            if original == table.ember {
+                world.set_voxel(pos, table.char);
             } else {
-                let water_adjacent = NEIGHBORS_6.iter().any(|&n| world.get_voxel(*pos + n) == table.water);
-                world.set_voxel(*pos, if water_adjacent { table.dark_ash } else { table.ash });
+                // Phase 1 already removed every water-adjacent cell, so a
+                // fully consumed non-ember cell always becomes dry ash.
+                world.set_voxel(pos, table.ash);
             }
-            self.burning.remove(pos);
-            self.events.push(FireEvent::Consumed(*pos));
+            burning.remove(&pos);
+            removed_any = true;
+            events.push(FireEvent::Consumed(pos));
+            emit_smoke(events, world, pos, SmokeKind::Consumed);
+        }
+
+        if removed_any {
+            *burning_bounds = calculate_bounds(burning);
         }
     }
 
@@ -265,6 +334,9 @@ impl FireSim {
         let (bounds_min, bounds_max) = world.bounds_voxels();
         let min = min.max(bounds_min);
         let max = max.min(bounds_max);
+        if min.cmpge(max).any() {
+            return;
+        }
         for x in min.x..max.x {
             for y in min.y..max.y {
                 for z in min.z..max.z {
@@ -276,7 +348,78 @@ impl FireSim {
                 }
             }
         }
+
+        // A fuel placement just outside an exhausted fire must wake that
+        // fire as well as any ember directly inside the edited region.
+        let wake_min = (min - IVec3::ONE).max(bounds_min);
+        let wake_max = (max + IVec3::ONE).min(bounds_max);
+        for x in wake_min.x..wake_max.x {
+            for y in wake_min.y..wake_max.y {
+                for z in wake_min.z..wake_max.z {
+                    let pos = IVec3::new(x, y, z);
+                    if self
+                        .burning
+                        .get(&pos)
+                        .is_some_and(|state| state.ticks >= SPREAD_DELAY_TICKS)
+                        && self.spread_queued.insert(pos)
+                    {
+                        self.spread_frontier.push_back(pos);
+                    }
+                }
+            }
+        }
     }
+}
+
+#[inline]
+fn next_u64(rng: &mut u64) -> u64 {
+    *rng ^= *rng << 13;
+    *rng ^= *rng >> 7;
+    *rng ^= *rng << 17;
+    *rng
+}
+
+#[inline]
+fn smoke_due(pos: IVec3, ticks: u32) -> bool {
+    let phase = (pos.x as u32).wrapping_mul(0x9E37_79B1)
+        ^ (pos.y as u32).wrapping_mul(0x85EB_CA77)
+        ^ (pos.z as u32).wrapping_mul(0xC2B2_AE3D);
+    (ticks + phase % SMOKE_INTERVAL_TICKS) % SMOKE_INTERVAL_TICKS == 0
+}
+
+fn smoke_face(world: &World, pos: IVec3) -> Option<IVec3> {
+    SMOKE_FACES.into_iter().find(|&face| {
+        let outlet = pos + face;
+        world.in_bounds(outlet) && world.get_voxel(outlet) == AIR
+    })
+}
+
+fn emit_smoke(events: &mut Vec<FireEvent>, world: &World, pos: IVec3, kind: SmokeKind) {
+    if let Some(face) = smoke_face(world, pos) {
+        events.push(FireEvent::Smoke { pos, face, kind });
+    }
+}
+
+fn include_in_bounds(bounds: &mut Option<(IVec3, IVec3)>, pos: IVec3) {
+    match bounds {
+        Some((min, max)) => {
+            *min = min.min(pos);
+            *max = max.max(pos + IVec3::ONE);
+        }
+        None => *bounds = Some((pos, pos + IVec3::ONE)),
+    }
+}
+
+fn calculate_bounds(burning: &FxHashMap<IVec3, BurnState>) -> Option<(IVec3, IVec3)> {
+    let mut positions = burning.keys().copied();
+    let first = positions.next()?;
+    let mut min = first;
+    let mut max = first + IVec3::ONE;
+    for pos in positions {
+        min = min.min(pos);
+        max = max.max(pos + IVec3::ONE);
+    }
+    Some((min, max))
 }
 
 #[cfg(test)]
@@ -352,11 +495,23 @@ mod tests {
 
         for _ in 0..(WOOD_BURN_TICKS - 1) {
             sim.tick(&mut world);
-            assert_eq!(world.get_voxel(pos), EMBER, "burning wood must show as ember (orange)");
+            assert_eq!(
+                world.get_voxel(pos),
+                EMBER,
+                "burning wood must show as ember (orange)"
+            );
         }
         sim.tick(&mut world);
-        assert_eq!(world.get_voxel(pos), ASH, "fully burned wood must become ash");
-        assert_eq!(sim.burning_count(), 0, "consumed cell must leave the burn map");
+        assert_eq!(
+            world.get_voxel(pos),
+            ASH,
+            "fully burned wood must become ash"
+        );
+        assert_eq!(
+            sim.burning_count(),
+            0,
+            "consumed cell must leave the burn map"
+        );
     }
 
     #[test]
@@ -371,11 +526,22 @@ mod tests {
         world.set_voxel(pos + IVec3::X, WATER);
         sim.tick(&mut world);
 
-        assert_eq!(sim.burning_count(), 0, "water-adjacent fire must be extinguished");
-        assert_eq!(world.get_voxel(pos), CHAR, "extinguished burning cell must become char");
+        assert_eq!(
+            sim.burning_count(),
+            0,
+            "water-adjacent fire must be extinguished"
+        );
+        assert_eq!(
+            world.get_voxel(pos),
+            CHAR,
+            "extinguished burning cell must become char"
+        );
 
-        let events = sim.drain_events();
-        assert!(events.contains(&FireEvent::Extinguished(pos)), "must emit Extinguished event");
+        let events: Vec<_> = sim.drain_events().collect();
+        assert!(
+            events.contains(&FireEvent::Extinguished(pos)),
+            "must emit Extinguished event"
+        );
     }
 
     #[test]
@@ -391,7 +557,11 @@ mod tests {
         sim.tick(&mut world);
 
         assert_eq!(sim.burning_count(), 0, "ember must be extinguished");
-        assert_eq!(world.get_voxel(pos), CHAR, "ember extinguished by water → char");
+        assert_eq!(
+            world.get_voxel(pos),
+            CHAR,
+            "ember extinguished by water → char"
+        );
     }
 
     #[test]
@@ -433,7 +603,122 @@ mod tests {
         for _ in 0..(WOOD_BURN_TICKS + 50) {
             sim.tick(&mut world);
         }
-        assert_eq!(sim.burning_count(), 0, "burn map must drain to empty at steady state");
+        assert_eq!(
+            sim.burning_count(),
+            0,
+            "burn map must drain to empty at steady state"
+        );
+    }
+
+    #[test]
+    fn enclosed_burn_emits_no_smoke() {
+        let mut world = world_with_floor(STONE);
+        let mut sim = FireSim::new(table());
+        let pos = IVec3::new(8, 5, 8);
+        world.set_voxel(pos, WOOD);
+        for face in NEIGHBORS_6 {
+            world.set_voxel(pos + face, STONE);
+        }
+        sim.ignite(&mut world, pos);
+
+        for _ in 0..WOOD_BURN_TICKS {
+            sim.tick(&mut world);
+            assert!(
+                !sim.drain_events()
+                    .any(|event| matches!(event, FireEvent::Smoke { .. })),
+                "an enclosed voxel must not emit smoke"
+            );
+        }
+    }
+
+    #[test]
+    fn top_blocked_smoke_uses_an_open_side_face() {
+        let mut world = world_with_floor(STONE);
+        let mut sim = FireSim::new(table());
+        let pos = IVec3::new(8, 5, 8);
+        world.set_voxel(pos, WOOD);
+        for face in NEIGHBORS_6 {
+            world.set_voxel(pos + face, STONE);
+        }
+        world.set_voxel(pos + IVec3::X, AIR);
+        sim.ignite(&mut world, pos);
+
+        let mut outlet = None;
+        for _ in 0..SMOKE_INTERVAL_TICKS {
+            sim.tick(&mut world);
+            outlet = sim.drain_events().find_map(|event| match event {
+                FireEvent::Smoke {
+                    face,
+                    kind: SmokeKind::Burning,
+                    ..
+                } => Some(face),
+                _ => None,
+            });
+            if outlet.is_some() {
+                break;
+            }
+        }
+        assert_eq!(outlet, Some(IVec3::X));
+    }
+
+    #[test]
+    fn exhausted_spreader_sleeps_and_wake_region_reactivates_it() {
+        let mut world = world_with_floor(STONE);
+        let mut sim = FireSim::new(table());
+        let source = IVec3::new(8, 5, 8);
+        let fuel = source + IVec3::X;
+        world.set_voxel(source, WOOD);
+        sim.ignite(&mut world, source);
+
+        for _ in 0..SPREAD_DELAY_TICKS {
+            sim.tick(&mut world);
+        }
+        assert_eq!(sim.spread_frontier.front(), Some(&source));
+
+        sim.tick(&mut world);
+        assert!(sim.spread_frontier.is_empty());
+        assert!(sim.spread_queued.is_empty());
+        for _ in 0..3 {
+            sim.tick(&mut world);
+        }
+        assert!(
+            sim.spread_frontier.is_empty(),
+            "failed spreaders must stay asleep"
+        );
+
+        world.set_voxel(fuel, WOOD);
+        sim.wake_region(&mut world, fuel, fuel + IVec3::ONE);
+        assert_eq!(sim.spread_frontier.front(), Some(&source));
+        sim.tick(&mut world);
+        assert_eq!(world.get_voxel(fuel), EMBER);
+    }
+
+    #[test]
+    fn a_spreader_ignites_at_most_one_neighbor_per_tick() {
+        let mut world = world_with_floor(STONE);
+        let mut sim = FireSim::new(table());
+        let source = IVec3::new(8, 5, 8);
+        world.set_voxel(source, WOOD);
+        world.set_voxel(source + IVec3::X, WOOD);
+        world.set_voxel(source + IVec3::Z, WOOD);
+        sim.ignite(&mut world, source);
+
+        for _ in 0..SPREAD_DELAY_TICKS {
+            sim.tick(&mut world);
+        }
+        assert_eq!(sim.burning_count(), 1);
+        sim.tick(&mut world);
+        assert_eq!(
+            sim.burning_count(),
+            2,
+            "only one neighbor may ignite per tick"
+        );
+        sim.tick(&mut world);
+        assert_eq!(
+            sim.burning_count(),
+            3,
+            "the successful source should retry next tick"
+        );
     }
 
     #[test]

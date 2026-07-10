@@ -30,8 +30,6 @@ struct VOut {
     @location(1) world_normal: vec3f,
     @location(2) ao: f32,
     @location(3) world_pos: vec3f,
-    @location(4) mat_id: f32,
-    @location(5) jitter_raw: f32,
 };
 
 const SKY_COLOR = vec3f(0.45, 0.66, 0.90);
@@ -80,15 +78,10 @@ fn vs(v: VIn, inst: Inst) -> VOut {
     // flicker on its surface -- chunks never move, so they never showed it,
     // matching the exact "only on detached bodies" symptom this fixed.
     let h = f32(v.norm_mat.y) / 255.0;
-    let mat_id_v = v.norm_mat.z | (v.norm_mat.w << 8u);
-    let water_id_v = u32(cam.fog.w);
-    // For water faces, the jitter field holds water depth, not color
-    // jitter — don't apply it as color variation.
-    let color_jitter = select(h, 0.5, mat_id_v == water_id_v);
 
     var out: VOut;
     out.clip = cam.view_proj * vec4f(wp, 1.0);
-    out.color = base.rgb * (1.0 + (color_jitter - 0.5) * 2.0 * base.a);
+    out.color = base.rgb * (1.0 + (h - 0.5) * 2.0 * base.a);
     // Chunks never rotate, so their local and world axes coincide -- but a
     // debris body's instance matrix carries real rotation (it tumbles), and
     // lighting a tumbling body against its *local* (un-rotated) face normal
@@ -100,8 +93,6 @@ fn vs(v: VIn, inst: Inst) -> VOut {
     out.world_normal = normalize((model * vec4f(local_n, 0.0)).xyz);
     out.ao = f32(v.pos_ao.w) / 3.0;
     out.world_pos = wp;
-    out.mat_id = f32(mat_id);
-    out.jitter_raw = f32(v.norm_mat.y);
     return out;
 }
 
@@ -115,31 +106,14 @@ struct FOut {
 fn fs(in: VOut) -> FOut {
     let n = normalize(in.world_normal);
     let ndotl = dot(n, -cam.sun_dir.xyz);
-    let water_id = u32(cam.fog.w);
-    let is_water = u32(in.mat_id) == water_id;
 
-    var c: vec3f;
-
-    if is_water {
-        // Water: flat, uniform color — no per-face lighting, no AO, no
-        // specular, no Fresnel. Just the base water color darkened by
-        // depth. This looks clean and smooth, not glitchy.
-        c = in.color * 0.8;
-
-        // Gentle depth-based darkening.
-        let water_depth = in.jitter_raw / 255.0;
-        let absorption = clamp(1.0 - exp(-water_depth * 15.0), 0.0, 0.6);
-        let deep_color = vec3f(0.02, 0.06, 0.12);
-        c = mix(c, deep_color, absorption);
-    } else {
-        // Standard lighting for non-water materials.
-        let sun = pow(clamp(ndotl * 0.5 + 0.5, 0.0, 1.0), 1.5) * SUN_STRENGTH;
-        let fill = max(-ndotl, 0.0) * FILL_STRENGTH;
-        let hemi_t = clamp(0.5 + 0.5 * n.y, 0.0, 1.0);
-        let ambient = mix(AMBIENT_GROUND, AMBIENT_SKY, hemi_t) * AMBIENT_STRENGTH;
-        let ao = 0.45 + 0.55 * in.ao;
-        c = in.color * (ambient + vec3f(sun + fill)) * ao;
-    }
+    // Smooth half-Lambert lighting (realistic, not cel-shaded).
+    let sun = pow(clamp(ndotl * 0.5 + 0.5, 0.0, 1.0), 1.5) * SUN_STRENGTH;
+    let fill = max(-ndotl, 0.0) * FILL_STRENGTH;
+    let hemi_t = clamp(0.5 + 0.5 * n.y, 0.0, 1.0);
+    let ambient = mix(AMBIENT_GROUND, AMBIENT_SKY, hemi_t) * AMBIENT_STRENGTH;
+    let ao = 0.45 + 0.55 * in.ao;
+    var c = in.color * (ambient + vec3f(sun + fill)) * ao;
 
     let dist = length(in.world_pos - cam.cam_pos.xyz);
     let f = clamp((dist - cam.fog.x) / (cam.fog.y - cam.fog.x), 0.0, 1.0);

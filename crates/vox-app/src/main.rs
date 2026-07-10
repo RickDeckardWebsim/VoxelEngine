@@ -23,8 +23,8 @@ use tools::{CarveOutcome, HOTBAR, Tool, Tools};
 
 use vox_core::consts::CHUNK_SIZE;
 use vox_core::{
-    FrameProfile, MaterialId, MaterialRegistry, ScopedTimer, Tunables, WorldConfig, chunk_origin,
-    voxel_at,
+    FrameProfile, FxHashSet, MaterialId, MaterialRegistry, ScopedTimer, Tunables, WorldConfig,
+    chunk_origin, voxel_at,
 };
 use vox_debug::hud::HudState;
 use vox_debug::{DebugOverlay, OverlayState};
@@ -164,6 +164,48 @@ fn fire_table(registry: &MaterialRegistry) -> Option<vox_sim::FireTable> {
     })
 }
 
+/// Place smoke just inside the face-adjacent air voxel selected by FireSim,
+/// with tangent-only jitter so the origin can never be pushed back through
+/// the burning surface. `salt` varies repeat emissions from the same cell.
+fn fire_smoke_origin(pos: IVec3, face: IVec3, voxel_size_m: f32, salt: u32) -> Vec3 {
+    debug_assert!(
+        [
+            IVec3::X,
+            IVec3::NEG_X,
+            IVec3::Y,
+            IVec3::NEG_Y,
+            IVec3::Z,
+            IVec3::NEG_Z,
+        ]
+        .contains(&face)
+    );
+
+    fn mix(mut x: u32) -> u32 {
+        x ^= x >> 16;
+        x = x.wrapping_mul(0x7feb_352d);
+        x ^= x >> 15;
+        x = x.wrapping_mul(0x846c_a68b);
+        x ^ (x >> 16)
+    }
+
+    let seed = mix(
+        (pos.x as u32).wrapping_mul(0x9e37_79b9)
+            ^ (pos.y as u32).wrapping_mul(0x85eb_ca6b)
+            ^ (pos.z as u32).wrapping_mul(0xc2b2_ae35)
+            ^ salt.wrapping_mul(0x27d4_eb2d),
+    );
+    let jitter_a = (seed & 0xffff) as f32 / 65_535.0 - 0.5;
+    let jitter_b = (mix(seed ^ 0xa511_e9b3) & 0xffff) as f32 / 65_535.0 - 0.5;
+    let normal = face.as_vec3();
+    let tangent_a = if face.y != 0 { Vec3::X } else { Vec3::Y };
+    let tangent_b = normal.cross(tangent_a);
+
+    vox_core::voxel_center_m(pos, voxel_size_m)
+        + normal * (voxel_size_m * 0.55)
+        + tangent_a * (jitter_a * voxel_size_m * 0.4)
+        + tangent_b * (jitter_b * voxel_size_m * 0.4)
+}
+
 /// The engine application.
 struct VoxApp {
     window: Arc<Window>,
@@ -190,6 +232,11 @@ struct VoxApp {
     /// Fire spreading and consumption, ticked alongside the fluid sim.
     /// `None` when the asset set is missing a material fire needs.
     fire: Option<vox_sim::FireSim>,
+    /// Debris bodies known to carry at least one ember voxel. This avoids a
+    /// full dense-grid search every fire tick merely to discover whether a
+    /// body can transfer fire back to the world. Stale generational ids are
+    /// pruned before each transfer pass.
+    burning_bodies: FxHashSet<BodyId>,
     /// Incrementing seed so repeated blasts get varied debris spin.
     blast_seed: u32,
     /// Incrementing seed so repeated impact-fracture chips get varied
@@ -327,6 +374,7 @@ impl VoxApp {
             fluid_clock: vox_platform::FrameClock::new(vox_core::consts::FLUID_DT),
             weathering,
             fire: fire_table(&registry).map(vox_sim::FireSim::new),
+            burning_bodies: FxHashSet::default(),
             registry,
             player: Player::new(Vec3::ZERO),
             camera: Camera::new(Vec3::ZERO),
@@ -381,7 +429,7 @@ impl VoxApp {
             .map(|key| {
                 let origin = chunk_origin(*key);
                 let slab = VoxelSlab::extract(world, origin, IVec3::splat(CHUNK_SIZE as i32));
-                (*key, mesh_slab(&slab, origin, water_material(&self.registry)))
+                (*key, mesh_slab(&slab, origin))
             })
             .collect();
         let meshed = meshes.len();
@@ -443,10 +491,15 @@ impl VoxApp {
         let Some(body) = self.phys.get(id) else {
             return MeshDispatch::Sync;
         };
+        let carries_fire = self
+            .registry
+            .id_by_name("ember")
+            .map(|m| Voxel(m.0))
+            .is_some_and(|ember| body.grid.voxels.contains(&ember));
         let voxel_count = (body.grid.dims.x * body.grid.dims.y * body.grid.dims.z) as usize;
         let dispatch = if voxel_count <= INLINE_MESH_VOXEL_BUDGET {
             let slab = VoxelSlab::from_grid(body.grid.dims, &body.grid.voxels);
-            let mesh = mesh_slab(&slab, IVec3::ZERO, water_material(&self.registry));
+            let mesh = mesh_slab(&slab, IVec3::ZERO);
             self.pipeline
                 .upload_body(&self.gpu, (id.slot, id.generation), &mesh);
             MeshDispatch::Sync
@@ -455,11 +508,19 @@ impl VoxApp {
                 (id.slot, id.generation),
                 body.grid.dims,
                 body.grid.voxels.clone(),
-                water_material(&self.registry),
             );
             MeshDispatch::Async
         };
-        self.debris_order.push_back(id);
+        if carries_fire {
+            self.burning_bodies.insert(id);
+        } else {
+            self.burning_bodies.remove(&id);
+        }
+        // Re-meshing an existing burning body must not add a second budget
+        // entry for the same generational id.
+        if !self.debris_order.contains(&id) {
+            self.debris_order.push_back(id);
+        }
         dispatch
     }
 
@@ -479,6 +540,7 @@ impl VoxApp {
     /// this "invisible for a solid frame every time damage is applied"
     /// rather than a one-off pop on the initial break.
     fn replace_body(&mut self, old_id: BodyId, spawned: Vec<BodyId>) {
+        self.burning_bodies.remove(&old_id);
         let old_key = (old_id.slot, old_id.generation);
         if spawned.is_empty() {
             self.pipeline.remove_body(old_key);
@@ -524,6 +586,7 @@ impl VoxApp {
     /// drop each evicted body's GPU mesh too.
     fn enforce_debris_budget(&mut self) {
         for id in evict_oldest_asleep_debris(&mut self.phys, &mut self.debris_order, MAX_DEBRIS_BODIES) {
+            self.burning_bodies.remove(&id);
             self.pipeline.remove_body((id.slot, id.generation));
         }
     }
@@ -537,6 +600,7 @@ impl VoxApp {
     /// once the global cap is hit.
     fn expire_clutter(&mut self, dt: f32) {
         for id in self.phys.tick_lifetimes(dt) {
+            self.burning_bodies.remove(&id);
             self.pipeline.remove_body((id.slot, id.generation));
         }
     }
@@ -1007,7 +1071,7 @@ impl App for VoxApp {
                 w.tick(&mut self.world, &events);
             }
             let mut spawned_ids: Vec<vox_physics::BodyId> = Vec::new();
-            let mut remesh_ids: Vec<vox_physics::BodyId> = Vec::new();
+            let mut remesh_ids: FxHashSet<vox_physics::BodyId> = FxHashSet::default();
             if let Some(f) = &mut self.fire {
                 f.tick(&mut self.world);
                 // Collect consumed positions for debris detach, and emit
@@ -1016,53 +1080,37 @@ impl App for VoxApp {
                 let mut consumed_positions: Vec<IVec3> = Vec::new();
                 for ev in f.drain_events() {
                     match ev {
-                        vox_sim::FireEvent::Burning(pos, _) => {
-                            // Spawn just above the top face of the voxel,
-                            // not at its center — smoke rises from surfaces.
-                            let mut center = vox_core::voxel_center_m(pos, s);
-                            center.y += s * 0.5;
-                            center.x += (pos.x as f32 * 0.37).fract() * s * 0.6 - s * 0.3;
-                            center.z += (pos.z as f32 * 0.61).fract() * s * 0.6 - s * 0.3;
+                        vox_sim::FireEvent::Smoke { pos, face, kind } => {
+                            let (count, color, speed, upward, life, size, salt) = match kind {
+                                vox_sim::SmokeKind::Burning => {
+                                    (1, [0.35, 0.34, 0.33], 0.04, 0.08, 4.5, s * 0.35, 0)
+                                }
+                                vox_sim::SmokeKind::Extinguished => {
+                                    (3, [0.7, 0.7, 0.75], 0.12, 0.15, 2.5, s * 0.3, 1)
+                                }
+                                vox_sim::SmokeKind::Consumed => {
+                                    (2, [0.25, 0.22, 0.20], 0.08, 0.1, 3.5, s * 0.35, 2)
+                                }
+                            };
+                            let center = fire_smoke_origin(
+                                pos,
+                                face,
+                                s,
+                                (self.particles.len() as u32).wrapping_add(salt),
+                            );
                             self.particles.burst(Burst {
                                 center,
-                                count: 1,
-                                color: [0.35, 0.34, 0.33],
-                                speed: 0.15,
-                                upward: 0.3,
-                                life: 6.0,
-                                size: 0.2,
+                                count,
+                                color,
+                                speed,
+                                upward,
+                                life,
+                                size,
                                 buoyant: true,
                             });
                         }
-                        vox_sim::FireEvent::Extinguished(pos) => {
-                            let mut center = vox_core::voxel_center_m(pos, s);
-                            center.y += s * 0.5;
-                            self.particles.burst(Burst {
-                                center,
-                                count: 8,
-                                color: [0.7, 0.7, 0.75],
-                                speed: 0.5,
-                                upward: 0.6,
-                                life: 4.0,
-                                size: 0.15,
-                                buoyant: true,
-                            });
-                        }
-                        vox_sim::FireEvent::Consumed(pos) => {
-                            let mut center = vox_core::voxel_center_m(pos, s);
-                            center.y += s * 0.5;
-                            self.particles.burst(Burst {
-                                center,
-                                count: 5,
-                                color: [0.25, 0.22, 0.20],
-                                speed: 0.4,
-                                upward: 0.3,
-                                life: 5.0,
-                                size: 0.18,
-                                buoyant: true,
-                            });
-                            consumed_positions.push(pos);
-                        }
+                        vox_sim::FireEvent::Consumed(pos) => consumed_positions.push(pos),
+                        vox_sim::FireEvent::Extinguished(_) => {}
                     }
                 }
                 // After consumption, check if any solid neighbors lost
@@ -1088,67 +1136,102 @@ impl App for VoxApp {
                 //     falling tree that lands on it).
                 let s = self.world.cfg.voxel_size_m;
                 let ember_vox = self.registry.id_by_name("ember").map(|m| Voxel(m.0));
-                let mut ignite_world: Vec<IVec3> = Vec::new();
-                let mut ignite_body: Vec<(vox_physics::BodyId, IVec3)> = Vec::new();
+                let mut ignite_world: FxHashSet<IVec3> = FxHashSet::default();
+                let mut ignite_body: FxHashSet<(vox_physics::BodyId, IVec3)> =
+                    FxHashSet::default();
                 if let Some(ember_vox) = ember_vox {
-                    let body_ids: Vec<vox_physics::BodyId> = self.phys.iter().map(|(id, _)| id).collect();
-                    for bid in &body_ids {
-                        let Some(body) = self.phys.get(*bid) else { continue };
-                        if body.sleep.asleep { continue; }
-                        let dims = body.grid.dims;
-                        for x in 0..dims.x {
-                            for y in 0..dims.y {
-                                for z in 0..dims.z {
-                                    let bv = body.grid.get(IVec3::new(x, y, z));
-                                    let local = (Vec3::new(x as f32, y as f32, z as f32) + 0.5) * s + body.grid_offset;
-                                    let world_pos = body.pos + body.rot * local;
-                                    let world_vox = vox_core::voxel_at(world_pos, s);
-                                    if bv == ember_vox {
-                                        // Body→world: this ember voxel ignites
-                                        // flammable world neighbors.
-                                        for n in [
-                                            IVec3::X, IVec3::NEG_X, IVec3::Y,
-                                            IVec3::NEG_Y, IVec3::Z, IVec3::NEG_Z,
-                                        ] {
-                                            let neighbor = world_vox + n;
-                                            let nv = self.world.get_voxel(neighbor);
-                                            if let Some(def) = self.registry.get(vox_core::MaterialId(nv.0)) {
-                                                if def.flammable && nv != ember_vox {
-                                                    ignite_world.push(neighbor);
-                                                }
-                                            }
-                                        }
-                                    } else if bv != vox_world::AIR {
-                                        // World→body: check if any world
-                                        // neighbor is ember (burning). If this
-                                        // body voxel is flammable, ignite it.
-                                        if let Some(def) = self.registry.get(vox_core::MaterialId(bv.0)) {
-                                            if def.flammable {
-                                                let world_burning = [
-                                                    IVec3::X, IVec3::NEG_X, IVec3::Y,
-                                                    IVec3::NEG_Y, IVec3::Z, IVec3::NEG_Z,
-                                                ].iter().any(|&n| self.world.get_voxel(world_vox + n) == ember_vox);
-                                                if world_burning {
-                                                    ignite_body.push((*bid, IVec3::new(x, y, z)));
-                                                }
-                                            }
-                                        }
+                    // Generational ids make stale entries harmless, but
+                    // pruning them keeps the set proportional to live fire.
+                    let phys = &self.phys;
+                    self.burning_bodies.retain(|id| phys.get(*id).is_some());
+
+                    // Cull bodies that neither contain fire nor overlap the
+                    // world's sparse burning bounds. The old path scanned
+                    // every voxel of every awake body at 15 Hz even when the
+                    // nearest flame was hundreds of metres away.
+                    let world_fire_bounds_m = f.burning_bounds().map(|(min, max)| {
+                        (
+                            (min - IVec3::ONE).as_vec3() * s,
+                            (max + IVec3::ONE).as_vec3() * s,
+                        )
+                    });
+                    for (bid, body) in self.phys.iter() {
+                        if body.sleep.asleep {
+                            continue;
+                        }
+                        let carries_fire = self.burning_bodies.contains(&bid);
+                        let near_world_fire = world_fire_bounds_m.is_some_and(|(min, max)| {
+                            body.aabb_max.cmpge(min).all() && body.aabb_min.cmple(max).all()
+                        });
+                        if !carries_fire && !near_world_fire {
+                            continue;
+                        }
+
+                        // `surface` is already cached for collision. Fire can
+                        // cross a body/world boundary only through these
+                        // voxels, so dense interior-grid scans do no useful
+                        // work and can be skipped entirely.
+                        for sample in &body.surface {
+                            let local_vox = ((*sample - body.grid_offset) / s).floor().as_ivec3();
+                            let bv = body.grid.get(local_vox);
+                            let world_vox = vox_core::voxel_at(body.pos + body.rot * *sample, s);
+                            if bv == ember_vox && carries_fire {
+                                // Body→world: this surface ember may ignite a
+                                // face-adjacent flammable world voxel.
+                                for n in [
+                                    IVec3::X,
+                                    IVec3::NEG_X,
+                                    IVec3::Y,
+                                    IVec3::NEG_Y,
+                                    IVec3::Z,
+                                    IVec3::NEG_Z,
+                                ] {
+                                    let neighbor = world_vox + n;
+                                    let nv = self.world.get_voxel(neighbor);
+                                    if nv != ember_vox
+                                        && self
+                                            .registry
+                                            .get(vox_core::MaterialId(nv.0))
+                                            .is_some_and(|def| def.flammable)
+                                    {
+                                        ignite_world.insert(neighbor);
                                     }
                                 }
+                            } else if near_world_fire
+                                && bv != vox_world::AIR
+                                && self
+                                    .registry
+                                    .get(vox_core::MaterialId(bv.0))
+                                    .is_some_and(|def| def.flammable)
+                                && [
+                                    IVec3::X,
+                                    IVec3::NEG_X,
+                                    IVec3::Y,
+                                    IVec3::NEG_Y,
+                                    IVec3::Z,
+                                    IVec3::NEG_Z,
+                                ]
+                                .iter()
+                                .any(|&n| f.is_burning(world_vox + n))
+                            {
+                                ignite_body.insert((bid, local_vox));
                             }
                         }
                     }
-                    // Apply body ignitions: swap the body voxel to ember.
-                    for (bid, local) in &ignite_body {
-                        if let Some(body) = self.phys.get_mut(*bid) {
-                            body.grid.set(*local, ember_vox);
-                            remesh_ids.push(*bid);
+
+                    // Apply body ignitions once per unique voxel and remesh
+                    // each changed body once, regardless of contact count.
+                    for (bid, local) in ignite_body {
+                        if let Some(body) = self.phys.get_mut(bid) {
+                            body.grid.set(local, ember_vox);
+                            self.burning_bodies.insert(bid);
+                            remesh_ids.insert(bid);
                         }
                     }
                 }
-                // Apply world ignitions (fire sim handles the swap).
-                for pos in &ignite_world {
-                    f.ignite(&mut self.world, *pos);
+                // Apply unique world ignitions (fire sim handles the swap).
+                for pos in ignite_world {
+                    f.ignite(&mut self.world, pos);
                 }
             }
             // Upload meshes for newly spawned debris and re-mesh bodies
@@ -1156,7 +1239,6 @@ impl App for VoxApp {
             // scope since upload_debris_mesh needs &mut self.
             for id in &spawned_ids {
                 self.upload_debris_mesh(*id);
-                self.debris_order.push_back(*id);
             }
             // Re-mesh bodies whose voxels changed (ember swap from
             // world→body fire spread). Don't push to debris_order —
@@ -1183,7 +1265,7 @@ impl App for VoxApp {
                 }
             }
             self.remesh.absorb_dirty(&mut self.world);
-            self.remesh.dispatch(&self.world, eye, water_material(&self.registry));
+            self.remesh.dispatch(&self.world, eye);
             self.remesh.collect(&self.gpu, &mut self.pipeline);
             self.body_mesh.collect(&self.gpu, &mut self.pipeline)
         };
@@ -1199,7 +1281,7 @@ impl App for VoxApp {
         let aspect = w as f32 / h.max(1) as f32;
         let view_proj = self.camera.view_proj(aspect);
         self.pipeline
-            .write_camera(&self.gpu, view_proj, self.camera.pos, FOG_END_M, water_material(&self.registry).0 as f32);
+            .write_camera(&self.gpu, view_proj, self.camera.pos, FOG_END_M);
         // Billboard basis: camera right and true up (right x forward).
         let cam_right = self.camera.right();
         let cam_up = cam_right.cross(self.camera.forward()).normalize();
@@ -1588,6 +1670,32 @@ fn evict_oldest_asleep_debris(
         }
     }
     evicted
+}
+
+#[cfg(test)]
+mod fire_smoke_tests {
+    use super::*;
+
+    #[test]
+    fn smoke_origin_is_inside_the_selected_air_neighbor() {
+        let pos = IVec3::new(8, 7, 6);
+        let s = 0.1;
+        for face in [
+            IVec3::X,
+            IVec3::NEG_X,
+            IVec3::Y,
+            IVec3::NEG_Y,
+            IVec3::Z,
+            IVec3::NEG_Z,
+        ] {
+            let origin = fire_smoke_origin(pos, face, s, 42);
+            assert_eq!(
+                voxel_at(origin, s),
+                pos + face,
+                "smoke must start in the exposed neighbor for face {face}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

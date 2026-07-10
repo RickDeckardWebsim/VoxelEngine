@@ -18,12 +18,23 @@ use vox_world::World;
 const GRAVITY_FACTOR: f32 = 0.35;
 /// Per-second velocity damping (air drag) in open air.
 const DRAG: f32 = 1.6;
+/// Gentle upward acceleration for buoyant particles. Smoke should billow,
+/// not launch like debris.
+const BUOYANCY_ACCEL: f32 = 0.3;
 /// Drag multiplier when a particle is enclosed (4+ solid neighbors).
 const ENCLOSURE_DRAG_MULT: f32 = 2.5;
-/// Repulsion strength between nearby particles (m/s²).
+/// Peak acceleration contributed by one overlapping particle (m/s²).
 const REPEL_STRENGTH: f32 = 3.0;
-/// Minimum distance squared for repulsion (prevents singularity).
-const REPEL_MIN_DIST2: f32 = 0.01;
+/// Aggregate repulsion acceleration cap. Dense smoke may have many nearby
+/// particles; bounding their sum prevents a crowded plume from exploding.
+const MAX_REPEL_ACCEL: f32 = 2.0;
+/// Buoyant particles have a low terminal speed. This is deliberately above
+/// their normal drag-limited rise speed, but catches collision/repulsion
+/// spikes and large-frame integration hitches.
+const MAX_BUOYANT_SPEED: f32 = 0.9;
+/// Sideways acceleration while smoke is pressed against a ceiling (m/s²).
+/// This is acceleration, not a per-frame velocity kick.
+const CEILING_SPREAD_ACCEL: f32 = 0.25;
 /// Spatial hash cell size in meters (~max smoke particle diameter).
 const HASH_CELL_M: f32 = 0.3;
 /// Velocity retention after hitting a floor (friction).
@@ -143,13 +154,15 @@ impl ParticleSystem {
 
         for i in 0..self.particles.len() {
             // Compute repulsion BEFORE the mutable borrow (it needs &self.particles).
-            let repel = hash.repulsion(i, &self.particles);
+            let repel = hash
+                .repulsion(i, &self.particles)
+                .clamp_length_max(MAX_REPEL_ACCEL);
             let p = &mut self.particles[i];
             p.age += dt;
 
             // Buoyancy / gravity.
             if p.buoyant {
-                p.vel.y += 0.6 * dt; // slower rise than before
+                p.vel.y += BUOYANCY_ACCEL * dt;
                 p.size += 0.15 * p.size * dt; // slower swell
             } else {
                 p.vel.y -= vox_core::consts::GRAVITY * GRAVITY_FACTOR * dt;
@@ -183,8 +196,11 @@ impl ParticleSystem {
                 if p.buoyant && p.vel.y > 0.0 {
                     // Hit a ceiling: stop rising, spread sideways.
                     p.vel.y = 0.0;
-                    p.vel.x += (hash.repulsion_seed(i) as f32 % 2.0 - 1.0) * 0.5;
-                    p.vel.z += (hash.repulsion_seed(i).wrapping_shr(8) as f32 % 2.0 - 1.0) * 0.5;
+                    let seed = hash.repulsion_seed(i);
+                    let sx = if seed & 1 == 0 { -1.0 } else { 1.0 };
+                    let sz = if seed & 2 == 0 { -1.0 } else { 1.0 };
+                    p.vel.x += sx * CEILING_SPREAD_ACCEL * dt;
+                    p.vel.z += sz * CEILING_SPREAD_ACCEL * dt;
                 } else if !p.buoyant && p.vel.y < 0.0 {
                     // Hit the floor: lose vertical velocity, friction on horizontal.
                     p.vel.y = 0.0;
@@ -193,6 +209,10 @@ impl ParticleSystem {
                 } else {
                     p.vel.y = 0.0;
                 }
+            }
+
+            if p.buoyant {
+                p.vel = p.vel.clamp_length_max(MAX_BUOYANT_SPEED);
             }
 
             // Integrate position with the corrected velocity.
@@ -264,9 +284,15 @@ impl SpatialHash {
                             if j == i {
                                 continue;
                             }
-                            let diff = p.pos - particles[j].pos;
+                            let other = &particles[j];
+                            let diff = p.pos - other.pos;
                             let dist2 = diff.length_squared();
-                            if dist2 > HASH_CELL_M * HASH_CELL_M * 4.0 {
+                            // A soft overlap kernel avoids the inverse-square
+                            // singularity that used to eject dense smoke at
+                            // hundreds of m/s². Particle `size` is half-size,
+                            // so the sum is their natural separation radius.
+                            let radius = (p.size + other.size).clamp(0.02, HASH_CELL_M * 2.0);
+                            if dist2 >= radius * radius {
                                 continue;
                             }
                             if dist2 < 1e-8 {
@@ -275,10 +301,13 @@ impl SpatialHash {
                                     (j as f32 * 0.137).fract() - 0.5,
                                     (i as f32 * 0.379).fract() - 0.5,
                                     ((j ^ i) as f32 * 0.617).fract() - 0.5,
-                                ) * REPEL_STRENGTH;
+                                )
+                                .normalize_or_zero()
+                                    * REPEL_STRENGTH;
                             } else {
                                 let dist = dist2.sqrt();
-                                force += diff / dist / dist2.max(REPEL_MIN_DIST2) * REPEL_STRENGTH;
+                                let overlap = 1.0 - dist / radius;
+                                force += diff / dist * (overlap * REPEL_STRENGTH);
                             }
                         }
                     }
@@ -316,7 +345,7 @@ fn count_solid_neighbors(world: &World, pos_m: Vec3, voxel_size_m: f32) -> u32 {
 mod tests {
     use super::*;
     use vox_core::WorldConfig;
-    use vox_world::{AIR, Voxel, World};
+    use vox_world::{Voxel, World};
 
     /// An empty world with air everywhere (no solids except walls for
     /// collision tests). Large enough that particles spawned near the
@@ -382,7 +411,6 @@ mod tests {
 
     #[test]
     fn the_cap_drops_oldest_first_and_never_exceeds_max() {
-        let world = empty_world();
         let mut sys = ParticleSystem::new();
         sys.burst(dust(Vec3::new(32.0, 32.0, 32.0), MAX_PARTICLES));
         assert_eq!(sys.len(), MAX_PARTICLES);
@@ -516,5 +544,32 @@ mod tests {
         let q0 = Vec3::from_array([inst1[0].center_size[0], inst1[0].center_size[1], inst1[0].center_size[2]]);
         let q1 = Vec3::from_array([inst1[1].center_size[0], inst1[1].center_size[1], inst1[1].center_size[2]]);
         assert!((q0 - q1).length() > 0.05, "repulsion must push particles apart: dist = {}", (q0 - q1).length());
+    }
+
+    #[test]
+    fn dense_smoke_repulsion_has_a_bounded_velocity() {
+        let world = empty_world();
+        let mut sys = ParticleSystem::new();
+        sys.burst(Burst {
+            center: Vec3::new(32.0, 32.0, 32.0),
+            count: 128,
+            color: [0.4, 0.4, 0.4],
+            speed: 0.0,
+            upward: 0.0,
+            life: 5.0,
+            size: 0.2,
+            buoyant: true,
+        });
+
+        // A deliberately large frame exercises the aggregate repulsion
+        // clamp as well as the buoyant terminal-speed guard.
+        sys.update(0.25, &world, 1.0);
+
+        assert!(
+            sys.particles
+                .iter()
+                .all(|p| p.vel.length() <= MAX_BUOYANT_SPEED + 1e-5),
+            "dense smoke must never be violently ejected"
+        );
     }
 }

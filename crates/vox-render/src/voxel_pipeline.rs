@@ -21,7 +21,7 @@ pub struct CameraUniform {
     pub view_proj: [[f32; 4]; 4],
     pub cam_pos: [f32; 4],
     pub sun_dir: [f32; 4],
-    /// x = fog start (m), y = fog end (m), z = voxel size (m), w = water material id.
+    /// x = fog start (m), y = fog end (m), z = voxel size (m), w = unused.
     pub fog: [f32; 4],
 }
 
@@ -375,13 +375,13 @@ impl VoxelPipeline {
     }
 
     /// Update the camera/environment uniform for this frame.
-    pub fn write_camera(&self, gpu: &Gpu, view_proj: Mat4, cam_pos: Vec3, fog_end_m: f32, water_id: f32) {
+    pub fn write_camera(&self, gpu: &Gpu, view_proj: Mat4, cam_pos: Vec3, fog_end_m: f32) {
         let sun = Vec3::new(-0.45, -0.8, -0.35).normalize();
         let uniform = CameraUniform {
             view_proj: view_proj.to_cols_array_2d(),
             cam_pos: Vec4::from((cam_pos, 1.0)).to_array(),
             sun_dir: Vec4::from((sun, 0.0)).to_array(),
-            fog: [fog_end_m * 0.55, fog_end_m, self.voxel_size_m, water_id],
+            fog: [fog_end_m * 0.55, fog_end_m, self.voxel_size_m, 0.0],
         };
         gpu.queue()
             .write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&uniform));

@@ -14,7 +14,7 @@ use vox_core::consts::CHUNK_SIZE;
 use vox_core::{chunk_origin, voxel_center_m};
 use vox_mesh::{MeshData, VoxelSlab, mesh_slab};
 use vox_render::{Gpu, VoxelPipeline};
-use vox_world::{Voxel, World};
+use vox_world::World;
 
 /// Maximum mesh jobs dispatched per frame.
 const MAX_DISPATCH_PER_FRAME: usize = 64;
@@ -68,7 +68,7 @@ impl RemeshQueue {
     }
 
     /// Dispatch up to the per-frame budget, nearest chunks first.
-    pub fn dispatch(&mut self, world: &World, camera_pos: Vec3, water_voxel: Voxel) {
+    pub fn dispatch(&mut self, world: &World, camera_pos: Vec3) {
         if self.pending.is_empty() {
             return;
         }
@@ -89,7 +89,7 @@ impl RemeshQueue {
             let tx = self.tx.clone();
             self.in_flight += 1;
             rayon::spawn(move || {
-                let mesh = mesh_slab(&slab, origin, water_voxel);
+                let mesh = mesh_slab(&slab, origin);
                 // Receiver dropped only on shutdown; ignore send failure.
                 let _ = tx.send((key, generation, mesh));
             });
