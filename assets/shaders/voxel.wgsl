@@ -242,13 +242,13 @@ fn fs(in: VOut) -> @location(0) vec4f {
     c = mix(c, cam.sky_color.xyz, f * f);
     // Water (material ID 9): semi-transparent with a subtle refraction ripple
     // that perturbs the fog mix slightly via a sin wave on world XZ + time.
-    let alpha = select(1.0, 0.85, in.mat_id == 9u);
+    let alpha = 1.0;
     if (in.mat_id == 9u) {
         let t = cam.sun_color.w;
         let ripple = sin(in.world_pos.x * 3.0 + t * 2.0) * 0.5 + sin(in.world_pos.z * 2.3 + t * 1.7) * 0.5;
         c = mix(c, cam.sky_color.xyz, clamp(f * f + ripple * 0.04, 0.0, 1.0));
-        // Slight blue tint for water
-        c = mix(c, vec3f(0.10, 0.25, 0.45), 0.25);
+        // Dark blue water — opaque, no see-through to void
+        c = mix(c, vec3f(0.08, 0.20, 0.40), 0.45);
     }
 
     return vec4f(c, alpha);
