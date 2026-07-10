@@ -25,6 +25,8 @@ pub const DEPTH_COPY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Fl
 struct ParamsUniform {
     resolution: [f32; 2],
     texel_size: [f32; 2],
+    _pad0: f32,
+    _pad1: f32,
 }
 
 /// Owns the offscreen textures, the post-process pipeline, and the
@@ -68,6 +70,8 @@ impl PostProcessPipeline {
         let params = ParamsUniform {
             resolution: [width as f32, height as f32],
             texel_size: [1.0 / width.max(1) as f32, 1.0 / height.max(1) as f32],
+            _pad0: 0.0,
+            _pad1: 0.0,
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("postprocess-params"),
@@ -212,6 +216,8 @@ impl PostProcessPipeline {
         let params = ParamsUniform {
             resolution: [width as f32, height as f32],
             texel_size: [1.0 / width.max(1) as f32, 1.0 / height.max(1) as f32],
+            _pad0: 0.0,
+            _pad1: 0.0,
         };
         gpu.queue().write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
 
