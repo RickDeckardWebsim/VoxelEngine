@@ -1,0 +1,24 @@
+{
+  "planPath": "docs/plans/2026-07-10-water-pollution.md",
+  "tasks": [
+    {"id": 0, "subject": "Task 1: Change FluidSim struct and constructor", "status": "pending"},
+    {"id": 1, "subject": "Task 2: Generalize is_simmed and tick loop checks", "status": "pending", "blockedBy": [0]},
+    {"id": 2, "subject": "Task 3: Verify place_blob and wake_region", "status": "pending", "blockedBy": [1]},
+    {"id": 3, "subject": "Task 4: Add muddy_water to WeatherTable + is_wet helper", "status": "pending"},
+    {"id": 4, "subject": "Task 5: Update main.rs weather_table to resolve muddy_water", "status": "pending", "blockedBy": [3]},
+    {"id": 5, "subject": "Task 6: Add muddy_water material to assets", "status": "pending"},
+    {"id": 6, "subject": "Task 7: Add dissolving logic (mud to muddy_water)", "status": "pending", "blockedBy": [3, 5]},
+    {"id": 7, "subject": "Task 8: Add polluting logic (clean water to muddy_water)", "status": "pending", "blockedBy": [6]},
+    {"id": 8, "subject": "Task 9: Add settling logic (muddy_water to water + sand)", "status": "pending", "blockedBy": [7]},
+    {"id": 9, "subject": "Task 10: Add sleep guarantee test for polluted lake", "status": "pending", "blockedBy": [8]},
+    {"id": 10, "subject": "Task 11: Generalize FireTable for muddy_water extinguish", "status": "pending"},
+    {"id": 11, "subject": "Task 12: Generalize PhysicsWorld buoyancy for multiple fluids", "status": "pending"},
+    {"id": 12, "subject": "Task 13: Generalize meshing (slab.rs + greedy.rs)", "status": "pending"},
+    {"id": 13, "subject": "Task 14: Generalize the WGSL shader", "status": "pending", "blockedBy": [5]},
+    {"id": 14, "subject": "Task 15: Generalize voxel_pipeline.rs", "status": "pending", "blockedBy": [13]},
+    {"id": 15, "subject": "Task 16: Wire everything in main.rs", "status": "pending", "blockedBy": [1, 4, 11, 12, 14]},
+    {"id": 16, "subject": "Task 17: Add integration test — full pollution lifecycle", "status": "pending", "blockedBy": [15]},
+    {"id": 17, "subject": "Task 18: Run full test suite and verify", "status": "pending", "blockedBy": [16]}
+  ],
+  "lastUpdated": "2026-07-10T00:00:00Z"
+}
