@@ -7,7 +7,7 @@
 use glam::{IVec3, Mat4, Vec3, Vec4};
 use wgpu::util::DeviceExt;
 
-use vox_core::{MaterialRegistry, consts::CHUNK_SIZE};
+use vox_core::{consts::CHUNK_SIZE, MaterialId, MaterialRegistry};
 use vox_mesh::{MeshData, VoxelVertex};
 
 use crate::frustum::Frustum;
@@ -43,9 +43,10 @@ struct GpuMesh {
     instance: wgpu::Buffer,
     aabb_min: Vec3,
     aabb_max: Vec3,
-    /// Whether this chunk's mesh contains any water (material ID 9) voxels.
-    /// Set at upload time so the water pass can skip chunks without water.
-    has_water: bool,
+    /// Whether this chunk's mesh contains any fluid voxels (water, muddy
+    /// water, …). Set at upload time so the water pass can skip chunks
+    /// without fluid.
+    has_fluid: bool,
 }
 
 /// Stats for the debug HUD.
@@ -85,6 +86,8 @@ pub struct VoxelPipeline {
     bind_group: wgpu::BindGroup,
     chunks: vox_core::FxHashMap<IVec3, GpuMesh>,
     bodies: vox_core::FxHashMap<BodyMeshKey, GpuBodyMesh>,
+    /// Material ids that are fluids (for chunk-level fluid pass culling).
+    fluid_ids: Vec<u16>,
     voxel_size_m: f32,
 }
 
@@ -117,6 +120,19 @@ impl VoxelPipeline {
             contents: bytemuck::cast_slice(&palette),
             usage: wgpu::BufferUsages::STORAGE,
         });
+
+        // Fluid material ids (water, muddy water, …) for chunk-level fluid
+        // pass culling, and the muddy-water id for the shader's is_fluid test.
+        let fluid_ids: Vec<u16> = (1..registry.len())
+            .filter_map(|i| {
+                let def = registry.get(MaterialId(i as u16))?;
+                def.fluid.then(|| i as u16)
+            })
+            .collect();
+        let muddy_water_id = registry
+            .id_by_name("muddy_water")
+            .map(|m| m.0 as u32)
+            .unwrap_or(0);
 
         let camera_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("voxel camera uniform"),
@@ -224,7 +240,10 @@ impl VoxelPipeline {
         };
 
         let opaque_constants = wgpu::PipelineCompilationOptions {
-            constants: &std::collections::HashMap::from([("water_pass".into(), 0.0_f64)]),
+            constants: &std::collections::HashMap::from([
+                ("water_pass".into(), 0.0_f64),
+                ("muddy_water_id".into(), muddy_water_id as f64),
+            ]),
             ..Default::default()
         };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -268,7 +287,10 @@ impl VoxelPipeline {
         // Depth writes enabled so void behind water is properly occluded —
         // terrain (drawn in opaque pass) still shows through the alpha blend.
         let water_constants = wgpu::PipelineCompilationOptions {
-            constants: &std::collections::HashMap::from([("water_pass".into(), 1.0_f64)]),
+            constants: &std::collections::HashMap::from([
+                ("water_pass".into(), 1.0_f64),
+                ("muddy_water_id".into(), muddy_water_id as f64),
+            ]),
             ..Default::default()
         };
         let water_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -315,6 +337,7 @@ impl VoxelPipeline {
             chunks: Default::default(),
             bodies: Default::default(),
             voxel_size_m,
+            fluid_ids,
         }
     }
 
@@ -344,7 +367,7 @@ impl VoxelPipeline {
             contents: bytemuck::cast_slice(&model.to_cols_array()),
             usage: wgpu::BufferUsages::VERTEX,
         });
-        let has_water = mesh.vertices.iter().any(|v| v.material == 9);
+        let has_fluid = mesh.vertices.iter().any(|v| self.fluid_ids.contains(&v.material));
         self.chunks.insert(
             key,
             GpuMesh {
@@ -354,7 +377,7 @@ impl VoxelPipeline {
                 instance,
                 aabb_min: origin_m,
                 aabb_max: origin_m + Vec3::splat(chunk_extent_m),
-                has_water,
+                has_fluid,
             },
         );
     }
@@ -533,7 +556,7 @@ impl VoxelPipeline {
         pass.set_pipeline(&self.water_pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         for mesh in self.chunks.values() {
-            if !mesh.has_water {
+            if !mesh.has_fluid {
                 continue;
             }
             if !frustum.aabb_visible(mesh.aabb_min, mesh.aabb_max) {
