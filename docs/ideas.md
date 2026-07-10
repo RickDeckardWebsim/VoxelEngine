@@ -502,6 +502,35 @@ commit (Activision actively DMCA-takedowns public repos with COD assets).
 rifle animations (free mocap, bake to engine format). Both are legal to redistribute.
 GLB is the runtime format (self-contained: mesh + skin + animations + textures).
 
+### 61a. CC0 Weapon Packs — Distributable in the Public Repo
+These packs are public domain (CC0) or permissive license — safe to commit, ship,
+and redistribute in the open-source repo. They're the legal baseline for weapons.
+
+- **Quaternius Ultimate Guns Pack** (CC0, free): 40 stylized low-poly gun models
+  in FBX/OBJ/Blend. Cartoon aesthetic that fits a voxel engine. No animations.
+  URL: https://quaternius.com/packs/ultimategun.html
+- **Quaternius Animated Guns Pack** (CC0, free): 6 animated guns (P90, revolver,
+  pistol, shotgun, sniper rifle) with basic mechanical animations (slide/bolt).
+  No first-person arm/viewmodel rigs. URL: https://quaternius.com/packs/animatedguns.html
+- **Kenney Blaster Kit** (CC0, free): Sci-fi/retro stylized weapons in
+  OBJ/GLTF. Clean, game-ready, voxel-aesthetic compatible. No animations.
+  URL: https://kenney.nl/assets/blaster-kit
+- **BoQsc/cc0-melee-weapons-pack-glb** (CC0, free): 21 melee weapons (knife,
+  crowbar, katana, machete, axe) pre-converted to GLB — directly consumable by
+  the gltf crate. URL: https://github.com/BoQsc/cc0-melee-weapons-pack-glb
+- **Sketchfab CC0/CC-BY models** (varies, free): Individual weapon models with
+  downloadable GLTF/FBX + PBR textures. Filter by CC0 license. Quality ranges
+  from low-poly to near-photoreal. URL: https://sketchfab.com (filter: CC0,
+  downloadable, weapon/rifle)
+- **Mixamo (Adobe)** (free, commercial-OK): Professional mocap animation clips
+  for rifle/shooter poses (idle, aim, reload, walk-with-weapon, sprint). Download
+  "Without Skin" FBX, retarget to your rig, bake to engine format. Do NOT commit
+  raw Mixamo FBX files — bake animation data into your own format first.
+  URL: https://www.mixamo.com
+
+All CC0 packs can be converted to GLB via Blender and committed directly to the
+repo. The engine loads GLB at runtime via the gltf crate (see #58/#59).
+
 ### 62. Firearm Gameplay — Hitscan + Voxel Destruction
 Left-click fires: raycast from player eye along look direction (reuse existing
 Tools::raycast_scene). Hit point triggers voxel carve (small radius, like Scalable
