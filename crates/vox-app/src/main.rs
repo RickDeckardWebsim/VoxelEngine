@@ -1538,7 +1538,17 @@ impl App for VoxApp {
                 self.gpu.queue(),
                 view_proj.to_cols_array_2d(),
                 self.camera.pos,
+                dn.sun_dir,
+                dn.sun_strength,
+                dn.sky_color,
+                dn.fill_strength,
+                dn.ambient_strength,
+                dn.sun_color,
+                dn.ambient_sky,
+                dn.ambient_ground,
                 self.game_time,
+                self.world.cfg.voxel_size_m,
+                FOG_END_M,
             );
             self.grass_pipeline.draw(self.gpu.queue(), &mut pass, grass_verts);
             self.debug_overlay.paint(&mut pass, &prepared_overlay);

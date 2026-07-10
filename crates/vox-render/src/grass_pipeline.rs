@@ -30,8 +30,18 @@ pub struct GrassVertex {
 struct GrassCameraUniform {
     view_proj: [[f32; 4]; 4],
     cam_pos: [f32; 4],
-    time: f32,
-    _pad: [f32; 3],
+    /// xyz = sun direction, w = sun strength
+    sun_dir: [f32; 4],
+    /// x = fog start, y = fog end, z = voxel size, w = ambient strength
+    fog: [f32; 4],
+    /// xyz = sky/fog color, w = fill strength
+    sky_color: [f32; 4],
+    /// xyz = sun color, w = game time
+    sun_color: [f32; 4],
+    /// xyz = ambient sky tint, w = unused
+    ambient_sky: [f32; 4],
+    /// xyz = ambient ground tint, w = unused
+    ambient_ground: [f32; 4],
 }
 
 /// Pipeline + persistent vertex buffer for grass blade rendering.
@@ -154,19 +164,33 @@ impl GrassPipeline {
         }
     }
 
-    /// Update the camera uniform. Call once per frame before drawing.
+    /// Update the camera uniform with day/night lighting params.
     pub fn write_camera(
         &self,
         queue: &wgpu::Queue,
         view_proj: [[f32; 4]; 4],
         cam_pos: glam::Vec3,
+        sun_dir: glam::Vec3,
+        sun_strength: f32,
+        sky_color: glam::Vec3,
+        fill_strength: f32,
+        ambient_strength: f32,
+        sun_color: glam::Vec3,
+        ambient_sky: glam::Vec3,
+        ambient_ground: glam::Vec3,
         game_time: f32,
+        voxel_size: f32,
+        fog_end: f32,
     ) {
         let uniform = GrassCameraUniform {
             view_proj,
             cam_pos: [cam_pos.x, cam_pos.y, cam_pos.z, 1.0],
-            time: game_time,
-            _pad: [0.0; 3],
+            sun_dir: [sun_dir.x, sun_dir.y, sun_dir.z, sun_strength],
+            fog: [fog_end * 0.55, fog_end, voxel_size, ambient_strength],
+            sky_color: [sky_color.x, sky_color.y, sky_color.z, fill_strength],
+            sun_color: [sun_color.x, sun_color.y, sun_color.z, game_time],
+            ambient_sky: [ambient_sky.x, ambient_sky.y, ambient_sky.z, 0.0],
+            ambient_ground: [ambient_ground.x, ambient_ground.y, ambient_ground.z, 0.0],
         };
         queue.write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&uniform));
     }

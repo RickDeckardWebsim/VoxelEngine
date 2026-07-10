@@ -120,9 +120,8 @@ pub fn generate_grass(
                                 let offset_x = (h - 0.5) * vs * 0.7;
                                 let offset_z = (h2 - 0.5) * vs * 0.7;
                                 let base = Vec3::new(center.x + offset_x, center.y, center.z + offset_z);
-                                let height = vs * (0.4 + h3 * 0.8);
-                                let width = vs * (0.04 + h * 0.04);
-
+                                let height = vs * (0.3 + h3 * 0.5); // shorter: 0.3-0.8 voxel
+                                let width = vs * (0.15 + h * 0.15); // wider: 0.15-0.3 voxel (blocky)
 
                                 let facing = h2 * std::f32::consts::TAU;
                                 let fx = facing.cos();
@@ -130,10 +129,11 @@ pub fn generate_grass(
                                 let half_w = width * 0.5;
                                 // Tip is straight up — wind sway is in the vertex shader.
                                 let tip = Vec3::new(base.x, base.y + height, base.z);
+                                // Blocky: tip width = base width (no taper).
                                 let bl = Vec3::new(base.x - fx * half_w, base.y, base.z - fz * half_w);
                                 let br = Vec3::new(base.x + fx * half_w, base.y, base.z + fz * half_w);
-                                let tl = Vec3::new(tip.x - fx * half_w * 0.3, tip.y, tip.z - fz * half_w * 0.3);
-                                let tr = Vec3::new(tip.x + fx * half_w * 0.3, tip.y, tip.z + fz * half_w * 0.3);
+                                let tl = Vec3::new(tip.x - fx * half_w, tip.y, tip.z - fz * half_w);
+                                let tr = Vec3::new(tip.x + fx * half_w, tip.y, tip.z + fz * half_w);
                                 vertices.push(GrassVertex { position: [bl.x, bl.y, bl.z], height_factor: 0.0 });
                                 vertices.push(GrassVertex { position: [br.x, br.y, br.z], height_factor: 0.0 });
                                 vertices.push(GrassVertex { position: [tl.x, tl.y, tl.z], height_factor: 1.0 });
