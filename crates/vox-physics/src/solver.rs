@@ -1328,43 +1328,110 @@ mod tests {
             "an untimed body must survive any number of ticks"
         );
     }
-    /// A body less dense than water (wood, 700 kg/m³) must float when its
-    /// bottom voxel is a *second* registered fluid (muddy_water), not just
-    /// when it's plain water. Before generalizing `water_voxel` to
-    /// `fluid_voxels`, only the single configured water material triggered
-    /// buoyancy, so a body sitting in muddy_water sank straight through it.
+    /// A body less dense than the fluid it sits in must float when that
+    /// fluid is a *second* registered fluid (muddy_water), not just plain
+    /// water. Before generalizing `water_voxel` to `fluid_voxels`, only the
+    /// single configured water material triggered buoyancy, so a body in
+    /// muddy_water sank straight through it to the floor.
+    ///
+    /// This test uses a dedicated registry so the fluids can be marked
+    /// `solid = false` and a `set_solid_table` attached — without it,
+    /// `World::solid` falls back to "any non-air voxel is solid"
+    /// (world.rs legacy path), muddy_water would act as a solid platform,
+    /// and the body would rest on top of it regardless of buoyancy (a
+    /// false green). The body is built from "foam" (density 300) so
+    /// `buoy_accel = (1000/300 - 1)*GRAVITY` exceeds gravity and the body
+    /// actually rises; wood (700) is denser than water's buoyant reference
+    /// (1000) net of gravity and would sink.
     #[test]
     fn body_floats_in_a_second_fluid_muddy_water() {
-        let reg = registry();
-        let mut world = floored_world();
-        // Carve a pool on top of the stone floor (floor top at 4 m) and fill
-        // it with muddy_water (material id 2) instead of water.
+        // ids: 0=air, 1=stone, 2=muddy_water, 3=water, 4=foam
+        let reg = MaterialRegistry::from_toml_str(
+            r#"
+            [[material]]
+            name = "stone"
+            color = [0.5, 0.5, 0.5]
+            density = 2700.0
+            strength = 50.0
+
+            [[material]]
+            name = "muddy_water"
+            color = [0.4, 0.3, 0.1]
+            density = 1100.0
+            strength = 0.0
+            solid = false
+            fluid = true
+
+            [[material]]
+            name = "water"
+            color = [0.2, 0.4, 0.8]
+            density = 1000.0
+            strength = 0.0
+            solid = false
+            fluid = true
+
+            [[material]]
+            name = "foam"
+            color = [0.9, 0.9, 0.9]
+            density = 300.0
+            strength = 1.0
+            "#,
+            "buoyancy_test.toml",
+        )
+        .expect("registry");
+
+        const STONE: Voxel = Voxel(1);
         const MUDDY_WATER: Voxel = Voxel(2);
-        let floor_top = 40; // 4.0 m in voxel coords
-        let pool_top = 70; // 7.0 m — 3 m deep pool
+        const WATER: Voxel = Voxel(3);
+        const FOAM: Voxel = Voxel(4);
+
+        // Build the solidity table from the registry so fluids (ids 2, 3)
+        // read as non-solid and the body passes through them — buoyancy is
+        // then the only upward force.
+        let solid_table: Vec<bool> = (0..reg.len())
+            .map(|i| reg.get(vox_core::MaterialId(i as u16)).is_some_and(|d| d.solid))
+            .collect();
+
+        let mut world = World::new(WorldConfig {
+            voxel_size_m: 0.1,
+            extent_m: [32.0, 24.0, 32.0],
+            ..WorldConfig::default()
+        });
+        world.set_solid_table(solid_table);
+        // Stone floor, top at 4.0 m (voxel y=40).
+        let (_, max) = world.bounds_voxels();
+        world.fill_box(IVec3::ZERO, IVec3::new(max.x, 40, max.z), STONE);
+        // Muddy_water pool on top of the floor, 4.0 m → 7.0 m (voxel y 40→70).
         world.fill_box(
-            IVec3::new(140, floor_top, 140),
-            IVec3::new(180, pool_top, 180),
+            IVec3::new(140, 40, 140),
+            IVec3::new(180, 70, 180),
             MUDDY_WATER,
         );
 
         let mut phys = PhysicsWorld::new();
-        // Register both water and muddy_water as buoyancy fluids.
-        const WATER: Voxel = Voxel(3);
+        // Register both water and muddy_water as buoyancy fluids. The key
+        // assertion: muddy_water (the *second* fluid) triggers buoyancy.
         phys.set_fluid_voxels(vec![WATER, MUDDY_WATER]);
 
-        // Wood (density 700) is lighter than water (1000), so it must float.
-        let id = phys.spawn(cube_body(&reg, 4, Vec3::new(16.0, 5.0, 16.0)));
+        // Foam (density 300) is much lighter than water (1000), so
+        // buoy_accel = (1000/300 - 1)*GRAVITY ≈ 2.33*GRAVITY, far exceeding
+        // gravity — the body rises and bobs near the muddy_water surface.
+        let dims = IVec3::splat(4);
+        let grid = VoxelGrid::new(dims, vec![FOAM; (dims.x * dims.y * dims.z) as usize]);
+        let body = Body::from_grid(grid, &reg, 0.1, Vec3::new(16.0, 5.0, 16.0)).expect("massive body");
+        let id = phys.spawn(body);
 
-        for _ in 0..300 {
+        for _ in 0..600 {
             phys.step(&world, PHYSICS_DT);
         }
         let b = phys.get(id).expect("alive");
-        // Floating means it did NOT sink to the stone floor (aabb_min.y 4.0).
-        // If buoyancy never fired it would rest on the floor at ~4.0 m.
+        // The body must float inside the pool — well above the stone floor
+        // (4.0 m) and near the muddy_water surface (7.0 m). If buoyancy
+        // never fired (the pre-fix behavior), the body would sink through
+        // the non-solid muddy_water and rest on the stone floor at ~4.0 m.
         assert!(
-            b.aabb_min.y > 4.5,
-            "wood must float in muddy_water, not sink to the floor: aabb_min.y = {}",
+            b.aabb_min.y > 5.0,
+            "foam must float in muddy_water via buoyancy, not sink to the floor: aabb_min.y = {}",
             b.aabb_min.y
         );
     }
