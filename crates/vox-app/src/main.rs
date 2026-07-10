@@ -118,6 +118,7 @@ fn weather_table(registry: &MaterialRegistry) -> Option<vox_sim::WeatherTable> {
         dirt: id("dirt")?,
         mud: id("mud")?,
         sand: id("sand")?,
+        muddy_water: id("muddy_water")?,
     })
 }
 
@@ -133,6 +134,7 @@ fn fire_table(registry: &MaterialRegistry) -> Option<vox_sim::FireTable> {
     let ember = id("ember")?;
     let char = id("char")?;
     let ash = id("ash")?;
+    let muddy_water = id("muddy_water").unwrap_or(id("water")?);
     let dark_ash = id("dark_ash")?;
     let flammable = (1..registry.len())
         .filter_map(|i| {
@@ -151,6 +153,7 @@ fn fire_table(registry: &MaterialRegistry) -> Option<vox_sim::FireTable> {
         planks,
         grass,
         flammable,
+        muddy_water,
     })
 }
 
@@ -163,6 +166,18 @@ fn powder_materials(registry: &MaterialRegistry) -> Vec<Voxel> {
         .filter_map(|i| {
             let def = registry.get(vox_core::MaterialId(i as u16))?;
             def.powder.then(|| Voxel(i as u16))
+        })
+        .collect()
+}
+
+/// All materials the registry marks as fluids, as `Voxel` ids. Empty if
+/// the asset set defines no fluids -- the sim runs powder-only. The sim
+/// handles each fluid with the full CA rule (fall, spread, level).
+fn fluid_materials(registry: &MaterialRegistry) -> Vec<Voxel> {
+    (1..registry.len())
+        .filter_map(|i| {
+            let def = registry.get(vox_core::MaterialId(i as u16))?;
+            def.fluid.then(|| Voxel(i as u16))
         })
         .collect()
 }
@@ -528,16 +543,15 @@ impl VoxApp {
         }
         #[cfg(not(feature = "mario"))]
         let _ = mario_units_per_meter;
-        let water_voxel = registry.id_by_name("water").map(|m| Voxel(m.0));
-
+        let fluids = fluid_materials(&registry);
         let mut app = Self {
             window,
             gpu,
             pipeline,
             shadow_pipeline,
             world,
-            fluid: vox_sim::FluidSim::with_powders(
-                water_material(&registry),
+            fluid: vox_sim::FluidSim::with_fluids_and_powders(
+                fluid_materials(&registry),
                 powder_materials(&registry),
             ),
             fluid_clock: vox_platform::FrameClock::new(vox_core::consts::FLUID_DT),
@@ -552,8 +566,8 @@ impl VoxApp {
             body_mesh: BodyMeshQueue::new(),
             phys: {
                 let mut phys = PhysicsWorld::new();
-                if let Some(water) = water_voxel {
-                    phys.set_water_voxel(water);
+                if !fluids.is_empty() {
+                    phys.set_fluid_voxels(fluids);
                 }
                 phys
             },
