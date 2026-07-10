@@ -495,6 +495,8 @@ impl MarioMode {
     pub fn find_rom(assets_dir: &Path) -> Option<std::path::PathBuf> {
         // Check common locations
         let candidates = [
+            Path::new("roms/baserom.us.z64").to_path_buf(),
+            assets_dir.join("roms/baserom.us.z64"),
             assets_dir.join("Super Mario 64 (USA)/Super Mario 64 (USA).z64"),
             assets_dir.join("baserom.us.z64"),
             Path::new("Super Mario 64 (USA)/Super Mario 64 (USA).z64").to_path_buf(),

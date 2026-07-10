@@ -1093,7 +1093,7 @@ impl VoxApp {
             let rom_path = match mario::MarioMode::find_rom(&assets) {
                 Some(p) => p,
                 None => {
-                    tracing::warn!("SM64 ROM not found — press M with baserom.us.z64 in the project root or assets dir");
+                    tracing::warn!("SM64 ROM not found — run enable_mario.bat with your SM64 US ROM, or place baserom.us.z64 in the roms/ directory");
                     return;
                 }
             };

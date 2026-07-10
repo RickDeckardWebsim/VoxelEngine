@@ -9,6 +9,7 @@ glam = { workspace = true }
 vox-core = { workspace = true }
 vox-world = { workspace = true }
 tracing = { workspace = true }
+sha1 = "0.10"
 
 [build-dependencies]
 cc = "1.2"

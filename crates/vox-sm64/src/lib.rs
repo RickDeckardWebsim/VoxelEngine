@@ -39,6 +39,7 @@ pub use ffi::{
 };
 
 use ffi::*;
+use sha1::{Sha1, Digest};
 
 /// Error from libsm64 operations.
 #[derive(Debug)]
@@ -104,11 +105,25 @@ impl Sm64 {
     /// Initialize libsm64 with a SM64 US ROM. Extracts Mario's texture
     /// and animation data. Must be called once before any other API.
     pub fn init(rom: &[u8]) -> Result<Self, Sm64Error> {
+        // Validate the ROM hash before passing it to libsm64 — a wrong
+        // ROM would crash the C code or produce garbage. This lets us
+        // fail gracefully with a clear error message instead.
+        let hash = Sha1::digest(rom);
+        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        if hex != ROM_SHA1 {
+            tracing::error!(
+                actual = %hex,
+                expected = %ROM_SHA1,
+                "ROM SHA1 mismatch"
+            );
+            return Err(Sm64Error::InvalidRom);
+        }
+
         let texture_size = (SM64_TEXTURE_WIDTH * SM64_TEXTURE_HEIGHT * 4) as usize;
         let mut texture = vec![0u8; texture_size];
 
-        // SAFETY: rom is a valid byte slice; texture is pre-allocated to
-        // the exact size libsm64 expects (W*H*4 RGBA bytes).
+        // SAFETY: rom is a validated SM64 US ROM byte slice; texture is
+        // pre-allocated to the exact size libsm64 expects (W*H*4 RGBA bytes).
         unsafe {
             sm64_global_init(rom.as_ptr(), texture.as_mut_ptr());
         }

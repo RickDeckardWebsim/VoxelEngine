@@ -2,3 +2,12 @@
 **/*.rs.bk
 *.pdb
 /.worktrees
+
+# SM64 ROM — user-provided, never committed (copyrighted content)
+*.z64
+*.n64
+*.v64
+roms/*.z64
+roms/*.n64
+roms/*.v64
+"Super Mario 64 (USA)/"
