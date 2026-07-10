@@ -2566,6 +2566,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "glam",
+ "naga",
  "pollster",
  "thiserror 2.0.18",
  "tracing",

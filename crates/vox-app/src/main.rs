@@ -36,7 +36,7 @@ use vox_gen::{TerrainGen, TerrainMaterials, TreeMaterials, generate_trees};
 use vox_mesh::{VoxelSlab, mesh_slab};
 use vox_physics::{Body, BodyId, ImpactEvent, PhysicsWorld, VoxelGrid};
 use vox_platform::{App, FrameControl, FrameTiming, InputState, run_app};
-use vox_render::{BodyMeshKey, Camera, Frustum, Gpu, ParticlePipeline, VoxelPipeline};
+use vox_render::{BodyMeshKey, Camera, Frustum, Gpu, ParticlePipeline, ShadowPipeline, VoxelPipeline};
 use vox_world::{AIR, Voxel, World};
 use winit::event::MouseButton;
 use winit::keyboard::KeyCode;
@@ -132,6 +132,11 @@ struct VoxApp {
     window: Arc<Window>,
     gpu: Gpu,
     pipeline: VoxelPipeline,
+    /// Directional shadow pipeline (#14): renders chunks to a 2048x2048
+    /// depth-only shadow map each frame; the main voxel pass samples it to
+    /// attenuate sunlight on occluded terrain. Follows the player position
+    /// and re-orients with the sun each frame.
+    shadow_pipeline: ShadowPipeline,
     world: World,
     registry: MaterialRegistry,
     player: Player,
@@ -210,6 +215,9 @@ struct VoxApp {
     /// CPU-simulated destruction feedback particles (see `particles`).
     particles: ParticleSystem,
     particle_pipeline: ParticlePipeline,
+    /// HDR post-processing pipeline: tone-maps the HDR offscreen render
+    /// target to the swapchain format using ACES filmic tone mapping.
+    post_pipeline: vox_render::PostPipeline,
     /// In-engine editor mode: when active, LMB paints a sphere of the
     /// selected material at the crosshair target and RMB erases a sphere of
     /// AIR, instead of the normal hotbar tools. Toggled with E. The player
@@ -226,6 +234,11 @@ struct VoxApp {
     /// Only captures player + camera + debris body transforms, not the
     /// voxel world -- see `replay` module docs.
     replay: replay::ReplayState,
+    /// Procedural crack-decal intensity (0 = off, >0 = visible cracks).
+    /// Foundation for damage visualization; not yet wired to actual voxel
+    /// damage state — set to 0 by default so cracks are invisible until a
+    /// future change drives this from per-voxel damage.
+    crack_intensity: f32,
 }
 
 /// Hard cap on total debris bodies alive at once. Past this, the oldest
@@ -262,7 +275,9 @@ impl VoxApp {
         let assets = assets_dir();
         let registry = MaterialRegistry::load_dir(&assets.join("materials"))?;
         let shader = std::fs::read_to_string(assets.join("shaders/voxel.wgsl"))?;
+        let shadow_shader = std::fs::read_to_string(assets.join("shaders/shadow.wgsl"))?;
         let particle_shader = std::fs::read_to_string(assets.join("shaders/particle.wgsl"))?;
+        let post_shader = std::fs::read_to_string(assets.join("shaders/post.wgsl"))?;
 
         let build_start = Instant::now();
         let world = build_terrain_world(cfg, &registry)?;
@@ -274,9 +289,19 @@ impl VoxApp {
 
         let size = window.inner_size();
         let gpu = Gpu::new(window.clone(), size.width, size.height)?;
-        let pipeline = VoxelPipeline::new(&gpu, &shader, &registry, world.cfg.voxel_size_m);
+        // Shadow pipeline must be created before the voxel pipeline so its
+        // shadow-sample bind group layout can be wired in as group 1.
+        let shadow_pipeline = ShadowPipeline::new(&gpu, &shadow_shader, world.cfg.voxel_size_m);
+        let pipeline = VoxelPipeline::new(
+            &gpu,
+            &shader,
+            &registry,
+            world.cfg.voxel_size_m,
+            Some(shadow_pipeline.sample_bind_group_layout()),
+        );
         let particle_pipeline = ParticlePipeline::new(&gpu, &particle_shader);
         let tools = Tools::new(&registry);
+        let post_pipeline = vox_render::PostPipeline::new(&gpu, gpu.hdr_view(), &post_shader);
         let debug_overlay = DebugOverlay::new(
             gpu.device(),
             gpu.surface_format(),
@@ -301,6 +326,7 @@ impl VoxApp {
             window,
             gpu,
             pipeline,
+            shadow_pipeline,
             world,
             fluid: vox_sim::FluidSim::with_powders(water_material(&registry), powder_materials(&registry)),
             fluid_clock: vox_platform::FrameClock::new(vox_core::consts::FLUID_DT),
@@ -334,9 +360,11 @@ impl VoxApp {
             editor_radius: 2.0,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            crack_intensity: 0.0,
             replay: replay::ReplayState::default(),
             particles: ParticleSystem::new(),
             particle_pipeline,
+            post_pipeline,
         };
         app.initial_mesh();
 
@@ -1312,6 +1340,7 @@ impl App for VoxApp {
             dn.sun_color,
             dn.ambient_sky,
             dn.ambient_ground,
+            self.crack_intensity,
             self.game_time,
         );
         // Billboard basis: camera right and true up (right x forward).
@@ -1323,6 +1352,20 @@ impl App for VoxApp {
         self.particle_pipeline
             .upload(&self.gpu, &particle_instances);
         let frustum = Frustum::from_view_proj(view_proj);
+
+        // Shadow camera (#14): orthographic box centered on the player,
+        // oriented along the sun direction. Updated every frame so shadows
+        // track the player and re-orient as the sun moves through the
+        // day/night cycle. The camera focus is the player/mario position
+        // (whichever is active) so the 100 m shadow box always covers the
+        // nearby terrain the eye actually sees.
+        let shadow_focus = if mario_active { mario_pos } else { self.camera.pos };
+        self.shadow_pipeline.write_camera(
+            &self.gpu,
+            dn.sun_dir,
+            shadow_focus,
+            self.world.cfg.voxel_size_m,
+        );
 
         let render_start = Instant::now();
         let frame = match self.gpu.begin_frame() {
@@ -1400,6 +1443,30 @@ impl App for VoxApp {
         );
         self.tools.set_material_index(self.selected_material + 1);
 
+        // Shadow pass (#14): render visible chunks into the shadow map
+        // (depth-only, no color attachment) before the main pass samples it.
+        // The pass must close (drop the shadow pass encoder guard) before
+        // the main pass opens on the same encoder. Frustum culling reuses
+        // the main camera frustum -- chunks outside the view are also
+        // outside the shadow receiver region.
+        {
+            let mut shadow_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow-pass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: self.shadow_pipeline.shadow_view(),
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            self.pipeline.draw_chunks_shadow(&self.shadow_pipeline, &mut shadow_pass, &frustum);
+        }
+
         let stats;
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1423,13 +1490,13 @@ impl App for VoxApp {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            pass.set_bind_group(1, self.shadow_pipeline.sample_bind_group(), &[]);
             let chunk_stats = self.pipeline.draw_chunks(&mut pass, &frustum);
             let body_stats = self.pipeline.draw_bodies(&mut pass, &frustum, self.camera.pos, FOG_END_M);
             stats = vox_render::DrawStats {
                 drawn: chunk_stats.drawn + body_stats.drawn,
                 culled: chunk_stats.culled + body_stats.culled,
             };
-            // Draw Mario if mode is active
             if let Some(mode) = &self.mario_mode {
                 if mode.is_active() {
                     mode.render(
@@ -1450,8 +1517,6 @@ impl App for VoxApp {
                     );
                 }
             }
-            // Alpha-blended particles after all opaque geometry (they depth
-            // test against it), UI last, on top of everything.
             self.particle_pipeline.draw(&mut pass);
             self.debug_overlay.paint(&mut pass, &prepared_overlay);
         }
