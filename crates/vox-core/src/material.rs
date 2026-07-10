@@ -544,7 +544,7 @@ mod tests {
             fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let reg = MaterialRegistry::from_toml_str(&source, "assets/materials/core.toml")
             .expect("shipped core.toml must parse");
-        assert_eq!(reg.len(), 15, "air + 14 shipped materials");
+        assert_eq!(reg.len(), 16, "air + 15 shipped materials");
         assert_eq!(reg.id_by_name("stone"), Some(MaterialId(1)));
         let mud = reg
             .get(reg.id_by_name("mud").expect("mud registered"))

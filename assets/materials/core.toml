@@ -121,3 +121,13 @@ density = 400.0
 strength = 0.3
 solid = false
 powder = true
+
+
+[[material]]
+name = "muddy_water"
+color = [0.28, 0.24, 0.18]
+jitter = 0.04
+density = 1100.0
+strength = 0.0
+solid = false
+fluid = true
