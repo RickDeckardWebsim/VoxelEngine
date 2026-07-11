@@ -698,7 +698,7 @@ impl VoxApp {
 
         for i in 0..5 {
             // Stack segments vertically, top segment first.
-        let seg_center = base_pos + Vec3::new(0.0, -i as f32 * (seg_height_m + voxel_size), 0.0);
+        let seg_center = base_pos + Vec3::new(0.0, -i as f32 * seg_height_m, 0.0);
             let grid = VoxelGrid::new(seg_dims, seg_voxels.clone());
             let Some(body) = Body::from_grid(grid, &self.registry, voxel_size, seg_center)
             else {
@@ -711,7 +711,7 @@ impl VoxApp {
                 // Connect bottom of previous segment to top of this segment.
                 let anchor_prev = Vec3::new(0.0, -half_height, 0.0);
                 let anchor_this = Vec3::new(0.0, half_height, 0.0);
-                self.phys.add_joint(prev, id, anchor_prev, anchor_this, voxel_size, 0.001);
+                self.phys.add_joint(prev, id, anchor_prev, anchor_this, 0.0, 0.001);
             }
 
             prev_id = Some(id);
@@ -1522,7 +1522,9 @@ impl App for VoxApp {
             self.spawn_debris(origin, 4, self.player.look_dir() * 8.0);
         }
         if input.key_pressed(KeyCode::KeyT) {
+            let t0 = std::time::Instant::now();
             self.spawn_rope();
+            tracing::info!(elapsed_ms = t0.elapsed().as_millis(), "spawn_rope took");
         }
         if input.key_pressed(KeyCode::KeyX) {
             let removed = self.phys.clear_sleeping();
@@ -1638,9 +1640,14 @@ impl App for VoxApp {
         }
         let impacts = {
             let _t = ScopedTimer::new(&mut self.profile.physics);
+            let step_start = std::time::Instant::now();
             let mut impacts = Vec::new();
             for _ in 0..timing.physics_steps {
                 impacts.extend(self.phys.step(&self.world, vox_core::consts::PHYSICS_DT));
+            }
+            let elapsed = step_start.elapsed().as_millis();
+            if elapsed > 50 {
+                tracing::warn!(elapsed_ms = elapsed, bodies = self.phys.body_count(), "slow physics step");
             }
             impacts
         };
