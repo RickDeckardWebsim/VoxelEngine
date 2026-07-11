@@ -3,6 +3,7 @@
 //! This crate deliberately has no winit dependency: window types enter only
 //! as [`wgpu::SurfaceTarget`].
 
+pub mod bloom_ssao;
 pub mod camera;
 pub mod frustum;
 pub mod gpu;
@@ -13,6 +14,7 @@ pub mod particles;
 pub mod postprocess;
 pub mod voxel_pipeline;
 
+pub use bloom_ssao::BloomSsaoPipeline;
 pub use camera::Camera;
 pub use frustum::Frustum;
 pub use gpu::{DEPTH_FORMAT, Frame, Gpu};

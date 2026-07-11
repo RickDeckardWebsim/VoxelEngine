@@ -33,8 +33,8 @@ fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
     return vec4f(p[vi], 0.0, 1.0);
 }
 
-fn view_pos_from_ndc(ndc: vec2f, depth: f32) -> vec4f {
-    let clip = vec4f(ndc.x, ndc.y, depth * 2.0 - 1.0, 1.0);
+fn view_pos_from_ndc(uv: vec2f, depth: f32) -> vec4f {
+    let clip = vec4f(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
     let view = params.inv_view_proj * clip;
     return view / view.w;
 }
@@ -82,7 +82,10 @@ fn fs_ssao(@builtin(position) frag_pos: vec4f) -> @location(0) f32 {
             continue;
         }
 
-        let sample_depth = textureSample(depth_tex, samp, sample_uv).r;
+        let dims = textureDimensions(depth_tex);
+        let sample_texel = vec2u(sample_uv * vec2f(dims));
+        let sample_texel_clamped = min(sample_texel, dims - vec2u(1));
+        let sample_depth = textureLoad(depth_tex, sample_texel_clamped, 0).r;
         let sample_view_z = view_pos_from_ndc(sample_uv, sample_depth).z;
 
         let range_check = abs(p.z - sample_view_z) < params.radius;
