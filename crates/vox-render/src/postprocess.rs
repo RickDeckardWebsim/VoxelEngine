@@ -46,7 +46,14 @@ pub struct PostProcessPipeline {
 
 impl PostProcessPipeline {
     /// Create the pipeline and offscreen textures at the given size.
-    pub fn new(gpu: &Gpu, shader_source: &str, width: u32, height: u32) -> Self {
+    pub fn new(
+        gpu: &Gpu,
+        shader_source: &str,
+        width: u32,
+        height: u32,
+        ao_view: &wgpu::TextureView,
+        bloom_view: &wgpu::TextureView,
+    ) -> Self {
         let device = gpu.device();
 
         // --- Offscreen textures ---
@@ -134,6 +141,26 @@ impl PostProcessPipeline {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -160,6 +187,14 @@ impl PostProcessPipeline {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(ao_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(bloom_view),
                 },
             ],
         });
@@ -215,7 +250,14 @@ impl PostProcessPipeline {
     }
 
     /// Resize the offscreen textures. Call when the window size changes.
-    pub fn resize(&mut self, gpu: &Gpu, width: u32, height: u32) {
+    pub fn resize(
+        &mut self,
+        gpu: &Gpu,
+        width: u32,
+        height: u32,
+        ao_view: &wgpu::TextureView,
+        bloom_view: &wgpu::TextureView,
+    ) {
         if width == self.width && height == self.height {
             return;
         }
@@ -259,6 +301,14 @@ impl PostProcessPipeline {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(ao_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(bloom_view),
                 },
             ],
         });
