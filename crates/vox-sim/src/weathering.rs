@@ -821,7 +821,10 @@ mod tests {
             sim.wake_region(&world, min, max);
         }
         // Run until everything settles: mud erodes to air, muddy_water
-        // settles → water + sand, eventually steady state.
+        // settles → water + mud deposit, eventually steady state. The
+        // sediment cycle (mud dissolves → muddy_water → settles → mud)
+        // means dissolving/settling never fully drain — break on the
+        // other maps + fluid sleep instead.
         for _ in 0..((MUD_DISSOLVE_TICKS + MUDDY_SETTLE_TICKS + POLLUTE_SPREAD_TICKS) * 3) {
             sim.tick(&mut world);
             let events = sim.drain_events();
@@ -832,9 +835,7 @@ mod tests {
             if sim.active_count() == 0
                 && weathering.soaking_count() == 0
                 && weathering.drying_count() == 0
-                && weathering.dissolving_count() == 0
                 && weathering.polluting_count() == 0
-                && weathering.settling_count() == 0
             {
                 break;
             }
@@ -845,6 +846,7 @@ mod tests {
         // dissolving may be non-zero: deposited mud re-enters dissolving
         // in a stable sediment cycle. This is correct behavior.
         // assert_eq!(weathering.dissolving_count(), 0);
+        assert_eq!(weathering.polluting_count(), 0);
         // settling may also be non-zero: the sediment cycle keeps a
         // muddy_water cell in the settling map continuously.
         // assert_eq!(weathering.settling_count(), 0);
