@@ -21,4 +21,4 @@ pub use destruction::{
     CarveResult, Region, apply_blast_impulse, blast, carve_capsule, carve_explosion, carve_sphere,
     detach_unsupported, laser,
 };
-pub use solver::{ImpactEvent, PhysicsWorld};
+pub use solver::{ImpactEvent, Joint, PhysicsWorld};

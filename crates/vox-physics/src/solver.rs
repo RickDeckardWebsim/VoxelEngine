@@ -5,7 +5,7 @@
 //! face) so stacks converge across frames; settled bodies sleep at ~zero
 //! cost until an impulse or a nearby world edit wakes them.
 
-use glam::{Quat, Vec3};
+use glam::{Mat3, Quat, Vec3};
 use vox_core::consts::{
     CLUTTER_LIFETIME_MAX_S, CLUTTER_LIFETIME_MIN_S, CLUTTER_MAX_VOXELS, CONTACT_SLOP, GRAVITY,
     SLEEP_FRAMES, SOLVER_ITERS, SUBSTEPS,
@@ -58,6 +58,26 @@ pub struct ImpactEvent {
     /// fracturing the body along this can carve *into* the struck surface
     /// instead of a generic sphere straddling half in, half out of it.
     pub push_dir: Vec3,
+}
+
+/// A distance constraint between two bodies. Maintains a fixed rest length
+/// between two anchor points. Used for rope/chain segments.
+#[derive(Clone, Debug)]
+pub struct Joint {
+    /// Slot index of body A.
+    pub body_a: usize,
+    /// Slot index of body B.
+    pub body_b: usize,
+    /// Anchor on body A, relative to COM, body-local frame (meters).
+    pub anchor_a: Vec3,
+    /// Anchor on body B, relative to COM, body-local frame.
+    pub anchor_b: Vec3,
+    /// Rest length between anchors (meters).
+    pub rest_length: f32,
+    /// Accumulated Lagrange multiplier (warm start).
+    pub acc_lambda: f32,
+    /// Compliance (inverse stiffness). 0 = rigid.
+    pub compliance: f32,
 }
 
 /// Two distinct mutable borrows out of the slot array.
@@ -148,6 +168,7 @@ pub struct PhysicsWorld {
     pos_corr: Vec<Vec3>,
     pub tunables: Tunables,
     lifetime_rng: u64,
+    joints: Vec<Joint>,
     /// Fluid materials for buoyancy (water, muddy_water, ...). Empty (default)
     /// disables buoyancy — bodies fall through fluids. Set by the app at
     /// construction from the registry's fluid materials.
@@ -240,10 +261,43 @@ impl PhysicsWorld {
     pub fn despawn(&mut self, id: BodyId) {
         let slot = id.slot as usize;
         if self.generations.get(slot) == Some(&id.generation) && self.slots[slot].is_some() {
+            self.remove_joints_for_slot(slot);
             self.slots[slot] = None;
             self.generations[slot] += 1;
             self.free.push(slot);
         }
+    }
+
+    /// Add a distance joint between two bodies. Returns the joint index.
+    pub fn add_joint(
+        &mut self,
+        a: BodyId,
+        b: BodyId,
+        anchor_a: Vec3,
+        anchor_b: Vec3,
+        rest_length: f32,
+    ) -> usize {
+        let joint = Joint {
+            body_a: a.slot as usize,
+            body_b: b.slot as usize,
+            anchor_a,
+            anchor_b,
+            rest_length,
+            acc_lambda: 0.0,
+            compliance: 0.0,
+        };
+        self.joints.push(joint);
+        self.joints.len() - 1
+    }
+
+    /// Remove all joints referencing a given body slot (called on despawn).
+    fn remove_joints_for_slot(&mut self, slot: usize) {
+        self.joints.retain(|j| j.body_a != slot && j.body_b != slot);
+    }
+
+    /// Read access to joints (for debugging/rendering).
+    pub fn joints(&self) -> &[Joint] {
+        &self.joints
     }
 
     pub fn get(&self, id: BodyId) -> Option<&Body> {
@@ -302,6 +356,7 @@ impl PhysicsWorld {
                     slot: slot as u32,
                     generation: self.generations[slot],
                 });
+                self.remove_joints_for_slot(slot);
                 self.slots[slot] = None;
                 self.generations[slot] += 1;
                 self.free.push(slot);
