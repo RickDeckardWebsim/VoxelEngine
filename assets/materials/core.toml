@@ -131,3 +131,12 @@ density = 1100.0
 strength = 0.0
 solid = false
 fluid = true
+
+[[material]]
+name = "rope"
+color = [0.65, 0.50, 0.30]
+jitter = 0.06
+density = 400.0
+strength = 2.0
+solid = true
+flammable = true
