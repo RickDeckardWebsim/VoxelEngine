@@ -7,7 +7,7 @@
 
 use glam::IVec3;
 use vox_core::{FxHashMap, FxHashSet};
-use vox_world::{Voxel, World};
+use vox_world::{AIR, Voxel, World};
 
 use crate::fluid::ContactEvent;
 
@@ -232,7 +232,19 @@ impl Weathering {
             true
         });
         for pos in dissolved {
-            world.set_voxel(pos, t.muddy_water);
+            // Conserve fluid volume: the mud cell becomes AIR (consumed),
+            // and one adjacent WATER cell becomes muddy_water. This avoids
+            // creating new fluid from nothing — the previous code turned
+            // mud (solid) directly into muddy_water (fluid), adding +1
+            // water per dissolved cell.
+            if let Some(water_pos) = NEIGHBORS_6
+                .iter()
+                .map(|&n| pos + n)
+                .find(|&q| world.get_voxel(q) == t.water)
+            {
+                world.set_voxel(water_pos, t.muddy_water);
+            }
+            world.set_voxel(pos, AIR);
         }
         // 2c. Advance polluting: clean water adjacent to muddy_water counts
         // toward pollution; at threshold, becomes muddy_water.
@@ -658,10 +670,17 @@ mod tests {
             assert_eq!(world.get_voxel(cell), MUD, "must not dissolve early");
         }
         weathering.tick(&mut world, &[]);
+        // Fluid conservation: mud becomes AIR (consumed), adjacent water
+        // becomes muddy_water. No new fluid created.
         assert_eq!(
             world.get_voxel(cell),
+            AIR,
+            "mud must be consumed (becomes air) at the dissolve threshold"
+        );
+        assert_eq!(
+            world.get_voxel(above),
             MUDDY_WATER,
-            "mud must dissolve to muddy_water at the threshold"
+            "adjacent water must become muddy_water at the dissolve threshold"
         );
     }
     #[test]
