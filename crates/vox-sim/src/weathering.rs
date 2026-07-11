@@ -60,6 +60,13 @@ impl WeatherTable {
     pub fn is_wet(&self, v: Voxel) -> bool {
         v == self.water || v == self.muddy_water
     }
+
+    /// Whether `v` is clean water only (not muddy_water).
+    /// Used for soaking/erosion — muddy water is non-destructive.
+    #[inline]
+    pub fn is_clean_water(&self, v: Voxel) -> bool {
+        v == self.water
+    }
 }
 
 pub struct Weathering {
@@ -134,9 +141,17 @@ impl Weathering {
                 let q = pos + n;
                 let v = world.get_voxel(q);
                 if v == t.mud {
-                    self.drying.remove(&q); // re-wetted
-                    self.dissolving.entry(q).or_insert(0);
-                } else if v == t.grass || v == t.dirt || (v == t.stone && moving) {
+                    self.drying.remove(&q); // re-wetted by any wet fluid
+                    // Only clean water dissolves mud into muddy_water;
+                    // muddy water adjacent to mud doesn't create new pollution.
+                    if t.is_clean_water(world.get_voxel(pos)) {
+                        self.dissolving.entry(q).or_insert(0);
+                    }
+                } else if (v == t.grass || v == t.dirt || (v == t.stone && moving))
+                    && t.is_clean_water(world.get_voxel(pos))
+                {
+                    // Only clean water causes soaking/erosion — muddy water
+                    // is non-destructive.
                     self.soaking.entry(q).or_insert(0);
                     if fell && v == t.stone {
                         fell_this_tick.insert(q);
@@ -177,10 +192,11 @@ impl Weathering {
             } else {
                 return false;
             };
-            // Water gone -> the soak dries up without converting.
+            // Clean water gone -> the soak dries up without converting.
+            // Muddy water is non-destructive and does NOT sustain soaking.
             if !NEIGHBORS_6
                 .iter()
-                .any(|&n| t.is_wet(world.get_voxel(pos + n)))
+                .any(|&n| t.is_clean_water(world.get_voxel(pos + n)))
             {
                 return false;
             }
@@ -403,15 +419,13 @@ mod tests {
     }
 
     #[test]
-    fn mud_under_muddy_water_still_soaks() {
-        // The is_wet generalization: dirt under muddy_water must still soak
-        // toward mud. This tests that the soak water-adjacency check (line 130)
-        // recognizes muddy_water as "wet".
+    fn muddy_water_does_not_erode_dirt() {
+        // Muddy water is non-destructive: dirt under muddy_water should NOT
+        // soak to mud. Only clean water causes soaking/erosion.
         let mut world = world_with_floor(DIRT);
         let mut weathering = Weathering::new(table());
         let cell = IVec3::new(8, 4, 8);
         world.set_voxel(cell + IVec3::Y, MUDDY_WATER);
-        // Update solid table: [air, water, stone, grass, dirt, mud, sand, muddy_water]
         world.set_solid_table(vec![false, false, true, true, true, true, true, false]);
         let events = vec![ContactEvent::Settled(cell + IVec3::Y)];
         weathering.tick(&mut world, &events);
@@ -420,8 +434,8 @@ mod tests {
         }
         assert_eq!(
             world.get_voxel(cell),
-            MUD,
-            "dirt under muddy_water must soak to mud — muddy_water is wet"
+            DIRT,
+            "dirt under muddy_water must NOT soak — muddy water is non-destructive"
         );
     }
 
