@@ -1949,6 +1949,17 @@ impl App for VoxApp {
             }
         }
 
+        // Stream chunks around the player: generate missing, evict beyond range.
+        let player_pos = self.player.ctrl.pos;
+        let _streamed = self.chunk_loader.update(
+            player_pos,
+            &mut self.world,
+            &mut self.pipeline,
+            &self.gpu,
+        );
+        if _streamed {
+            self.grass_cache.invalidate();
+        }
         // Wake any resting debris whose ground was just carved/edited from
         // under it, then remesh: absorb edits, dispatch to workers, upload.
         let eye = self.player.eye(timing.alpha);
