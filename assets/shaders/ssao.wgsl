@@ -17,7 +17,7 @@ struct SsaoParams {
 };
 
 @group(0) @binding(0) var<uniform> params: SsaoParams;
-@group(0) @binding(1) var depth_tex: texture_2d<f32>;
+@group(0) @binding(1) var depth_tex: texture_depth_2d;
 @group(0) @binding(2) var samp: sampler;
 @group(0) @binding(3) var<storage, read> kernel: array<vec4f>;
 @group(0) @binding(4) var ao_tex: texture_2d<f32>;
@@ -39,11 +39,22 @@ fn view_pos_from_ndc(uv: vec2f, depth: f32) -> vec4f {
     return view / view.w;
 }
 
+// Load depth from the depth texture at UV coordinates using textureLoad
+// (integer texel fetch). texture_depth_2d cannot use textureSample with a
+// regular sampler — only textureSampleCompare with a comparison sampler —
+// so we fetch raw depth values via textureLoad instead.
+fn load_depth(uv: vec2f) -> f32 {
+    let dims = textureDimensions(depth_tex);
+    let c = clamp(uv, vec2f(0.0), vec2f(1.0));
+    let texel = min(vec2u(c * vec2f(dims)), dims - vec2u(1));
+    return textureLoad(depth_tex, texel, 0);
+}
+
 fn reconstruct_normal(uv: vec2f, ts: vec2f, depth: f32) -> vec3f {
-    let l = textureSample(depth_tex, samp, uv + vec2f(-ts.x, 0.0)).r;
-    let r = textureSample(depth_tex, samp, uv + vec2f( ts.x, 0.0)).r;
-    let d = textureSample(depth_tex, samp, uv + vec2f(0.0, -ts.y)).r;
-    let u = textureSample(depth_tex, samp, uv + vec2f(0.0,  ts.y)).r;
+    let l = load_depth(uv + vec2f(-ts.x, 0.0));
+    let r = load_depth(uv + vec2f( ts.x, 0.0));
+    let d = load_depth(uv + vec2f(0.0, -ts.y));
+    let u = load_depth(uv + vec2f(0.0,  ts.y));
 
     let p = view_pos_from_ndc(uv, depth).xyz;
     let pl = view_pos_from_ndc(uv + vec2f(-ts.x, 0.0), l).xyz;
@@ -59,7 +70,7 @@ fn reconstruct_normal(uv: vec2f, ts: vec2f, depth: f32) -> vec3f {
 @fragment
 fn fs_ssao(@builtin(position) frag_pos: vec4f) -> @location(0) f32 {
     let uv = frag_pos.xy * params.texel_size;
-    let depth = textureSample(depth_tex, samp, uv).r;
+    let depth = load_depth(uv);
 
     if (depth >= 1.0) {
         return 1.0;
@@ -82,10 +93,7 @@ fn fs_ssao(@builtin(position) frag_pos: vec4f) -> @location(0) f32 {
             continue;
         }
 
-        let dims = textureDimensions(depth_tex);
-        let sample_texel = vec2u(sample_uv * vec2f(dims));
-        let sample_texel_clamped = min(sample_texel, dims - vec2u(1));
-        let sample_depth = textureLoad(depth_tex, sample_texel_clamped, 0).r;
+        let sample_depth = load_depth(sample_uv);
         let sample_view_z = view_pos_from_ndc(sample_uv, sample_depth).z;
 
         let range_check = abs(p.z - sample_view_z) < params.radius;
