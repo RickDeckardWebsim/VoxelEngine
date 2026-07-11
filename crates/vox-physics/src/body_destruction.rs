@@ -216,13 +216,18 @@ pub fn split_components(grid: &VoxelGrid) -> Vec<(VoxelGrid, IVec3)> {
                     max = max.max(v);
                 }
                 let dims = max - min + IVec3::ONE;
-                let mut voxels = vec![AIR; (dims.x * dims.y * dims.z) as usize];
+                let total = (dims.x * dims.y * dims.z) as usize;
+                let mut voxels = vec![AIR; total];
+                let mut damage = vec![0.0; total];
                 for &v in &comp {
                     let mat = grid.get(v);
+                    let dmg = grid.damage_at(v);
                     let l = v - min;
-                    voxels[grid_index(dims, l)] = mat;
+                    let idx = grid_index(dims, l);
+                    voxels[idx] = mat;
+                    damage[idx] = dmg;
                 }
-                out.push((VoxelGrid::new(dims, voxels), min));
+                out.push((VoxelGrid::new_with_damage(dims, voxels, damage), min));
             }
         }
     }
