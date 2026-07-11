@@ -502,10 +502,20 @@ impl PhysicsWorld {
             }
             parent[x]
         }
-        for &(a, b) in self.broadphase.candidate_pairs(&self.slots) {
-            let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+        fn union(parent: &mut [usize], a: usize, b: usize) {
+            let (ra, rb) = (find(parent, a), find(parent, b));
             if ra != rb {
                 parent[ra] = rb;
+            }
+        }
+        for &(a, b) in self.broadphase.candidate_pairs(&self.slots) {
+            union(&mut parent, a, b);
+        }
+        // Joint-connected bodies are in the same island so joined bodies
+        // sleep and wake together.
+        for j in &self.joints {
+            if self.slots[j.body_a].is_some() && self.slots[j.body_b].is_some() {
+                union(&mut parent, j.body_a, j.body_b);
             }
         }
         let mut groups: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
