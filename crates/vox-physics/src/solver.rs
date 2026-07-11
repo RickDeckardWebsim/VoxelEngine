@@ -727,8 +727,8 @@ impl PhysicsWorld {
                 }
                 let n = d / dist;
                 // Velocity-based solve: cancel relative velocity along the
-                // constraint axis. Position drift is corrected by the
-                // split-impulse pass below (5% per iteration).
+                // constraint axis. No position correction (disabled to
+                // prevent chain feedback loops); slight sag is acceptable.
                 let v_rel = (bb.vel + bb.omega.cross(rb)) - (ba.vel + ba.omega.cross(ra));
                 let vn = v_rel.dot(n);
                 let ima = if asleep_a { 0.0 } else { ba.inv_mass };
@@ -868,42 +868,12 @@ impl PhysicsWorld {
                     None => self.pos_corr[c.body] += c.normal * push,
                 }
             }
-            // Joint distance drift correction (small beta — 5% per iter).
-            for j in &self.joints {
-                let (ba, bb) = match (self.slots[j.body_a].as_ref(), self.slots[j.body_b].as_ref()) {
-                    (Some(a), Some(b)) => (a, b),
-                    _ => continue,
-                };
-                if ba.sleep.asleep && bb.sleep.asleep {
-                    continue;
-                }
-                let asleep_a = ba.sleep.asleep;
-                let asleep_b = bb.sleep.asleep;
-                let ra = ba.rot * j.anchor_a;
-                let rb = bb.rot * j.anchor_b;
-                let d = (bb.pos + rb) - (ba.pos + ra);
-                let dist = d.length();
-                if dist < 1e-6 {
-                    continue;
-                }
-                let n = d / dist;
-                let c = dist - j.rest_length;
-                let ima = if asleep_a { 0.0 } else { ba.inv_mass };
-                let imb = if asleep_b { 0.0 } else { bb.inv_mass };
-                let iwa = if asleep_a { Mat3::ZERO } else { ba.inv_iw };
-                let iwb = if asleep_b { Mat3::ZERO } else { bb.inv_iw };
-                let ra_cross_n = ra.cross(n);
-                let rb_cross_n = rb.cross(n);
-                let w = ima + imb
-                    + iwa.mul_vec3(ra_cross_n).dot(ra_cross_n)
-                    + iwb.mul_vec3(rb_cross_n).dot(rb_cross_n);
-                if w <= 0.0 {
-                    continue;
-                }
-                let corr = (c * 0.05).clamp(-MAX_POSITION_CORRECTION_M, MAX_POSITION_CORRECTION_M);
-                self.pos_corr[j.body_a] += n * (corr * ima / w);
-                self.pos_corr[j.body_b] -= n * (corr * imb / w);
-            }
+            // Joint position correction disabled — velocity solve alone
+            // prevents explosion. Position correction in a joint chain
+            // creates a feedback loop (correcting one joint violates the
+            // next), causing solver divergence and frame-rate death.
+            // The velocity-only solve allows slight sag under gravity,
+            // which is acceptable for flexible rope.
         }
         for (slot, entry) in self.slots.iter_mut().enumerate() {
             let Some(body) = entry else { continue };

@@ -755,6 +755,7 @@ impl VoxApp {
                 &body.grid.damage,
             );
             let mesh = mesh_slab(&slab, IVec3::ZERO, &self.fluids);
+            tracing::info!(slot = id.slot, verts = mesh.vertices.len(), "upload_debris_mesh sync");
             self.pipeline
                 .upload_body(&self.gpu, (id.slot, id.generation), &mesh);
             MeshDispatch::Sync
@@ -850,6 +851,7 @@ impl VoxApp {
         for id in
             evict_oldest_asleep_debris(&mut self.phys, &mut self.debris_order, MAX_DEBRIS_BODIES)
         {
+            tracing::info!(slot = id.slot, "budget evicted");
             self.burning_bodies.remove(&id);
             self.pipeline.remove_body((id.slot, id.generation));
         }
@@ -864,6 +866,7 @@ impl VoxApp {
     /// once the global cap is hit.
     fn expire_clutter(&mut self, dt: f32) {
         for id in self.phys.tick_lifetimes(dt) {
+            tracing::info!(slot = id.slot, "clutter expired");
             self.burning_bodies.remove(&id);
             self.pipeline.remove_body((id.slot, id.generation));
         }
@@ -884,6 +887,7 @@ impl VoxApp {
     /// `Tunables::fracture_sensitivity` for the overall threshold dial.
     fn apply_impact_fracture(&mut self, impacts: Vec<ImpactEvent>) {
         for event in impacts {
+            tracing::info!(slot = event.body.slot, impulse = event.impulse, "impact event");
             let Some(body) = self.phys.get(event.body) else {
                 continue;
             };
@@ -1652,6 +1656,17 @@ impl App for VoxApp {
             impacts
         };
         self.apply_impact_fracture(impacts);
+        // Debug: check rope segment health for NaN/divergence.
+        if !self.phys.joints().is_empty() {
+            if let Some(j) = self.phys.joints().first() {
+                if let Some(body) = self.phys.iter().find(|(id, _)| id.slot as usize == j.body_a) {
+                    let (_, b) = body;
+                    if !b.pos.is_finite() || !b.vel.is_finite() || b.vel.length() > 50.0 {
+                        tracing::warn!(pos=?b.pos, vel=?b.vel, vel_len=b.vel.length(), "rope segment 0 DIVERGED");
+                    }
+                }
+            }
+        }
         // Re-mesh debris bodies whose damage changed this frame (sub-threshold
         // impacts set damage_dirty via apply_body_damage's in-place path).
         let damage_dirty_ids: Vec<BodyId> = self
