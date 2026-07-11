@@ -10,6 +10,9 @@ use vox_world::{AIR, Voxel};
 pub struct VoxelGrid {
     pub dims: IVec3,
     pub voxels: Vec<Voxel>,
+    /// Per-voxel damage, 0.0 (pristine) to 1.0 (crumbled). Parallel to
+    /// `voxels`, same length. Only meaningful on debris bodies.
+    pub damage: Vec<f32>,
 }
 
 impl VoxelGrid {
@@ -18,7 +21,19 @@ impl VoxelGrid {
             voxels.len() as i64,
             dims.x as i64 * dims.y as i64 * dims.z as i64
         );
-        Self { dims, voxels }
+        let damage = vec![0.0; voxels.len()];
+        Self { dims, voxels, damage }
+    }
+
+    /// Construct a grid with an existing damage field (e.g. carrying damage
+    /// through `split_components`). `damage.len()` must equal `voxels.len()`.
+    pub fn new_with_damage(dims: IVec3, voxels: Vec<Voxel>, damage: Vec<f32>) -> Self {
+        debug_assert_eq!(
+            voxels.len() as i64,
+            dims.x as i64 * dims.y as i64 * dims.z as i64
+        );
+        debug_assert_eq!(voxels.len(), damage.len());
+        Self { dims, voxels, damage }
     }
 
     #[inline]
@@ -53,6 +68,46 @@ impl VoxelGrid {
     /// Number of solid voxels.
     pub fn solid_count(&self) -> usize {
         self.voxels.iter().filter(|v| **v != AIR).count()
+    }
+
+    /// Damage at `p`; out-of-bounds reads as 0.0 (pristine).
+    #[inline]
+    pub fn damage_at(&self, p: IVec3) -> f32 {
+        if p.cmpge(IVec3::ZERO).all() && p.cmplt(self.dims).all() {
+            self.damage[self.index(p)]
+        } else {
+            0.0
+        }
+    }
+
+    /// Add damage to a solid voxel. Returns true if the voxel accepted damage.
+    #[inline]
+    pub fn add_damage(&mut self, p: IVec3, amount: f32) -> bool {
+        if p.cmpge(IVec3::ZERO).all() && p.cmplt(self.dims).all() {
+            let idx = self.index(p);
+            if self.voxels[idx] != AIR {
+                self.damage[idx] = (self.damage[idx] + amount).min(1.0);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Decay all damage by `decay_rate * dt`. Returns true if any damage changed.
+    pub fn tick_damage_decay(&mut self, dt: f32, decay_rate: f32) -> bool {
+        let mut changed = false;
+        for d in &mut self.damage {
+            if *d > 0.0 {
+                *d = (*d - decay_rate * dt).max(0.0);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Whether any voxel has nonzero damage.
+    pub fn has_damage(&self) -> bool {
+        self.damage.iter().any(|&d| d > 0.0)
     }
 }
 
