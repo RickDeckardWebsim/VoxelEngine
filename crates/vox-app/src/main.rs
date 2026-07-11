@@ -424,6 +424,10 @@ struct VoxApp {
     /// textures, fullscreen edge-detection/saturation/grading pass that
     /// composites the scene to the swapchain.
     postprocess: vox_render::PostProcessPipeline,
+    /// SSAO + bloom post-processing pipeline: generates ambient occlusion
+    /// and bloom from the scene's HDR color + depth, feeding the results
+    /// into the cel-shading composite pass.
+    bloom_ssao: vox_render::BloomSsaoPipeline,
     /// Grass blade render pipeline.
     grass_pipeline: vox_render::GrassPipeline,
     /// Cached grass blade vertices (throttled regeneration).
@@ -513,7 +517,16 @@ impl VoxApp {
         let particle_pipeline = ParticlePipeline::new(&gpu, &particle_shader);
         let tools = Tools::new(&registry);
         let (surf_w, surf_h) = gpu.surface_size();
-        let postprocess = vox_render::PostProcessPipeline::new(&gpu, &post_shader, surf_w, surf_h);
+        let ssao_shader = std::fs::read_to_string(assets.join("shaders/ssao.wgsl"))?;
+        let bloom_shader = std::fs::read_to_string(assets.join("shaders/bloom.wgsl"))?;
+        let bloom_ssao = vox_render::BloomSsaoPipeline::new(
+            &gpu, &ssao_shader, &bloom_shader, surf_w, surf_h,
+        );
+        let postprocess = vox_render::PostProcessPipeline::new(
+            &gpu, &post_shader, surf_w, surf_h,
+            bloom_ssao.ao_view(),
+            bloom_ssao.bloom_view(),
+        );
         let grass_pipeline = vox_render::GrassPipeline::new(&gpu, &grass_shader);
         let debug_overlay = DebugOverlay::new(gpu.device(), gpu.surface_format(), None, &window);
         // Air (id 0) is never player-selectable; the picker mirrors that.
@@ -594,6 +607,7 @@ impl VoxApp {
             particles: ParticleSystem::new(),
             particle_pipeline,
             postprocess,
+            bloom_ssao,
             grass_pipeline,
             grass_cache: grass::GrassCache::new(),
         };
@@ -2054,6 +2068,24 @@ impl App for VoxApp {
             self.pipeline.draw_water(&mut pass, &frustum);
         }
 
+        // SSAO + bloom passes: generate AO and bloom from the scene's HDR color + depth.
+        let inv_view_proj = view_proj.inverse();
+        self.bloom_ssao.write_params(
+            self.gpu.queue(),
+            view_proj.to_cols_array_2d(),
+            inv_view_proj.to_cols_array_2d(),
+            self.tunables.ssao_intensity,
+            self.tunables.ssao_radius,
+            self.tunables.bloom_intensity,
+            self.tunables.bloom_threshold,
+        );
+        self.bloom_ssao.process(
+            self.gpu.device(),
+            &mut encoder,
+            self.postprocess.color_view(),
+            self.postprocess.depth_view(),
+        );
+
         // Post-process pass: composite the offscreen HDR color + depth
         // through the fullscreen edge-detection/saturation/grading shader
         // onto the swapchain frame.
@@ -2092,7 +2124,14 @@ impl App for VoxApp {
 
     fn resize(&mut self, width: u32, height: u32) {
         self.gpu.resize(width, height);
-        self.postprocess.resize(&self.gpu, width, height);
+        self.bloom_ssao.resize(&self.gpu, width, height);
+        self.postprocess.resize(
+            &self.gpu,
+            width,
+            height,
+            self.bloom_ssao.ao_view(),
+            self.bloom_ssao.bloom_view(),
+        );
     }
 
     fn window_event(&mut self, event: &winit::event::WindowEvent) -> bool {
