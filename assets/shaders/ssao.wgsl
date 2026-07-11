@@ -38,7 +38,7 @@ fn view_pos_from_ndc(uv: vec2f, depth: f32) -> vec4f {
     // see camera.rs:53, frustum.rs:29-30). The depth buffer stores this
     // directly, so no remapping is needed. X and Y are still UV [0,1]
     // → NDC [-1,1].
-    let clip = vec4f(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0, depth, 1.0);
+    let clip = vec4f(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, depth, 1.0);
     let view = params.inv_view_proj * clip;
     return view / view.w;
 }
@@ -101,7 +101,8 @@ fn fs_ssao(@builtin(position) frag_pos: vec4f) -> @location(0) f32 {
 
         let proj = params.view_proj * vec4f(sample_pos, 1.0);
         let sample_ndc = proj.xy / proj.w;
-        let sample_uv = sample_ndc * 0.5 + 0.5;
+        // NDC to UV: flip Y because depth buffer origin is top-left.
+        let sample_uv = vec2f(sample_ndc.x * 0.5 + 0.5, 0.5 - sample_ndc.y * 0.5);
 
         if (sample_uv.x < 0.0 || sample_uv.x > 1.0 || sample_uv.y < 0.0 || sample_uv.y > 1.0) {
             continue;
