@@ -365,6 +365,27 @@ impl World {
         }
     }
 
+    /// Remove a chunk from the map, dirtying itself and its six face neighbors
+    /// (neighbors' meshes sample this chunk for face culling, and the chunk's
+    /// own mesh must be dropped). No-op if the chunk is absent. Also removes
+    /// it from the edited set — an evicted chunk is gone.
+    pub fn remove_chunk(&mut self, key: IVec3) {
+        if self.chunks.remove(&key).is_none() {
+            return;
+        }
+        self.edited.remove(&key);
+        // Dirty self (so its mesh is dropped) + neighbors (their face culling
+        // changes when an adjacent chunk disappears).
+        self.dirty.insert(key);
+        for axis in 0..3 {
+            for sign in [-1, 1] {
+                let mut n = key;
+                n[axis] += sign;
+                self.dirty.insert(n);
+            }
+        }
+    }
+
     /// Chunk at `key`, if it exists.
     pub fn chunk_at(&self, key: IVec3) -> Option<&Chunk> {
         self.chunks.get(&key)
@@ -695,5 +716,35 @@ fn same_value_write_does_not_mark_edited() {
     assert!(edited_before); // was edited
     // No new chunks marked:
     assert_eq!(w.edited_count(), 1, "same-value write should not add edited chunks");
+}
+#[test]
+fn remove_chunk_evicts_and_dirties_neighbors() {
+    let mut w = world();
+    w.insert_chunk(IVec3::new(1, 1, 1), Chunk::uniform(STONE));
+    w.drain_dirty(); // clear insert dirty
+
+    w.remove_chunk(IVec3::new(1, 1, 1));
+    assert!(w.chunk_at(IVec3::new(1, 1, 1)).is_none(),
+        "chunk must be removed");
+    // Neighbors dirtied so their meshes update (face culling changes).
+    let dirty: HashSet<_> = w.drain_dirty().into_iter().collect();
+    for key in [
+        IVec3::new(1, 1, 1),
+        IVec3::new(2, 1, 1),
+        IVec3::new(0, 1, 1),
+        IVec3::new(1, 2, 1),
+        IVec3::new(1, 0, 1),
+        IVec3::new(1, 1, 2),
+        IVec3::new(1, 1, 0),
+    ] {
+        assert!(dirty.contains(&key), "neighbor {key} not dirtied by removal");
+    }
+}
+
+#[test]
+fn remove_absent_chunk_is_noop() {
+    let mut w = world();
+    w.remove_chunk(IVec3::new(5, 5, 5));
+    assert!(w.drain_dirty().is_empty(), "removing absent chunk dirties nothing");
 }
 }
