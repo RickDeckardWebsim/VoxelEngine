@@ -107,6 +107,12 @@ fn tuning_window(ctx: &Context, state: &mut OverlayState<'_>) {
             ui.label("Movement:");
             ui.add(Slider::new(&mut state.tunables.fly_speed, 1.0..=40.0).text("fly speed (m/s)"));
             ui.separator();
+            ui.separator();
+            ui.label("Post-processing:");
+            ui.add(Slider::new(&mut state.tunables.ssao_intensity, 0.0..=2.0).text("SSAO intensity"));
+            ui.add(Slider::new(&mut state.tunables.ssao_radius, 0.1..=2.0).text("SSAO radius"));
+            ui.add(Slider::new(&mut state.tunables.bloom_intensity, 0.0..=2.0).text("Bloom intensity"));
+            ui.add(Slider::new(&mut state.tunables.bloom_threshold, 0.3..=3.0).text("Bloom threshold"));
 
             ui.label("Build material:");
             egui::ComboBox::from_label("")

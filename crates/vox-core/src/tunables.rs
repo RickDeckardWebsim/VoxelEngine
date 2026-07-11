@@ -32,6 +32,14 @@ pub struct Tunables {
     /// sensitive to impacts); it doesn't change materials' *relative*
     /// toughness to each other, which comes entirely from `strength`.
     pub fracture_sensitivity: f32,
+    /// SSAO intensity (0 = off, 1 = full effect).
+    pub ssao_intensity: f32,
+    /// SSAO sample radius in view space.
+    pub ssao_radius: f32,
+    /// Bloom intensity (0 = off, 1 = full effect).
+    pub bloom_intensity: f32,
+    /// Bloom luminance threshold for bright-pass extraction.
+    pub bloom_threshold: f32,
 }
 
 impl Default for Tunables {
@@ -48,6 +56,10 @@ impl Default for Tunables {
             // give way at the slightest bump, wood needs a real fall or
             // throw, stone needs a genuinely hard impact.
             fracture_sensitivity: 1.0,
+            ssao_intensity: 1.0,
+            ssao_radius: 0.5,
+            bloom_intensity: 0.8,
+            bloom_threshold: 0.8,
         }
     }
 }
