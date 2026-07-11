@@ -291,6 +291,13 @@ impl PhysicsWorld {
         self.joints.len() - 1
     }
 
+    /// Check if two body slots are connected by a joint.
+    fn are_joined(&self, a: usize, b: usize) -> bool {
+        self.joints.iter().any(|j| {
+            (j.body_a == a && j.body_b == b) || (j.body_a == b && j.body_b == a)
+        })
+    }
+
     /// Remove all joints referencing a given body slot (called on despawn).
     fn remove_joints_for_slot(&mut self, slot: usize) {
         self.joints.retain(|j| j.body_a != slot && j.body_b != slot);
@@ -591,7 +598,13 @@ impl PhysicsWorld {
         // keeps its capacity) instead of a fresh allocation per touching
         // pair per substep.
         let mut staged: Vec<Contact> = Vec::new();
-        for &(a, b) in self.broadphase.candidate_pairs(&self.slots) {
+        let pairs: Vec<(usize, usize)> = self.broadphase.candidate_pairs(&self.slots).to_vec();
+        for (a, b) in pairs {
+            // Skip contact between jointed bodies — the joint handles their
+            // connection. Contacts between rope segments fight the joint.
+            if self.are_joined(a, b) {
+                continue;
+            }
             let (asleep_a, asleep_b) = {
                 let ba = self.slots[a].as_ref().expect("pair body alive");
                 let bb = self.slots[b].as_ref().expect("pair body alive");
