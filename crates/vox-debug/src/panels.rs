@@ -110,7 +110,7 @@ fn tuning_window(ctx: &Context, state: &mut OverlayState<'_>) {
             ui.separator();
             ui.label("Post-processing:");
             ui.add(Slider::new(&mut state.tunables.ssao_intensity, 0.0..=2.0).text("SSAO intensity"));
-            ui.add(Slider::new(&mut state.tunables.ssao_radius, 0.1..=2.0).text("SSAO radius"));
+            ui.add(Slider::new(&mut state.tunables.ssao_radius, 0.05..=2.0).text("SSAO radius").logarithmic(true));
             ui.add(Slider::new(&mut state.tunables.bloom_intensity, 0.0..=2.0).text("Bloom intensity"));
             ui.add(Slider::new(&mut state.tunables.bloom_threshold, 0.3..=3.0).text("Bloom threshold"));
 

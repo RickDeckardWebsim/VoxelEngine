@@ -56,8 +56,8 @@ impl Default for Tunables {
             // give way at the slightest bump, wood needs a real fall or
             // throw, stone needs a genuinely hard impact.
             fracture_sensitivity: 1.0,
-            ssao_intensity: 1.0,
-            ssao_radius: 2.0,
+            ssao_intensity: 0.8,
+            ssao_radius: 0.3,
             bloom_intensity: 0.8,
             bloom_threshold: 0.8,
         }
