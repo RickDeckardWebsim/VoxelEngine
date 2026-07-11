@@ -4,13 +4,84 @@
 
 use vox_core::WorldConfig;
 
-/// `voxelengine [--scale 0.1|1.0] [--mario-scale N] [--seed N] [--extent X,Y,Z] [--help]`
+/// Streaming quality preset: controls render distance, tree detail ring,
+/// and chunk generation budget per frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Quality {
+    Low,
+    Medium,
+    High,
+    Ultra,
+}
+
+impl Quality {
+    /// Render distance in chunks (radius around player).
+    pub fn render_distance(self) -> i32 {
+        match self {
+            Quality::Low => 4,
+            Quality::Medium => 8,
+            Quality::High => 16,
+            Quality::Ultra => 24,
+        }
+    }
+
+    /// Detail ring radius in chunks. Trees root only within this ring;
+    /// canopies extend beyond it into far chunks.
+    pub fn detail_ring(self) -> i32 {
+        match self {
+            Quality::Low => 1,
+            Quality::Medium => 3,
+            Quality::High => 6,
+            Quality::Ultra => 12,
+        }
+    }
+
+    /// Maximum chunks to generate per frame.
+    pub fn gen_budget(self) -> usize {
+        match self {
+            Quality::Low => 2,
+            Quality::Medium => 4,
+            Quality::High => 8,
+            Quality::Ultra => 12,
+        }
+    }
+
+    /// Maximum loaded chunk count (soft cap for eviction).
+    pub fn chunk_cap(self) -> usize {
+        let r = self.render_distance() as usize;
+        // (2r+1)^2 * height_chunks estimate, plus headroom.
+        let side = 2 * r + 1;
+        side * side * 4 + 64
+    }
+}
+
+impl Default for Quality {
+    fn default() -> Self {
+        Quality::Medium
+    }
+}
+
+impl std::str::FromStr for Quality {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "low" => Ok(Quality::Low),
+            "medium" => Ok(Quality::Medium),
+            "high" => Ok(Quality::High),
+            "ultra" => Ok(Quality::Ultra),
+            _ => Err(format!("unknown quality '{s}', expected low|medium|high|ultra")),
+        }
+    }
+}
+
+/// `voxelengine [--scale 0.1|1.0] [--mario-scale N] [--seed N] [--extent X,Y,Z] [--quality low|medium|high|ultra] [--help]`
 pub fn usage() -> String {
-    "voxelengine [--scale 0.1|1.0] [--mario-scale N] [--seed N] [--extent X,Y,Z] [--help]\n\n\
+    "voxelengine [--scale 0.1|1.0] [--mario-scale N] [--seed N] [--extent X,Y,Z] [--quality low|medium|high|ultra] [--help]\n\n\
      --scale       voxel edge length in meters (default 0.1)\n\
      --mario-scale SM64 units per meter — higher = smaller Mario (default 125, Mario ~1.3m)\n\
      --seed        world generation seed (default 1337)\n\
      --extent      world size in meters, comma-separated X,Y,Z (default 128,48,128)\n\
+     --quality     streaming quality preset: low|medium|high|ultra (default medium)\n\
      --help        show this message"
         .to_string()
 }
@@ -28,6 +99,8 @@ pub struct CliConfig {
     /// SM64 units per meter for Mario mode. Higher = smaller Mario.
     /// Default 60 → Mario is ~2.67m tall (160 SM64 units / 60).
     pub mario_units_per_meter: f32,
+    /// Streaming quality preset (render distance, tree detail, gen budget).
+    pub quality: Quality,
 }
 
 /// Parse CLI overrides on top of [`WorldConfig::default`]. Returns a
@@ -37,6 +110,7 @@ pub struct CliConfig {
 pub fn parse<'a>(args: impl Iterator<Item = &'a str>) -> Result<CliConfig, String> {
     let mut cfg = WorldConfig::default();
     let mut mario_units_per_meter: f32 = 125.0;
+    let mut quality = Quality::default();
     let args: Vec<&str> = args.collect();
     let mut i = 0;
     while i < args.len() {
@@ -79,6 +153,10 @@ pub fn parse<'a>(args: impl Iterator<Item = &'a str>) -> Result<CliConfig, Strin
                 }
                 cfg.extent_m = extent;
             }
+            "--quality" => {
+                let v = next_value(&args, &mut i, "--quality")?;
+                quality = v.parse().map_err(|e: String| format!("--quality: {e}"))?;
+            }
             other => return Err(format!("unknown argument '{other}'")),
         }
         i += 1;
@@ -87,6 +165,7 @@ pub fn parse<'a>(args: impl Iterator<Item = &'a str>) -> Result<CliConfig, Strin
     Ok(CliConfig {
         world: cfg,
         mario_units_per_meter,
+        quality,
     })
 }
 
@@ -176,5 +255,27 @@ mod tests {
         assert!(wants_help("--help".split_whitespace()));
         assert!(wants_help("-h".split_whitespace()));
         assert!(!wants_help("--scale 1.0".split_whitespace()));
+    }
+    #[test]
+    fn quality_parses_low() {
+        let cli = parse(["--quality", "low"].into_iter()).unwrap();
+        assert_eq!(cli.quality, Quality::Low);
+    }
+
+    #[test]
+    fn quality_parses_medium_default() {
+        let cli = parse([].into_iter()).unwrap();
+        assert_eq!(cli.quality, Quality::Medium);
+    }
+
+    #[test]
+    fn quality_parses_ultra() {
+        let cli = parse(["--quality", "ultra"].into_iter()).unwrap();
+        assert_eq!(cli.quality, Quality::Ultra);
+    }
+
+    #[test]
+    fn quality_rejects_unknown() {
+        assert!(parse(["--quality", "turbo"].into_iter()).is_err());
     }
 }
