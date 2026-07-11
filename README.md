@@ -160,6 +160,15 @@ works fully without Mario mode.
   solid voxels, driven by a `crack_intensity` uniform (default 0 = off).
 - **Smoke particles**: World-colliding billboard particles with
   inter-particle repulsion, enclosure-aware drag, emitted by fire.
+- **SSAO**: Screen-space ambient occlusion reconstructs view-space normals
+  from the depth buffer and samples a 32-direction hemisphere kernel to
+  darken crevices, under-overhangs, and contact areas. Half-resolution AO
+  buffer with 3×3 box blur, applied before tone mapping. Intensity and
+  radius tunable via the F3 debug overlay.
+- **Bloom**: Bright pixels (fire, ember, sun-lit surfaces) bleed light into
+  surrounding areas via a luminance-threshold bright pass followed by a
+  13-tap separable Gaussian blur at half resolution. Added after color
+  grading. Intensity and threshold tunable via the F3 debug overlay.
 
 ## Simulation
 
