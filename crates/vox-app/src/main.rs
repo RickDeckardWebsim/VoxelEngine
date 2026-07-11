@@ -698,7 +698,7 @@ impl VoxApp {
 
         for i in 0..5 {
             // Stack segments vertically, top segment first.
-            let seg_center = base_pos + Vec3::new(0.0, -i as f32 * seg_height_m, 0.0);
+        let seg_center = base_pos + Vec3::new(0.0, -i as f32 * (seg_height_m + voxel_size), 0.0);
             let grid = VoxelGrid::new(seg_dims, seg_voxels.clone());
             let Some(body) = Body::from_grid(grid, &self.registry, voxel_size, seg_center)
             else {
@@ -711,7 +711,7 @@ impl VoxApp {
                 // Connect bottom of previous segment to top of this segment.
                 let anchor_prev = Vec3::new(0.0, -half_height, 0.0);
                 let anchor_this = Vec3::new(0.0, half_height, 0.0);
-                self.phys.add_joint(prev, id, anchor_prev, anchor_this, 0.0);
+                self.phys.add_joint(prev, id, anchor_prev, anchor_this, voxel_size);
             }
 
             prev_id = Some(id);
