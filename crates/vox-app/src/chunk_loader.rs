@@ -127,7 +127,7 @@ impl ChunkLoader {
         let chunk_max = chunk_of(bmax - IVec3::ONE);
 
         // Collect missing chunks, sorted by distance from center.
-        let mut missing: Vec<(i64, IVec3, bool)> = Vec::new();
+        let mut missing: Vec<(i64, IVec3)> = Vec::new();
         for dz in -render_dist..=render_dist {
             for dy in -render_dist..=render_dist {
                 for dx in -render_dist..=render_dist {
@@ -137,18 +137,15 @@ impl ChunkLoader {
                     if key.z < chunk_min.z || key.z > chunk_max.z { continue; }
                     if world.chunk_at(key).is_some() { continue; }
                     let dist = (dx * dx + dy * dy + dz * dz) as i64;
-                    let in_detail = dx.abs() <= detail_ring
-                        && dz.abs() <= detail_ring
-                        && dy.abs() <= detail_ring;
-                    missing.push((dist, key, in_detail));
+                    missing.push((dist, key));
                 }
             }
         }
-        missing.sort_by_key(|(d, _, _)| *d);
+        missing.sort_by_key(|(d, _)| *d);
 
         let mut generated = false;
-        for (_, key, in_detail) in missing.into_iter().take(budget) {
-            self.generate_chunk(world, pipeline, gpu, key, in_detail);
+        for (_, key) in missing.into_iter().take(budget) {
+            self.generate_chunk(world, pipeline, gpu, key, center, detail_ring);
             generated = true;
         }
         generated
@@ -176,10 +173,7 @@ impl ChunkLoader {
                     if key.y < chunk_min.y || key.y > chunk_max.y { continue; }
                     if key.z < chunk_min.z || key.z > chunk_max.z { continue; }
                     if world.chunk_at(key).is_some() { continue; }
-                    let in_detail = dx.abs() <= detail_ring
-                        && dz.abs() <= detail_ring
-                        && dy.abs() <= detail_ring;
-                    self.generate_chunk(world, pipeline, gpu, key, in_detail);
+                    self.generate_chunk(world, pipeline, gpu, key, center, detail_ring);
                 }
             }
         }
@@ -190,13 +184,22 @@ impl ChunkLoader {
     /// band, skipped air above, per-column surface fill (with clipped trees)
     /// only in the surface band. Avoids allocating air chunks and dense
     /// 64 KB stone chunks.
+    ///
+    /// Tree stamping is UNCONDITIONAL across the canopy-reach neighborhood:
+    /// the loop stamps all trees rooted in near (detail-ring) chunks whose
+    /// canopy overlaps this chunk. When this chunk is itself near, dx=0/dz=0
+    /// includes self → own-rooted trees stamp. When far, self is filtered
+    /// out by the detail-ring check → only near-neighbor canopy stamps.
+    /// This keeps trees whole across ALL chunk boundaries, not just the
+    /// detail-ring boundary.
     fn generate_chunk(
         &self,
         world: &mut World,
         _pipeline: &mut VoxelPipeline,
         _gpu: &Gpu,
         key: IVec3,
-        in_detail: bool,
+        center_chunk: IVec3,
+        detail_ring: i32,
     ) {
         let s = world.cfg.voxel_size_m;
 
@@ -214,19 +217,43 @@ impl ChunkLoader {
                 let chunk = self.terrain.fill_surface_chunk(key, s, self.terrain_mats);
                 world.insert_chunk(key, chunk);
 
-                // Trees: only root trees in detail-ring chunks, but stamp their
-                // canopy clipped to this chunk (canopy may extend into far chunks).
-                if in_detail {
-                    let origin = chunk_origin(key);
-                    let clip_min = origin;
-                    let clip_max = origin + IVec3::splat(CHUNK_SIZE as i32);
-                    world.set_clip(clip_min, clip_max);
-                    let trees = trees_for_chunk(&world.cfg, &self.terrain, key);
-                    for tree in &trees {
-                        stamp_tree(world, tree, self.tree_mats);
+                // Stamp all trees whose canopy overlaps this chunk. Tree
+                // existence is gated by the ROOT chunk's tier (root within
+                // detail ring → tree exists). The loop is unconditional —
+                // it covers both own-rooted trees (dx=0, dz=0) and
+                // neighbor-rooted trees. The clip guard ensures only voxels
+                // within this chunk are written; the rest are dropped.
+                let origin = chunk_origin(key);
+                let clip_min = origin;
+                let clip_max = origin + IVec3::splat(CHUNK_SIZE as i32);
+                world.set_clip(clip_min, clip_max);
+
+                // Canopy reach is ~5m; at 0.1m voxels that's ~50 voxels
+                // (< 2 chunks of 3.2m), at 1.0m voxels it's < 1 chunk
+                // (32m). A 5x5 neighborhood (±2 chunks) is conservative
+                // and the inner loop is cheap (trees_for_chunk returns
+                // ~0-3 trees per chunk).
+                const CANOPY_REACH_CHUNKS: i32 = 2;
+                for dz in -CANOPY_REACH_CHUNKS..=CANOPY_REACH_CHUNKS {
+                    for dx in -CANOPY_REACH_CHUNKS..=CANOPY_REACH_CHUNKS {
+                        let neighbor = IVec3::new(key.x + dx, key.y, key.z + dz);
+                        // Root-chunk-tier gate: only stamp from near
+                        // (detail-ring) root chunks. Self (dx=0, dz=0) is
+                        // included when this chunk is in the detail ring,
+                        // excluded when it's far.
+                        let ndx = neighbor.x - center_chunk.x;
+                        let ndz = neighbor.z - center_chunk.z;
+                        if ndx.abs() > detail_ring || ndz.abs() > detail_ring {
+                            continue;
+                        }
+                        let trees = trees_for_chunk(&world.cfg, &self.terrain, neighbor);
+                        for tree in &trees {
+                            stamp_tree(world, tree, self.tree_mats);
+                        }
                     }
-                    world.clear_clip();
                 }
+
+                world.clear_clip();
             }
         }
 
