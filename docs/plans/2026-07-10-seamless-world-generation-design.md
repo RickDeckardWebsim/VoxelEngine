@@ -89,9 +89,10 @@ chunk `K` by computing the tree's bounding box (trunk + canopy radius) and
 checking overlap with chunk `K`'s bounds. Pure math from
 `(seed, chunk_coords)` — no global iteration needed.
 
-**Quality interaction:** Far-quality chunks skip tree generation entirely.
-Near-quality chunks stamp trees with clip. Same clip mechanism, gated by
-quality ring.
+**Quality interaction:** Tree existence is gated by the root chunk's tier
+(Section 4). Near chunks stamp their trees (clipped to each overlapping target
+chunk). Far chunks receive canopy stamps from near-rooted trees but never root
+their own. Same clip mechanism, gated by root-chunk quality.
 
 **Edit safety:** Clip is only active during generation. Player edits (tools,
 bombs, carves) never set the clip — they write freely to any in-bounds chunk.
@@ -161,12 +162,14 @@ User picks via CLI (`--quality low|medium|high|ultra`) or in-game key.
 **Render distance:** How many chunks around the player exist in memory + GPU.
 Beyond this, pristine chunks evict.
 
-**Detail ring:** Chunks within this radius get full generation: terrain +
-trees. Beyond the detail ring (but within render distance), chunks get
-terrain-only — no trees. Terrain heightmap is identical in both rings (same
-`height_m` function), so there's no height discontinuity at the ring
-boundary. The quality difference is purely tree presence + render distance —
-no geometric LOD, no popping, no cracks.
+**Detail ring:** Tree existence is gated by the **root chunk's** tier. A tree
+rooted in a near chunk (within the detail ring) exists in full — its canopy
+stamps into ALL overlapping chunks regardless of the target chunk's own tier.
+"Far = no trees" means "no trees rooted there," not "no tree voxels at all."
+This keeps trees whole across the ring boundary — no half-cut canopies.
+Terrain heightmap is identical in both rings (same `height_m` function), so
+there's no height discontinuity. The quality difference is purely tree
+rooting + render distance — no geometric LOD, no popping, no cracks.
 
 **Live switching:** Changing quality at runtime adjusts render distance and
 detail ring. Chunks beyond the new render distance evict (pristine only).
