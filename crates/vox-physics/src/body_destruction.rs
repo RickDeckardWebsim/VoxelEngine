@@ -290,6 +290,59 @@ fn finish_carve(
     }
     ids
 }
+/// Apply damage to a debris body's voxels. Sub-threshold impacts call this
+/// instead of carving. Adds damage to the specified voxels; any voxel reaching
+/// 1.0 crumbles (becomes AIR). If any voxels crumble, the body is despawned
+/// and [`finish_carve`] splits + respawns fragments. If none crumble, the body
+/// is mutated in-place with `damage_dirty` set.
+///
+/// Returns `Some(Vec<BodyId>)` if the body was despawned (crumble case --
+/// caller should `replace_body` with the returned IDs), or `None` if the body
+/// was mutated in-place (no crumble -- body still exists at the same ID).
+pub fn apply_body_damage(
+    phys: &mut PhysicsWorld,
+    registry: &MaterialRegistry,
+    id: BodyId,
+    damage_voxels: &[(IVec3, f32)],
+    voxel_size_m: f32,
+) -> Option<Vec<BodyId>> {
+    // Clone the grid to apply damage, because we need to read the parent
+    // state before a possible despawn -- can't borrow the body mutably while
+    // also reading it for position/rotation.
+    let body = phys.get(id)?;
+    let mut grid = body.grid.clone();
+    let parent = ParentState {
+        pos: body.pos,
+        rot: body.rot,
+        vel: body.vel,
+        omega: body.omega,
+        grid_offset: body.grid_offset,
+    };
+
+    let mut crumbled = false;
+    for &(voxel_pos, amount) in damage_voxels {
+        if grid.add_damage(voxel_pos, amount) {
+            if grid.damage_at(voxel_pos) >= 1.0 && grid.solid(voxel_pos) {
+                grid.set(voxel_pos, AIR);
+                crumbled = true;
+            }
+        }
+    }
+
+    if crumbled {
+        // Despawn + split + respawn, same as the fracture path.
+        phys.despawn(id);
+        Some(finish_carve(phys, registry, grid, voxel_size_m, parent))
+    } else {
+        // No crumble -- mutate the body's grid in-place.
+        if let Some(body) = phys.get_mut(id) {
+            body.grid = grid;
+            body.damage_dirty = true;
+        }
+        None
+    }
+}
+
 
 /// Remove exactly one voxel (grid-local coordinates) from an existing
 /// body's own grid, splitting it into however many disconnected fragments
@@ -730,5 +783,21 @@ mod tests {
             remaining < original_count,
             "must have removed the center column: {remaining} vs {original_count}"
         );
+    }
+
+    #[test]
+    fn split_components_carries_damage() {
+        // Build a 4x1x1 grid, damage the left half, disconnect by removing middle.
+        let mut grid = VoxelGrid::new(IVec3::new(4, 1, 1), vec![STONE; 4]);
+        grid.add_damage(IVec3::new(0, 0, 0), 0.7);
+        grid.set(IVec3::new(2, 0, 0), AIR); // disconnect left from right
+        let components = split_components(&grid);
+        assert_eq!(components.len(), 2, "must split into 2 components");
+        // Left component (voxel 0) should carry damage 0.7.
+        let left = components.iter().find(|(_, min)| min.x == 0).unwrap();
+        assert_eq!(left.0.damage_at(IVec3::ZERO), 0.7, "left fragment must carry damage");
+        // Right component (voxel 3) should have 0 damage.
+        let right = components.iter().find(|(_, min)| min.x == 3).unwrap();
+        assert_eq!(right.0.damage_at(IVec3::ZERO), 0.0, "right fragment must be pristine");
     }
 }

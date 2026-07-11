@@ -552,4 +552,35 @@ mod tests {
         let grid = solid_grid(IVec3::splat(4));
         assert!(raycast_grid(&grid, Vec3::new(-1.0, 0.2, 0.2), Vec3::NEG_X, 5.0, 0.1).is_none());
     }
+
+    #[test]
+    fn damage_accumulates_and_caps_at_1() {
+        let mut grid = VoxelGrid::new(IVec3::new(2, 2, 2), vec![Voxel(1); 8]);
+        assert_eq!(grid.damage_at(IVec3::new(0, 0, 0)), 0.0);
+        grid.add_damage(IVec3::new(0, 0, 0), 0.5);
+        assert_eq!(grid.damage_at(IVec3::new(0, 0, 0)), 0.5);
+        grid.add_damage(IVec3::new(0, 0, 0), 0.7);
+        assert_eq!(grid.damage_at(IVec3::new(0, 0, 0)), 1.0, "damage caps at 1.0");
+    }
+
+    #[test]
+    fn damage_does_not_accumulate_on_air() {
+        let mut grid = VoxelGrid::new(IVec3::new(2, 1, 1), vec![AIR, Voxel(1)]);
+        assert!(!grid.add_damage(IVec3::new(0, 0, 0), 0.5), "air rejects damage");
+        assert!(grid.add_damage(IVec3::new(1, 0, 0), 0.5), "solid accepts damage");
+    }
+
+    #[test]
+    fn damage_decays_to_zero() {
+        let mut grid = VoxelGrid::new(IVec3::new(1, 1, 1), vec![Voxel(1)]);
+        grid.add_damage(IVec3::ZERO, 0.5);
+        assert!(grid.has_damage());
+        grid.tick_damage_decay(1.0, 0.05);
+        assert_eq!(grid.damage_at(IVec3::ZERO), 0.45);
+        for _ in 0..20 {
+            grid.tick_damage_decay(1.0, 0.05);
+        }
+        assert_eq!(grid.damage_at(IVec3::ZERO), 0.0);
+        assert!(!grid.has_damage());
+    }
 }
