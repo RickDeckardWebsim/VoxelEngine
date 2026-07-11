@@ -35,12 +35,8 @@ fn fs_bright(@builtin(position) frag_pos: vec4f) -> @location(0) vec4f {
     return vec4f(color * soft, 1.0);
 }
 
-// 13-tap Gaussian weights (sigma ~4, precomputed).
-const GAUSSIAN_WEIGHTS: array<f32, 13> = array<f32, 13>(
-    0.002216, 0.008764, 0.026995, 0.064759, 0.120985, 0.176037, 0.199476,
-    0.176037, 0.120985, 0.064759, 0.026995, 0.008764, 0.002216,
-);
-
+// 13-tap separable Gaussian blur (sigma ~4). Unrolled because naga
+// rejects dynamic indexing of module-scope const arrays.
 // Blur direction: 0 = horizontal, 1 = vertical.
 override blur_direction: u32 = 0u;
 
@@ -51,10 +47,18 @@ fn fs_blur(@builtin(position) frag_pos: vec4f) -> @location(0) vec4f {
     let dir = select(vec2f(ts.x, 0.0), vec2f(0.0, ts.y), blur_direction == 1u);
 
     var sum = vec3f(0.0);
-    for (var i = 0; i < 13; i = i + 1) {
-        let offset = f32(i - 6);
-        let w = GAUSSIAN_WEIGHTS[i];
-        sum += textureSample(input_tex, samp, uv + dir * offset).rgb * w;
-    }
+    sum += textureSample(input_tex, samp, uv + dir * -6.0).rgb * 0.002216;
+    sum += textureSample(input_tex, samp, uv + dir * -5.0).rgb * 0.008764;
+    sum += textureSample(input_tex, samp, uv + dir * -4.0).rgb * 0.026995;
+    sum += textureSample(input_tex, samp, uv + dir * -3.0).rgb * 0.064759;
+    sum += textureSample(input_tex, samp, uv + dir * -2.0).rgb * 0.120985;
+    sum += textureSample(input_tex, samp, uv + dir * -1.0).rgb * 0.176037;
+    sum += textureSample(input_tex, samp, uv).rgb * 0.199476;
+    sum += textureSample(input_tex, samp, uv + dir *  1.0).rgb * 0.176037;
+    sum += textureSample(input_tex, samp, uv + dir *  2.0).rgb * 0.120985;
+    sum += textureSample(input_tex, samp, uv + dir *  3.0).rgb * 0.064759;
+    sum += textureSample(input_tex, samp, uv + dir *  4.0).rgb * 0.026995;
+    sum += textureSample(input_tex, samp, uv + dir *  5.0).rgb * 0.008764;
+    sum += textureSample(input_tex, samp, uv + dir *  6.0).rgb * 0.002216;
     return vec4f(sum, 1.0);
 }
