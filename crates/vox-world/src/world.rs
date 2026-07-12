@@ -86,18 +86,13 @@ impl<'w> SolidLookup<'w> {
             None => false,
         }
     }
-    /// Like [`present`](Self::present), but returns `true` for in-bounds
-    /// positions in **unloaded** chunks — treating them as potentially
-    /// solid rather than definitely air. Used by the connectivity flood
-    /// (`detach_unsupported`): in a streamed world, chunks beyond the
-    /// render distance don't exist in memory, but they're not empty —
-    /// terrain is there, just not generated yet. If the flood treated
-    /// them as air, every structure near the streaming boundary would
-    /// appear disconnected and detach as debris. Treating them as
-    /// potentially-solid lets the flood continue through unloaded
-    /// terrain and reach the floor (or the give-up cap), correctly
-    /// proving the structure is anchored.
-    pub fn present_or_unloaded(&mut self, v: IVec3) -> bool {
+    /// True if `v` is in-bounds but its chunk is not loaded (not in the
+    /// chunk map). Used by the connectivity flood: an unloaded chunk's
+    /// contents are unknown (terrain exists but hasn't been generated), so
+    /// the flood can't determine whether a structure connects through it.
+    /// The flood treats this as "unknown — assume anchored, don't extract"
+    /// rather than risking a false-positive detachment.
+    pub fn is_unloaded(&mut self, v: IVec3) -> bool {
         if !self.world.in_bounds(v) {
             return false;
         }
@@ -110,10 +105,7 @@ impl<'w> SolidLookup<'w> {
                 c
             }
         };
-        match chunk {
-            Some(c) => c.get(local_of(v)) != AIR,
-            None => true, // Unloaded chunk: assume solid (terrain exists, just not generated).
-        }
+        chunk.is_none()
     }
 }
 

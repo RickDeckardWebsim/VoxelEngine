@@ -358,6 +358,15 @@ enum FloodResult {
     /// The flood exhausted every reachable solid voxel while staying under
     /// the cap: a genuinely bounded, disconnected island. Its member voxels.
     Bounded(Vec<IVec3>),
+    /// The flood reached an unloaded chunk whose contents are unknown
+    /// (terrain exists but hasn't been generated in the streamed world).
+    /// Treated like `Anchored` — don't extract — because we can't prove
+    /// the structure is disconnected. The flood must not traverse through
+    /// phantom-solid voxels (every voxel in an unloaded chunk would read
+    /// as present, flooding through 32k+ phantom voxels and their unloaded
+    /// neighbors, almost always hitting the floor or give-up cap for the
+    /// wrong reason).
+    Unknown,
 }
 
 /// 6-connected flood from `start` through solid voxels, following the
@@ -404,7 +413,12 @@ fn flood_from(
         component.push(v);
         for d in DIRS {
             let n = v + d;
-            if lookup.present_or_unloaded(n) && visited.insert(n) {
+            if lookup.is_unloaded(n) {
+                // Unloaded chunk: contents unknown. Can't prove
+                // disconnection — assume anchored, don't extract.
+                return FloodResult::Unknown;
+            }
+            if lookup.present(n) && visited.insert(n) {
                 heap.push(Reverse(key(n)));
             }
         }
