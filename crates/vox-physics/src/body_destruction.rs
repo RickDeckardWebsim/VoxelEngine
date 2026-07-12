@@ -13,7 +13,7 @@
 use std::collections::VecDeque;
 
 use glam::{IVec3, Quat, Vec3};
-use vox_core::MaterialRegistry;
+use vox_core::{FxHashMap, FxHashSet, MaterialRegistry};
 use vox_core::consts::{DEBRIS_MIN_VOXELS, MAX_BODY_VOXELS};
 use vox_world::{AIR, Voxel};
 
@@ -482,36 +482,46 @@ fn spawn_impact_chips(
     };
     let speed = (impact_speed * IMPACT_CHIP_SPEED_SCALE).min(IMPACT_CHIP_MAX_SPEED_M_S);
 
+    // Build a map of removed voxels for O(1) adjacency + material lookup.
+    let removed_map: FxHashMap<IVec3, Voxel> = removed.iter().copied().collect();
+    let removed_set: FxHashSet<IVec3> = removed_map.keys().copied().collect();
+
     let mut ids = Vec::with_capacity(target);
     for &(h, i) in ranked.iter().take(target) {
-        let (v, mat) = removed[i];
-        let chip_center_world = parent.local_to_world_m(voxel_center_m(v, voxel_size_m));
-        // Chip shape: pick from 3 templates by hash (same variety as
-        // spawn_debris_chips in destruction.rs).
-        let template = h % 3;
-        let (dims, voxels) = if template == 0 {
-            let mut vs = vec![mat; 4];
-            vs[(h as usize) % 4] = AIR;
-            (IVec3::new(2, 2, 1), vs)
-        } else if template == 1 {
-            let mut vs = vec![AIR; 9];
-            vs[1] = mat; vs[3] = mat; vs[4] = mat; vs[5] = mat; vs[7] = mat;
-            (IVec3::new(3, 3, 1), vs)
-        } else {
-            let mut vs = vec![mat; 8];
-            vs[(h as usize) % 8] = AIR;
-            (IVec3::new(2, 2, 2), vs)
-        };
+        let (seed_vox, _mat) = removed[i];
+
+        // Build the chip from the actual removed voxels: flood-fill from
+        // the seed through the removed set (6-connected), up to a small
+        // cap. This produces a chunk shaped like the real carved material,
+        // not a generic template shape.
+        let cluster = crate::destruction::cluster_removed(&removed_set, seed_vox, 8);
+        if cluster.is_empty() {
+            continue;
+        }
+        let mut min = IVec3::splat(i32::MAX);
+        let mut max = IVec3::splat(i32::MIN);
+        for &v in &cluster {
+            min = min.min(v);
+            max = max.max(v);
+        }
+        let dims = max - min + IVec3::ONE;
+        let mut voxels = vec![AIR; (dims.x * dims.y * dims.z) as usize];
+        for &v in &cluster {
+            let mat = removed_map.get(&v).copied().unwrap_or(AIR);
+            let l = v - min;
+            voxels[grid_index(dims, l)] = mat;
+        }
         let grid = VoxelGrid::new(dims, voxels);
-        let Some(mut body) = Body::from_grid(grid, registry, voxel_size_m, chip_center_world)
+        let cluster_center_local = voxel_center_m(min, voxel_size_m)
+            + dims.as_vec3() * voxel_size_m * 0.5;
+        let cluster_center_world = parent.local_to_world_m(cluster_center_local);
+        let Some(mut body) = Body::from_grid(grid, registry, voxel_size_m, cluster_center_world)
         else {
             continue;
         };
 
-        // Radial scatter: blend the impact direction with a per-chip
-        // outward radial direction from the impact center. This makes
-        // debris fly outward from the hit point, not all in one stream.
-        let radial_dir = (chip_center_world - parent.pos).normalize_or(dir);
+        // Radial scatter from the cluster's actual position, not the seed.
+        let radial_dir = (cluster_center_world - parent.pos).normalize_or(dir);
         let blend = 0.4 + (small_hash(h, 42) as f32 / u32::MAX as f32) * 0.4; // 0.4..0.8
         let chip_dir = (dir * (1.0 - blend) + radial_dir * blend).normalize_or(dir);
         body.vel = parent.vel + chip_dir * speed;

@@ -46,11 +46,11 @@
 //! from debris floating forever. See [`FLOOD_GIVE_UP_VOXELS`].)
 
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, VecDeque};
 
 use glam::{IVec3, Vec3, Vec3Swizzles};
 use vox_core::consts::{DEBRIS_MIN_VOXELS, MAX_BODY_VOXELS};
-use vox_core::{FxHashSet, MaterialRegistry, voxel_at, voxel_center_m};
+use vox_core::{FxHashMap, FxHashSet, MaterialRegistry, voxel_at, voxel_center_m};
 use vox_world::{AIR, SolidLookup, Voxel, World};
 
 use crate::BodyId;
@@ -635,46 +635,49 @@ fn spawn_debris_chips(
         ranked.truncate(target);
     }
 
+    // Build a map of removed voxels for O(1) adjacency + material lookup.
+    let removed_map: FxHashMap<IVec3, Voxel> = removed.iter().copied().collect();
+    let removed_set: FxHashSet<IVec3> = removed_map.keys().copied().collect();
+
     let mut ids = Vec::with_capacity(target);
     for &(h, i) in ranked.iter().take(target) {
-        let (v, mat) = removed[i];
-        let chip_center_m = voxel_center_m(v, voxel_size_m);
-        // Chip shape: pick from 3 templates by hash for visual variety.
-        // All avoid the single-voxel and straight-bar degenerate cases
-        // (no torque-free axis of rotation — see the L-shape comment below).
-        // Template 0 (33%): 3-voxel L-triomino (2x2x1 minus one corner).
-        // Template 1 (33%): 5-voxel plus-sign (3x3x1 cross).
-        // Template 2 (33%): 7-voxel block (2x2x2 minus one corner).
-        // Larger chips (5, 7 voxels) are above CLUTTER_MAX_VOXELS (4) so
-        // they persist — smaller center rubble clears in 35-60s, larger
-        // edge chunks stay as permanent debris.
-        let template = h % 3;
-        let (dims, voxels) = if template == 0 {
-            // 3-voxel L-triomino: 2x2x1 minus one corner.
-            let mut vs = vec![mat; 4];
-            vs[(h as usize) % 4] = AIR;
-            (IVec3::new(2, 2, 1), vs)
-        } else if template == 1 {
-            // 5-voxel plus-sign: 3x3x1 cross, 4 arms + center.
-            let mut vs = vec![AIR; 9];
-            vs[1] = mat; // top
-            vs[3] = mat; // left
-            vs[4] = mat; // center
-            vs[5] = mat; // right
-            vs[7] = mat; // bottom
-            (IVec3::new(3, 3, 1), vs)
-        } else {
-            // 7-voxel block: 2x2x2 minus one corner.
-            let mut vs = vec![mat; 8];
-            vs[(h as usize) % 8] = AIR;
-            (IVec3::new(2, 2, 2), vs)
-        };
+        let (seed_vox, _mat) = removed[i];
+
+        // Build the chip from the actual removed voxels: flood-fill from
+        // the seed through the removed set (6-connected), up to a small
+        // cap. This produces a chunk shaped like the real carved material
+        // — a piece of tree trunk, a fragment of stone wall — not a
+        // generic template shape.
+        let cluster = cluster_removed(&removed_set, seed_vox, 8);
+        if cluster.is_empty() {
+            continue;
+        }
+        let mut min = IVec3::splat(i32::MAX);
+        let mut max = IVec3::splat(i32::MIN);
+        for &v in &cluster {
+            min = min.min(v);
+            max = max.max(v);
+        }
+        let dims = max - min + IVec3::ONE;
+        let mut voxels = vec![AIR; (dims.x * dims.y * dims.z) as usize];
+        for &v in &cluster {
+            let mat = removed_map.get(&v).copied().unwrap_or(AIR);
+            let l = v - min;
+            voxels[(l.x + l.z * dims.x + l.y * dims.x * dims.z) as usize] = mat;
+        }
         let grid = VoxelGrid::new(dims, voxels);
-        let Some(mut body) = Body::from_grid(grid, registry, voxel_size_m, chip_center_m) else {
+        // Position the body so the cluster's world-space voxels land where
+        // they were carved from. Body::from_grid places COM; we pass the
+        // cluster's bounding-box center as the initial position, which
+        // from_grid corrects to the actual COM.
+        let cluster_center_m = voxel_center_m(min, voxel_size_m)
+            + dims.as_vec3() * voxel_size_m * 0.5;
+        let Some(mut body) = Body::from_grid(grid, registry, voxel_size_m, cluster_center_m)
+        else {
             continue;
         };
 
-        let offset = chip_center_m - center_m;
+        let offset = cluster_center_m - center_m;
         let dist = offset.length();
         let dir = if dist > 1e-6 { offset / dist } else { Vec3::Y };
         let speed = (power * DEBRIS_CHIP_SPEED_SCALE / dist.max(BLAST_MIN_DIST_M))
@@ -691,6 +694,52 @@ fn spawn_debris_chips(
         ids.push(phys.spawn(body));
     }
     ids
+}
+
+/// Flood-fill through `removed` from `seed`, up to `cap` voxels. Returns
+/// the cluster of removed voxels connected to the seed (6-connected), up
+/// to the cap. Used to build chips shaped like the actual carved material
+/// instead of generic templates.
+///
+/// Returns an empty vec if the cluster is degenerate: fewer than 3 voxels
+/// (useless — no torque-free axis of rotation, bad inertia tensor) or
+/// all voxels collinear (a straight bar — torque-free along its axis,
+/// physically degenerate spin).
+pub(crate) fn cluster_removed(removed: &FxHashSet<IVec3>, seed: IVec3, cap: usize) -> Vec<IVec3> {
+    let mut cluster = Vec::with_capacity(cap);
+    let mut visited = FxHashSet::default();
+    let mut queue = VecDeque::new();
+    queue.push_back(seed);
+    visited.insert(seed);
+    while let Some(v) = queue.pop_front() {
+        cluster.push(v);
+        if cluster.len() >= cap {
+            break;
+        }
+        for d in DIRS {
+            let n = v + d;
+            if removed.contains(&n) && visited.insert(n) {
+                queue.push_back(n);
+            }
+        }
+    }
+    // Reject degenerate clusters: too small or all-collinear.
+    if cluster.len() < 3 {
+        return Vec::new();
+    }
+    if is_collinear(&cluster) {
+        return Vec::new();
+    }
+    cluster
+}
+
+/// True if all voxels in `cluster` lie on a single axis-aligned line.
+fn is_collinear(cluster: &[IVec3]) -> bool {
+    let min = cluster.iter().copied().fold(IVec3::splat(i32::MAX), IVec3::min);
+    let max = cluster.iter().copied().fold(IVec3::splat(i32::MIN), IVec3::max);
+    let span = max - min;
+    // Collinear if at most one axis has nonzero span.
+    span.x.min(1) + span.y.min(1) + span.z.min(1) <= 1
 }
 
 /// Carve a jagged [`ExplosionShape`] (not a plain sphere -- see its docs),
@@ -1311,8 +1360,9 @@ mod tests {
         for (_, body) in phys.iter() {
             let sc = body.grid.solid_count();
             assert!(
-                sc == 3 || sc == 5 || sc == 7,
-                "each chip is a small debris fragment (3/5/7 voxels), got {sc}"
+                sc >= 3 && sc <= 8,
+                "each chip is a small debris fragment (3-8 voxels from real \
+                 voxel clustering), got {sc}"
             );
             assert!(!body.sleep.asleep);
         }
