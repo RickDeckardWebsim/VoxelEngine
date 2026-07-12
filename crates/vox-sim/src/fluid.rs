@@ -50,15 +50,6 @@ pub struct FluidSim {
     /// tick. Rebuilt every tick alongside the active set -- empty whenever
     /// the water sleeps, so settled cost is still zero.
     momentum: FxHashMap<IVec3, IVec3>,
-    /// All voxel materials this sim treats as fluids (water, muddy_water, ...).
-    /// Each flows with the full CA rule. Set once at construction -- never
-    /// inferred from the active set. A single entry reproduces the original
-    /// single-water behavior exactly.
-    fluids: Vec<Voxel>,
-    /// Materials this sim treats as powders (fall + diagonal slide, no
-    /// spreading). Empty if the asset set defines no powders -- the sim
-    /// behaves as water-only. Set once at construction.
-    powders: Vec<Voxel>,
     /// O(1) material-type lookup indexed by `Voxel.0`. 256 bytes — fits
     /// L1. Eliminates the per-cell `Vec::contains` linear scan (called
     /// ~7× per active cell per tick: `is_simmed`, `is_fluid`, `is_powder`).
@@ -106,8 +97,7 @@ impl FluidSim {
         Self {
             active: FxHashSet::default(),
             momentum: FxHashMap::default(),
-            fluids,
-            powders,
+
             is_fluid_lut,
             is_powder_lut,
             rng: 0x9E37_79B9_7F4A_7C15,
