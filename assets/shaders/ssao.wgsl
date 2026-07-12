@@ -1,19 +1,23 @@
 // SSAO generation + blur. Two fragment entry points, one vertex shader.
-// Reconstructs view-space positions and normals from the depth buffer,
-// samples a hemisphere kernel, and outputs a per-pixel AO factor.
+// Reconstructs view-space positions from the depth buffer using the
+// inverse projection matrix, samples a hemisphere kernel, and outputs
+// a per-pixel AO factor.
+//
+// Uses proj/inv_proj (NOT view_proj) — SSAO works entirely in view space,
+// so the view matrix is irrelevant.
 
 struct SsaoParams {
-    inv_view_proj: mat4x4f,
-    view_proj: mat4x4f,
-    resolution: vec2f,
-    texel_size: vec2f,
+    proj: mat4x4f,       // projection matrix only (not view_proj)
+    inv_proj: mat4x4f,   // inverse projection matrix
+    texel_size: vec2f,   // 1.0 / half-res render target dims
+    depth_texel_size: vec2f,  // 1.0 / full-res depth texture dims
     radius: f32,
     intensity: f32,
     bias: f32,
     kernel_size: u32,
-    depth_texel_size: vec2f,  // 1.0 / depth_texture_dimensions (full-res)
     _pad: f32,
     _pad2: f32,
+    _pad3: f32,
 };
 
 @group(0) @binding(0) var<uniform> params: SsaoParams;
@@ -22,7 +26,6 @@ struct SsaoParams {
 @group(0) @binding(3) var<storage, read> kernel: array<vec4f>;
 @group(0) @binding(4) var ao_tex: texture_2d<f32>;
 
-// Fullscreen triangle: 3 vertices covering the screen (no vertex buffer).
 @vertex
 fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
     var p = array<vec2f, 3>(
@@ -33,20 +36,7 @@ fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
     return vec4f(p[vi], 0.0, 1.0);
 }
 
-fn view_pos_from_ndc(uv: vec2f, depth: f32) -> vec4f {
-    // glam's perspective_rh produces [0,1] clip Z (wgpu/D3D convention —
-    // see camera.rs:53, frustum.rs:29-30). The depth buffer stores this
-    // directly, so no remapping is needed. X and Y are still UV [0,1]
-    // → NDC [-1,1].
-    let clip = vec4f(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, depth, 1.0);
-    let view = params.inv_view_proj * clip;
-    return view / view.w;
-}
-
-// Load depth from the depth texture at UV coordinates using textureLoad
-// (integer texel fetch). texture_depth_2d cannot use textureSample with a
-// regular sampler — only textureSampleCompare with a comparison sampler —
-// so we fetch raw depth values via textureLoad instead.
+// Load raw depth [0,1] from the depth texture at UV.
 fn load_depth(uv: vec2f) -> f32 {
     let dims = textureDimensions(depth_tex);
     let c = clamp(uv, vec2f(0.0), vec2f(1.0));
@@ -54,6 +44,19 @@ fn load_depth(uv: vec2f) -> f32 {
     return textureLoad(depth_tex, texel, 0);
 }
 
+// Reconstruct view-space position from screen UV + depth.
+// UV [0,1] → NDC [-1,1] (X and Y). Depth is already [0,1] NDC Z
+// (glam perspective_rh, wgpu convention — camera.rs:53).
+fn view_pos_from_uv(uv: vec2f, depth: f32) -> vec3f {
+    // wgpu's @builtin(position) has Y=0 at top, but glam's perspective_rh
+    // expects NDC Y=+1 at top. Flip Y so reconstruction matches the
+    // projection matrix's convention.
+    let ndc = vec4f(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, depth, 1.0);
+    let view = params.inv_proj * ndc;
+    return view.xyz / view.w;
+}
+
+// Reconstruct view-space normal from depth gradients.
 fn reconstruct_normal(uv: vec2f, depth: f32) -> vec3f {
     let ts = params.depth_texel_size;
     let l = load_depth(uv + vec2f(-ts.x, 0.0));
@@ -61,11 +64,11 @@ fn reconstruct_normal(uv: vec2f, depth: f32) -> vec3f {
     let d = load_depth(uv + vec2f(0.0, -ts.y));
     let u = load_depth(uv + vec2f(0.0,  ts.y));
 
-    let p = view_pos_from_ndc(uv, depth).xyz;
-    let pl = view_pos_from_ndc(uv + vec2f(-ts.x, 0.0), l).xyz;
-    let pr = view_pos_from_ndc(uv + vec2f( ts.x, 0.0), r).xyz;
-    let pd = view_pos_from_ndc(uv + vec2f(0.0, -ts.y), d).xyz;
-    let pu = view_pos_from_ndc(uv + vec2f(0.0,  ts.y), u).xyz;
+    let p  = view_pos_from_uv(uv, depth);
+    let pl = view_pos_from_uv(uv + vec2f(-ts.x, 0.0), l);
+    let pr = view_pos_from_uv(uv + vec2f( ts.x, 0.0), r);
+    let pd = view_pos_from_uv(uv + vec2f(0.0, -ts.y), d);
+    let pu = view_pos_from_uv(uv + vec2f(0.0,  ts.y), u);
 
     let dx = pr - pl;
     let dy = pu - pd;
@@ -77,51 +80,59 @@ fn fs_ssao(@builtin(position) frag_pos: vec4f) -> @location(0) f32 {
     let uv = frag_pos.xy * params.texel_size;
     let depth = load_depth(uv);
 
+    // Sky pixels — no occlusion.
     if (depth >= 1.0) {
         return 1.0;
     }
-
-    let p = view_pos_from_ndc(uv, depth).xyz;
+    let p = view_pos_from_uv(uv, depth);
     let n = reconstruct_normal(uv, depth);
+    let _ = n; // Unused in screen-space AO; kept for future normal-oriented sampling.
 
-    // Build a TBN basis to rotate the tangent-space hemisphere kernel
-    // into view space aligned with the surface normal. Without this, the
-    // kernel samples along a fixed view-space direction and the AO detaches
-    // from geometry ("floating shadows").
-    let rvec = vec3f(0.123, 0.456, 0.789);
-    let tangent = normalize(rvec - n * dot(rvec, n));
-    let bitangent = cross(n, tangent);
-    let tbn = mat3x3f(tangent, bitangent, n);
-
+    // SSAO hemisphere sampling: for each kernel sample, project it
+    // from view space back to screen space, sample the depth buffer
+    // there, and check if geometry is closer than the sample point.
+    // If so, the sample is occluded → contribute to AO.
     var occlusion = 0.0;
-    let n_samples = i32(params.kernel_size);
-    for (var i = 0; i < n_samples; i = i + 1) {
-        let sample_dir = (tbn * kernel[i].xyz) * kernel[i].w;
-        let sample_pos = p + sample_dir * params.radius + n * params.bias;
+    for (var i = 0u; i < params.kernel_size; i = i + 1u) {
+        // Get the hemisphere sample direction + scale.
+        let sample_dir = kernel[i].xyz;
+        let sample_scale = kernel[i].w;
+        let sample_pos = p + sample_dir * sample_scale * params.radius;
 
-        let proj = params.view_proj * vec4f(sample_pos, 1.0);
-        let sample_ndc = proj.xy / proj.w;
-        // NDC to UV: flip Y because depth buffer origin is top-left.
-        let sample_uv = vec2f(sample_ndc.x * 0.5 + 0.5, 0.5 - sample_ndc.y * 0.5);
-
-        if (sample_uv.x < 0.0 || sample_uv.x > 1.0 || sample_uv.y < 0.0 || sample_uv.y > 1.0) {
-            continue;
-        }
-
+        // Project the sample point back to screen space. NDC Y=+1 is
+        // top (projection convention), but wgpu UV Y=0 is top — flip.
+        let projected = params.proj * vec4f(sample_pos, 1.0);
+        let sample_uv = vec2f(
+            projected.x / projected.w * 0.5 + 0.5,
+            1.0 - (projected.y / projected.w * 0.5 + 0.5),
+        );
         let sample_depth = load_depth(sample_uv);
-        let sample_view_z = view_pos_from_ndc(sample_uv, sample_depth).z;
 
-        let range_check = abs(p.z - sample_view_z) < params.radius;
-        if (sample_view_z > sample_pos.z && range_check) {
-            occlusion += 1.0;
+        // Reconstruct the view-space Z of the actual geometry at that UV.
+        let geom_z = view_pos_from_uv(sample_uv, sample_depth).z;
+
+        // If geometry is closer to the camera than the sample point
+        // (smaller Z in view space = closer in RH), the sample is
+        // occluded. The bias prevents self-occlusion on flat surfaces.
+        if (geom_z <= sample_pos.z + params.bias) {
+            // Smooth-step the occlusion by the distance ratio so
+            // samples far from the surface contribute less (prevents
+            // halos at depth discontinuities).
+            let range_check = smoothstep(
+                0.0,
+                1.0,
+                params.radius / abs(p.z - geom_z),
+            );
+            occlusion += range_check;
         }
     }
-    occlusion = occlusion / f32(n_samples);
 
-    return 1.0 - occlusion * params.intensity;
+    // Normalize and invert: 1.0 = no occlusion, 0.0 = fully occluded.
+    let ao = 1.0 - (occlusion / f32(params.kernel_size)) * params.intensity;
+    return clamp(ao, 0.0, 1.0);
 }
 
-// --- Blur pass: 3x3 box filter over the SSAO texture. ---
+// --- Blur pass: 3x3 box filter ---
 
 @fragment
 fn fs_blur(@builtin(position) frag_pos: vec4f) -> @location(0) f32 {

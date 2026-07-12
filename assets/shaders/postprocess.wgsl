@@ -72,9 +72,8 @@ fn fs(@builtin(position) frag_pos: vec4f) -> @location(0) vec4f {
 
     // Sample base color.
     var c = textureSample(color_tex, samp, uv).rgb;
-    // SSAO disabled — reconstruction issues produce visual artifacts.
-    // let ao = textureSample(ao_tex, samp, uv).r;
-    // c = c * ao;
+    let ao = textureSample(ao_tex, samp, uv).r;
+    c = c * ao;
 
     // Very subtle tone mapping — just a soft knee in highlights to
     // prevent harsh clipping, not full ACES which creates artifacts
@@ -90,9 +89,8 @@ fn fs(@builtin(position) frag_pos: vec4f) -> @location(0) vec4f {
     // Color grading: slight lift in shadows, warm tint, gentle contrast.
     c = c + vec3f(0.03);
     c = c * vec3f(1.02, 1.0, 0.98);
-    // Bloom disabled — needs tuning, currently produces artifacts.
-    // let bloom = textureSample(bloom_tex, samp, uv).rgb;
-    // c = c + bloom;
+    let bloom = textureSample(bloom_tex, samp, uv).rgb;
+    c = c + bloom;
 
     return vec4f(clamp(c, vec3f(0.0), vec3f(1.0)), 1.0);
 }
