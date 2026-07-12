@@ -433,6 +433,14 @@ impl World {
         std::mem::take(&mut self.dirty_regions)
     }
 
+    /// Mark a single chunk dirty (needs re-meshing). Used by the chunk
+    /// loader to re-mesh edited chunks whose GPU mesh was evicted but
+    /// whose voxel data persists — the remesh queue picks this up on the
+    /// next `absorb_dirty` call.
+    pub fn mark_dirty(&mut self, key: IVec3) {
+        self.dirty.insert(key);
+    }
+
     /// Mark `key` dirty, plus any face neighbor whose mesh can see `local`
     /// (border voxels affect the neighbor's face culling and AO).
     fn mark_dirty_with_neighbors(&mut self, key: IVec3, local: UVec3) {

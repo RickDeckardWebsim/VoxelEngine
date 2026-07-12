@@ -392,6 +392,11 @@ impl VoxelPipeline {
         self.chunks.len()
     }
 
+    /// True if this chunk currently has a resident GPU mesh.
+    pub fn has_chunk_mesh(&self, key: IVec3) -> bool {
+        self.chunks.contains_key(&key)
+    }
+
     /// Render all shadow-casting chunks into the shadow map via `shadow`. Called
     /// inside the shadow render pass (opened by the app with
     /// `shadow.shadow_view()` as its depth attachment). Culling uses the

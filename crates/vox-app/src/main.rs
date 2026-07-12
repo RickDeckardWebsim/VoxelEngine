@@ -33,7 +33,7 @@ use player::Player;
 use remesh::RemeshQueue;
 use tools::{CarveOutcome, HOTBAR, Tool, Tools};
 
-use vox_core::consts::CHUNK_SIZE;
+use vox_core::consts::{CHUNK_SIZE, REACH};
 use vox_core::{
     FrameProfile, FxHashMap, FxHashSet, MaterialId, MaterialRegistry, ScopedTimer, Tunables,
     WorldConfig, chunk_origin, voxel_at,
@@ -640,7 +640,7 @@ impl VoxApp {
         // Pre-generate spawn chunks before meshing and surface height
         // scan — both need solid voxels to exist. Disjoint field borrows.
         let center = Vec3::from(app.world.cfg.extent_m) * 0.5;
-        app.chunk_loader.pregenerate_spawn(center, &mut app.world, &mut app.pipeline, &app.gpu);
+        app.chunk_loader.pregenerate_spawn(center, &mut app.world);
 
         app.initial_mesh();
 
@@ -1151,6 +1151,29 @@ impl VoxApp {
             return;
         }
         if input.mouse_clicked(MouseButton::Left) {
+            // Ensure chunks at the tool's impact point are loaded before
+            // the carve — otherwise the tool hits air at the streaming
+            // boundary and the effect is lost.
+            let hit_point = eye + look * REACH;
+            let radius = self.tools.active_radius_m();
+            match self.tools.tool {
+                Tool::Bomb | Tool::ScalableDig => {
+                    self.chunk_loader.ensure_loaded_box(
+                        hit_point - Vec3::splat(radius),
+                        hit_point + Vec3::splat(radius),
+                        &mut self.world,
+                    );
+                }
+                Tool::DeathLaser => {
+                    // Ensure chunks along the beam up to REACH.
+                    self.chunk_loader.ensure_loaded_box(
+                        eye - Vec3::splat(REACH),
+                        eye + look * REACH + Vec3::splat(REACH),
+                        &mut self.world,
+                    );
+                }
+                _ => {}
+            }
             let outcome = match self.tools.tool {
                 Tool::Dig => {
                     self.tools
@@ -1980,9 +2003,9 @@ impl App for VoxApp {
         let player_pos = self.player.ctrl.pos;
         let _streamed = self.chunk_loader.update(
             player_pos,
+            self.player.ctrl.vel,
             &mut self.world,
             &mut self.pipeline,
-            &self.gpu,
         );
         if _streamed {
             self.grass_cache.invalidate();

@@ -10,7 +10,7 @@ use glam::{IVec3, Vec3};
 use vox_core::consts::CHUNK_SIZE;
 use vox_core::{WorldConfig, chunk_of, chunk_origin};
 use vox_gen::{ChunkBand, TerrainGen, TerrainMaterials, TreeMaterials, stamp_tree, trees_for_chunk};
-use vox_render::{Gpu, VoxelPipeline};
+use vox_render::VoxelPipeline;
 use vox_world::{Chunk, World};
 
 use crate::args::Quality;
@@ -69,31 +69,36 @@ impl ChunkLoader {
         &mut self,
         player_pos: Vec3,
         world: &mut World,
-        pipeline: &mut VoxelPipeline,
-        gpu: &Gpu,
     ) {
         let center = Self::player_chunk(player_pos, world.cfg.voxel_size_m);
         let ring = self.quality.detail_ring();
         let radius = ring.max(2); // At least 2 chunks for spawn.
-        self.generate_ring(world, pipeline, gpu, center, radius, ring);
+        self.generate_ring(world, center, radius, ring);
         self.last_center_chunk = center;
     }
 
     /// Per-frame update: generate missing chunks near the player, evict
-    /// chunks beyond render distance. Returns whether any changes were made.
+    /// chunks beyond render distance, re-mesh edited chunks whose GPU
+    /// mesh was dropped, and pre-generate ahead of the player's movement.
+    /// Returns whether any changes were made.
     pub fn update(
         &mut self,
         player_pos: Vec3,
+        player_vel: Vec3,
         world: &mut World,
         pipeline: &mut VoxelPipeline,
-        gpu: &Gpu,
     ) -> bool {
         let s = world.cfg.voxel_size_m;
         let center = Self::player_chunk(player_pos, s);
 
-        // Only act when the player crossed a chunk boundary.
+        // Pre-generate ahead of the player every frame (outside the
+        // boundary-crossing gate) so chunks are ready before arrival.
+        let pregen = self.pregen_ahead(player_pos, player_vel, world);
+
+        // Only do the heavy generation + eviction + reconciliation pass
+        // when the player crossed a chunk boundary.
         if (center - self.last_center_chunk).abs().max_element() < RELOAD_THRESHOLD_CHUNKS {
-            return false;
+            return pregen;
         }
         self.last_center_chunk = center;
 
@@ -102,12 +107,122 @@ impl ChunkLoader {
         let budget = self.quality.gen_budget();
 
         // Generate missing chunks (up to budget, nearest first).
-        let generated = self.generate_missing(world, pipeline, gpu, center, render_dist, detail_ring, budget);
+        let generated = self.generate_missing(world, center, render_dist, detail_ring, budget);
 
         // Evict chunks beyond render distance.
         let evicted = self.evict_beyond_range(world, pipeline, center, render_dist);
 
-        generated || evicted
+        // Reconcile: re-mesh edited chunks that have data but no GPU mesh
+        // (evicted earlier, player walked back). Only check edited chunks
+        // — pristine chunks with no mesh are either freshly generated
+        // (already dirty) or absent. Mark them dirty so the remesh queue
+        // picks them up next frame.
+        let mut reconciled = false;
+        for dz in -render_dist..=render_dist {
+            for dy in -render_dist..=render_dist {
+                for dx in -render_dist..=render_dist {
+                    let key = center + IVec3::new(dx, dy, dz);
+                    if world.is_edited(key)
+                        && world.chunk_at(key).is_some()
+                        && !pipeline.has_chunk_mesh(key)
+                    {
+                        world.mark_dirty(key);
+                        reconciled = true;
+                    }
+                }
+            }
+        }
+
+        generated || evicted || reconciled || pregen
+    }
+
+    /// Synchronously generate a chunk at `key` if it doesn't exist and is
+    /// within world bounds. Used before destructive/fluid operations that
+    /// might cross into unloaded territory.
+    pub fn ensure_loaded(
+        &self,
+        world: &mut World,
+        key: IVec3,
+    ) {
+        if world.chunk_at(key).is_some() {
+            return;
+        }
+        let (bmin, bmax) = world.bounds_voxels();
+        let chunk_min = chunk_of(bmin);
+        let chunk_max = chunk_of(bmax - IVec3::ONE);
+        if key.x < chunk_min.x || key.x > chunk_max.x { return; }
+        if key.y < chunk_min.y || key.y > chunk_max.y { return; }
+        if key.z < chunk_min.z || key.z > chunk_max.z { return; }
+        let center = self.last_center_chunk;
+        let detail_ring = self.quality.detail_ring();
+        self.generate_chunk(world, key, center, detail_ring);
+        world.mark_dirty(key);
+    }
+
+    /// Ensure all chunks overlapping the world-space box `[min_m, max_m]`
+    /// are loaded. Used before bomb/dig operations with a known radius.
+    pub fn ensure_loaded_box(
+        &self,
+        min_m: Vec3,
+        max_m: Vec3,
+        world: &mut World,
+    ) {
+        let s = world.cfg.voxel_size_m;
+        let min_vox = (min_m / s).floor().as_ivec3();
+        let max_vox = (max_m / s).ceil().as_ivec3();
+        let min_chunk = chunk_of(min_vox);
+        let max_chunk = chunk_of(max_vox);
+        for cz in min_chunk.z..=max_chunk.z {
+            for cy in min_chunk.y..=max_chunk.y {
+                for cx in min_chunk.x..=max_chunk.x {
+                    self.ensure_loaded(world, IVec3::new(cx, cy, cz));
+                }
+            }
+        }
+    }
+
+    /// Pre-generate chunks ahead of the player based on velocity. Runs
+    /// every frame with a small budget (1-3 chunks) outside the boundary
+    /// gate. Predicts the player's position ~1 second ahead and generates
+    /// the 3×3 horizontal ring around the predicted chunk.
+    fn pregen_ahead(
+        &self,
+        player_pos: Vec3,
+        player_vel: Vec3,
+        world: &mut World,
+    ) -> bool {
+        if player_vel.length_squared() < 0.01 {
+            return false;
+        }
+        let s = world.cfg.voxel_size_m;
+        let next_pos = player_pos + player_vel * 1.0; // 1-second look-ahead
+        let next_chunk = Self::player_chunk(next_pos, s);
+        let center = self.last_center_chunk;
+        let detail_ring = self.quality.detail_ring();
+        let mut generated = false;
+        let mut budget = 3; // Small per-frame pre-gen budget
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                if budget == 0 {
+                    break;
+                }
+                let key = IVec3::new(next_chunk.x + dx, next_chunk.y, next_chunk.z + dz);
+                if world.chunk_at(key).is_some() {
+                    continue;
+                }
+                let (bmin, bmax) = world.bounds_voxels();
+                let chunk_min = chunk_of(bmin);
+                let chunk_max = chunk_of(bmax - IVec3::ONE);
+                if key.x < chunk_min.x || key.x > chunk_max.x { continue; }
+                if key.y < chunk_min.y || key.y > chunk_max.y { continue; }
+                if key.z < chunk_min.z || key.z > chunk_max.z { continue; }
+                self.generate_chunk(world, key, center, detail_ring);
+                world.mark_dirty(key);
+                budget -= 1;
+                generated = true;
+            }
+        }
+        generated
     }
 
     /// Generate missing chunks within render distance, up to `budget`,
@@ -115,8 +230,6 @@ impl ChunkLoader {
     fn generate_missing(
         &self,
         world: &mut World,
-        pipeline: &mut VoxelPipeline,
-        gpu: &Gpu,
         center: IVec3,
         render_dist: i32,
         detail_ring: i32,
@@ -145,7 +258,7 @@ impl ChunkLoader {
 
         let mut generated = false;
         for (_, key) in missing.into_iter().take(budget) {
-            self.generate_chunk(world, pipeline, gpu, key, center, detail_ring);
+            self.generate_chunk(world, key, center, detail_ring);
             generated = true;
         }
         generated
@@ -155,8 +268,6 @@ impl ChunkLoader {
     fn generate_ring(
         &self,
         world: &mut World,
-        pipeline: &mut VoxelPipeline,
-        gpu: &Gpu,
         center: IVec3,
         radius: i32,
         detail_ring: i32,
@@ -173,7 +284,7 @@ impl ChunkLoader {
                     if key.y < chunk_min.y || key.y > chunk_max.y { continue; }
                     if key.z < chunk_min.z || key.z > chunk_max.z { continue; }
                     if world.chunk_at(key).is_some() { continue; }
-                    self.generate_chunk(world, pipeline, gpu, key, center, detail_ring);
+                    self.generate_chunk(world, key, center, detail_ring);
                 }
             }
         }
@@ -195,8 +306,6 @@ impl ChunkLoader {
     fn generate_chunk(
         &self,
         world: &mut World,
-        _pipeline: &mut VoxelPipeline,
-        _gpu: &Gpu,
         key: IVec3,
         center_chunk: IVec3,
         detail_ring: i32,
@@ -228,27 +337,31 @@ impl ChunkLoader {
                 let clip_max = origin + IVec3::splat(CHUNK_SIZE as i32);
                 world.set_clip(clip_min, clip_max);
 
-                // Canopy reach is ~5m; at 0.1m voxels that's ~50 voxels
-                // (< 2 chunks of 3.2m), at 1.0m voxels it's < 1 chunk
-                // (32m). A 5x5 neighborhood (±2 chunks) is conservative
-                // and the inner loop is cheap (trees_for_chunk returns
-                // ~0-3 trees per chunk).
-                const CANOPY_REACH_CHUNKS: i32 = 2;
-                for dz in -CANOPY_REACH_CHUNKS..=CANOPY_REACH_CHUNKS {
-                    for dx in -CANOPY_REACH_CHUNKS..=CANOPY_REACH_CHUNKS {
-                        let neighbor = IVec3::new(key.x + dx, key.y, key.z + dz);
-                        // Root-chunk-tier gate: only stamp from near
-                        // (detail-ring) root chunks. Self (dx=0, dz=0) is
-                        // included when this chunk is in the detail ring,
-                        // excluded when it's far.
-                        let ndx = neighbor.x - center_chunk.x;
-                        let ndz = neighbor.z - center_chunk.z;
-                        if ndx.abs() > detail_ring || ndz.abs() > detail_ring {
-                            continue;
-                        }
-                        let trees = trees_for_chunk(&world.cfg, &self.terrain, neighbor);
-                        for tree in &trees {
-                            stamp_tree(world, tree, self.tree_mats);
+                // Canopy reach: trees grow up to ~12.2m (10m trunk + 2.2m
+                // crown). Compute chunk-count reach from the world's voxel
+                // size so it's correct at any scale.
+                let chunk_m = CHUNK_SIZE as f32 * s;
+                let canopy_reach_h: i32 = 2; // canopy radius ~2.2m < 1 chunk at 0.1m
+                let canopy_reach_v: i32 = ((12.2 / chunk_m).ceil() as i32 + 1).max(1);
+                // Trees grow up, not down: dy from -canopy_reach_v to 0.
+                for dy in -canopy_reach_v..=0 {
+                    for dz in -canopy_reach_h..=canopy_reach_h {
+                        for dx in -canopy_reach_h..=canopy_reach_h {
+                            let neighbor = IVec3::new(key.x + dx, key.y + dy, key.z + dz);
+                            // Root-chunk-tier gate: only stamp from near
+                            // (detail-ring) root chunks. The gate is
+                            // horizontal-only — trees root at a specific Y.
+                            // Self (dx=0, dz=0, dy=0) is included when this
+                            // chunk is in the detail ring.
+                            let ndx = neighbor.x - center_chunk.x;
+                            let ndz = neighbor.z - center_chunk.z;
+                            if ndx.abs() > detail_ring || ndz.abs() > detail_ring {
+                                continue;
+                            }
+                            let trees = trees_for_chunk(&world.cfg, &self.terrain, neighbor);
+                            for tree in &trees {
+                                stamp_tree(world, tree, self.tree_mats);
+                            }
                         }
                     }
                 }
