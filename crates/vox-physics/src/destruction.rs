@@ -404,7 +404,7 @@ fn flood_from(
         component.push(v);
         for d in DIRS {
             let n = v + d;
-            if lookup.present(n) && visited.insert(n) {
+            if lookup.present_or_unloaded(n) && visited.insert(n) {
                 heap.push(Reverse(key(n)));
             }
         }
