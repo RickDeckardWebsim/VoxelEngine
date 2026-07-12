@@ -1811,6 +1811,25 @@ impl App for VoxApp {
 
         let fluid_timing = self.fluid_clock.advance(timing.dt_frame);
         for _ in 0..fluid_timing.physics_steps {
+            // Ensure chunks adjacent to active fluid are loaded — water
+            // flowing into an unloaded chunk allocates an empty chunk
+            // (no terrain), which then blocks proper generation.
+            {
+                const DIRS6: [IVec3; 6] = [
+                    IVec3::X, IVec3::NEG_X, IVec3::Y,
+                    IVec3::NEG_Y, IVec3::Z, IVec3::NEG_Z,
+                ];
+                let neighbor_chunks: FxHashSet<IVec3> = self
+                    .fluid
+                    .active_chunk_keys()
+                    .flat_map(|ck| DIRS6.into_iter().map(move |d| ck + d))
+                    .collect();
+                for ck in neighbor_chunks {
+                    if self.world.chunk_at(ck).is_none() {
+                        self.chunk_loader.ensure_loaded(&mut self.world, ck);
+                    }
+                }
+            }
             self.fluid.tick(&mut self.world);
             if let Some(w) = &mut self.weathering {
                 let events = self.fluid.drain_events();

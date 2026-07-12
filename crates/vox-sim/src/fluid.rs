@@ -2,7 +2,7 @@
 //! `docs/plans/2026-07-09-fluid-sim-design.md` for the rationale.
 
 use glam::IVec3;
-use vox_core::{FxHashMap, FxHashSet};
+use vox_core::{FxHashMap, FxHashSet, chunk_of};
 use vox_world::{AIR, Voxel, World};
 
 const NEIGHBORS_6: [IVec3; 6] = [
@@ -134,6 +134,14 @@ impl FluidSim {
     /// Number of cells currently flowing (debug-overlay stat).
     pub fn active_count(&self) -> usize {
         self.active.len()
+    }
+
+    /// Chunk keys containing at least one active fluid/powder cell. Used
+    /// by the app to ensure neighbor chunks are loaded before a fluid
+    /// tick — water flowing into an unloaded chunk allocates a water-only
+    /// chunk (no terrain), which blocks proper generation.
+    pub fn active_chunk_keys(&self) -> impl Iterator<Item = IVec3> + '_ {
+        self.active.iter().map(|&p| chunk_of(p))
     }
 
     /// Number of cells carrying momentum (debug-overlay stat / tests).
