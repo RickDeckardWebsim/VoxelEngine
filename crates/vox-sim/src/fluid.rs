@@ -59,6 +59,11 @@ pub struct FluidSim {
     /// spreading). Empty if the asset set defines no powders -- the sim
     /// behaves as water-only. Set once at construction.
     powders: Vec<Voxel>,
+    /// O(1) material-type lookup indexed by `Voxel.0`. 256 bytes — fits
+    /// L1. Eliminates the per-cell `Vec::contains` linear scan (called
+    /// ~7× per active cell per tick: `is_simmed`, `is_fluid`, `is_powder`).
+    is_fluid_lut: [bool; 256],
+    is_powder_lut: [bool; 256],
     /// xorshift64* state for randomized per-tick update order (same
     /// construction as `PhysicsWorld::lifetime_rng` / `ParticleSystem`'s
     /// spawn jitter) -- avoids a visible left/right or diagonal bias in how
@@ -66,6 +71,12 @@ pub struct FluidSim {
     rng: u64,
     /// This tick's `ContactEvent`s (see the enum's docs for the bound).
     events: Vec<ContactEvent>,
+    /// Scratch buffers reused across ticks to avoid per-tick heap
+    /// allocation. Cleared (not dropped) at the start of each tick, so
+    /// capacity persists: a 50k-cell flood allocates once, then reuses.
+    scratch_cells: Vec<IVec3>,
+    scratch_active: FxHashSet<IVec3>,
+    scratch_momentum: FxHashMap<IVec3, IVec3>,
 }
 
 impl FluidSim {
@@ -84,13 +95,26 @@ impl FluidSim {
     /// Create a sim handling multiple fluid materials and powder materials.
     /// Each fluid flows with the full CA rule; each powder falls and piles.
     pub fn with_fluids_and_powders(fluids: Vec<Voxel>, powders: Vec<Voxel>) -> Self {
+        let mut is_fluid_lut = [false; 256];
+        let mut is_powder_lut = [false; 256];
+        for &f in &fluids {
+            is_fluid_lut[f.0 as usize] = true;
+        }
+        for &p in &powders {
+            is_powder_lut[p.0 as usize] = true;
+        }
         Self {
             active: FxHashSet::default(),
             momentum: FxHashMap::default(),
             fluids,
             powders,
+            is_fluid_lut,
+            is_powder_lut,
             rng: 0x9E37_79B9_7F4A_7C15,
             events: Vec::new(),
+            scratch_cells: Vec::new(),
+            scratch_active: FxHashSet::default(),
+            scratch_momentum: FxHashMap::default(),
         }
     }
 
@@ -100,18 +124,21 @@ impl FluidSim {
     }
 
     /// Whether `v` is a fluid material this sim handles.
+    #[inline]
     fn is_fluid(&self, v: Voxel) -> bool {
-        self.fluids.contains(&v)
+        self.is_fluid_lut[v.0 as usize]
     }
 
     /// Whether `v` is a material this sim handles (fluid or a powder).
+    #[inline]
     fn is_simmed(&self, v: Voxel) -> bool {
-        self.is_fluid(v) || self.powders.contains(&v)
+        self.is_fluid_lut[v.0 as usize] || self.is_powder_lut[v.0 as usize]
     }
 
     /// Whether `v` is a powder material this sim handles.
+    #[inline]
     fn is_powder(&self, v: Voxel) -> bool {
-        self.powders.contains(&v)
+        self.is_powder_lut[v.0 as usize]
     }
 
     /// Number of cells currently flowing (debug-overlay stat).
@@ -174,8 +201,6 @@ impl FluidSim {
     /// propagation pass needed.
     pub fn tick(&mut self, world: &mut World) -> usize {
         self.events.clear();
-        let fluids = self.fluids.clone();
-        let is_fluid = |v: Voxel| fluids.contains(&v);
 
         // Snapshot exactly the positions that hold a simmed material *before*
         // any mutation this tick, and process only those. A live re-check
@@ -187,15 +212,24 @@ impl FluidSim {
         // can never target a cell that already holds material -- `is_open`
         // only accepts AIR), so each snapshot position is guaranteed to still
         // be valid when its turn comes.
-        let cells: Vec<IVec3> = self
-            .active
-            .iter()
-            .copied()
-            .filter(|&p| self.is_simmed(world.get_voxel(p)))
-            .collect();
+        // Reuse scratch_cells instead of allocating a fresh Vec every tick.
+        // Take it out of self to avoid borrowing self while filling it.
+        let mut cells = std::mem::take(&mut self.scratch_cells);
+        cells.clear();
+        cells.extend(
+            self.active
+                .iter()
+                .copied()
+                .filter(|&p| self.is_simmed(world.get_voxel(p))),
+        );
 
-        let mut next_active = FxHashSet::default();
-        let mut next_momentum = FxHashMap::default();
+        // Double-buffer: swap active/momentum into scratch (preserving their
+        // capacity for next tick), then build the new sets in self.active/
+        // self.momentum directly. No per-tick allocation.
+        std::mem::swap(&mut self.active, &mut self.scratch_active);
+        std::mem::swap(&mut self.momentum, &mut self.scratch_momentum);
+        self.active.clear();
+        self.momentum.clear();
 
         // Every active cell is processed every tick -- no per-tick cell
         // budget. Flow speed is therefore volume-independent: a 500-cell
@@ -207,7 +241,7 @@ impl FluidSim {
         // within a single tick.
         let processed = cells.len();
 
-        for pos in cells {
+        for &pos in &cells {
             let v = world.get_voxel(pos);
             let is_powder = self.is_powder(v);
             let coin = self.next_u64() & 1 == 0;
@@ -218,9 +252,10 @@ impl FluidSim {
                     step_powder(pos, &mut is_open, coin, coin2)
                 } else {
                     let mut is_supported = |p: IVec3| {
-                        world.in_bounds(p) && (world.solid(p) || is_fluid(world.get_voxel(p)))
+                        world.in_bounds(p)
+                            && (world.solid(p) || self.is_fluid(world.get_voxel(p)))
                     };
-                    let has_fluid_above = is_fluid(world.get_voxel(pos + IVec3::Y));
+                    let has_fluid_above = self.is_fluid(world.get_voxel(pos + IVec3::Y));
                     step_cell_with_momentum(
                         pos,
                         &mut is_open,
@@ -228,7 +263,7 @@ impl FluidSim {
                         has_fluid_above,
                         coin,
                         coin2,
-                        self.momentum.get(&pos).copied(),
+                        self.scratch_momentum.get(&pos).copied(),
                     )
                 }
             };
@@ -236,7 +271,7 @@ impl FluidSim {
                 // Write the cell's own material back -- water or powder.
                 world.set_voxel(pos, AIR);
                 world.set_voxel(dest, v);
-                next_active.insert(dest);
+                self.active.insert(dest);
                 self.events.push(ContactEvent::Vacated(pos));
                 self.events.push(if dest.y < pos.y {
                     ContactEvent::Fell(dest)
@@ -249,10 +284,10 @@ impl FluidSim {
                     let carried = if hdir != IVec3::ZERO {
                         Some(hdir)
                     } else {
-                        self.momentum.get(&pos).copied()
+                        self.scratch_momentum.get(&pos).copied()
                     };
                     if let Some(d) = carried {
-                        next_momentum.insert(dest, d);
+                        self.momentum.insert(dest, d);
                     }
                 }
                 // Wake same-material neighbors of both the old and new
@@ -265,17 +300,17 @@ impl FluidSim {
                         let neighbor = changed + n;
                         let nv = world.get_voxel(neighbor);
                         if self.is_simmed(nv) {
-                            next_active.insert(neighbor);
+                            self.active.insert(neighbor);
                             // Only water inherits momentum.
-                            if !is_powder && is_fluid(nv) {
+                            if !is_powder && self.is_fluid(nv) {
                                 let hdir = IVec3::new(dest.x - pos.x, 0, dest.z - pos.z);
                                 let carried = if hdir != IVec3::ZERO {
                                     Some(hdir)
                                 } else {
-                                    self.momentum.get(&pos).copied()
+                                    self.scratch_momentum.get(&pos).copied()
                                 };
                                 if let Some(d) = carried {
-                                    next_momentum.entry(neighbor).or_insert(d);
+                                    self.momentum.entry(neighbor).or_insert(d);
                                 }
                             }
                         }
@@ -286,8 +321,12 @@ impl FluidSim {
                 self.events.push(ContactEvent::Settled(pos));
             }
         }
-        self.active = next_active;
-        self.momentum = next_momentum;
+        // Return the cell buffer to scratch so its capacity persists.
+        self.scratch_cells = cells;
+        // Clear the swapped-out old sets so their capacity persists for
+        // next tick's double-buffer swap.
+        self.scratch_active.clear();
+        self.scratch_momentum.clear();
         processed
     }
 

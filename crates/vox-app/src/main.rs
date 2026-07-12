@@ -1792,6 +1792,10 @@ impl App for VoxApp {
             if let Some(w) = &mut self.weathering {
                 let events = self.fluid.drain_events();
                 w.tick(&mut self.world, &events);
+            } else {
+                // Weathering disabled — still drain to prevent unbounded
+                // events growth (2 entries per active cell per tick).
+                self.fluid.drain_events();
             }
             let mut spawned_ids = Vec::new();
             let mut remesh_ids: FxHashSet<BodyId> = FxHashSet::default();
