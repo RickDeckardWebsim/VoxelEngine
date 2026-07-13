@@ -12,10 +12,16 @@ pub const PHYSICS_DT: f32 = 1.0 / 60.0;
 /// tick rate (active-cell sleeping), so this mainly caps worst-case cost
 /// during a big flood event, not steady-state cost.
 pub const FLUID_DT: f32 = 1.0 / 15.0;
-/// Physics substeps per fixed step.
-pub const SUBSTEPS: u32 = 2;
-/// Velocity solver iterations per substep.
-pub const SOLVER_ITERS: u32 = 8;
+/// Physics substeps per fixed step. Box2D 3.0 / Teardown research: more
+/// substeps with fewer iterations per substep gives better stability for
+/// stacks and chains. Each substep updates contact anchors and geometry
+/// more frequently.
+pub const SUBSTEPS: u32 = 4;
+/// Velocity solver iterations per substep. Kept low (2) because the
+/// increased substep count re-derives contact geometry often enough that
+/// fewer inner iterations suffice; total passes are halved (4×2 = 8 vs
+/// the old 2×8 = 16), traded for fresher contact data each pass.
+pub const SOLVER_ITERS: u32 = 2;
 /// Baumgarte positional-correction factor for contacts.
 pub const CONTACT_BETA: f32 = 0.2;
 /// Allowed contact penetration in meters.
