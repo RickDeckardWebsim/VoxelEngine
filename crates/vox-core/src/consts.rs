@@ -32,6 +32,16 @@ pub const SOLVER_ITERS: u32 = 2;
 /// iterations are joints-only (contacts are already converged), so the
 /// cost is proportional to joint count, not contact count.
 pub const JOINT_ITERS: u32 = 8;
+/// Baumgarte positional-correction factor for joint distance constraints.
+/// Drives the joint back toward rest_length each substep. Lower than
+/// contact beta to avoid oscillation in chains: correcting one joint
+/// changes the distance of its neighbor, so a high beta creates
+/// visible bounce. 0.1 converges in ~10 substeps without overshoot.
+pub const JOINT_BETA: f32 = 0.1;
+/// Ceiling on how far one joint may move a body per position iteration,
+/// in meters — prevents a badly stretched joint from snapping a body
+/// back to rest_length in one frame.
+pub const MAX_JOINT_CORRECTION_M: f32 = 0.02;
 /// Baumgarte positional-correction factor for contacts.
 pub const CONTACT_BETA: f32 = 0.2;
 /// Allowed contact penetration in meters.

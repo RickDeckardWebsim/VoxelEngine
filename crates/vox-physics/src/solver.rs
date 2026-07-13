@@ -8,7 +8,7 @@
 use glam::{IVec3, Mat3, Quat, Vec3};
 use vox_core::consts::{
     CLUTTER_LIFETIME_MAX_S, CLUTTER_LIFETIME_MIN_S, CLUTTER_MAX_VOXELS, CONTACT_SLOP, GRAVITY,
-    JOINT_ITERS, SLEEP_FRAMES, SOLVER_ITERS, SUBSTEPS,
+    JOINT_BETA, JOINT_ITERS, MAX_JOINT_CORRECTION_M, SLEEP_FRAMES, SOLVER_ITERS, SUBSTEPS,
 };
 use vox_core::{FxHashMap, Tunables};
 use vox_world::{SolidLookup, Voxel, World};
@@ -1016,12 +1016,54 @@ impl PhysicsWorld {
                     None => self.pos_corr[c.body] += c.normal * push,
                 }
             }
-            // Joint position correction disabled — velocity solve alone
-            // prevents explosion. Position correction in a joint chain
-            // creates a feedback loop (correcting one joint violates the
-            // next), causing solver divergence and frame-rate death.
-            // The velocity-only solve allows slight sag under gravity,
-            // which is acceptable for flexible rope.
+            // Joint position correction: drive distance back toward
+            // rest_length. Without this, gravity-induced position drift
+            // accumulates every substep and the chain slowly sags. Low
+            // beta (0.1) converges over ~10 substeps without overshoot;
+            // the per-iteration cap prevents a stretched joint from
+            // snapping a body back in one frame. Pinned/sleeping bodies
+            // are treated as static (don't move, but their position still
+            // counts in the distance calculation).
+            for j in &self.joints {
+                let (Some(ba), Some(bb)) = (self.slots[j.body_a].as_ref(), self.slots[j.body_b].as_ref()) else { continue };
+                let static_a = ba.sleep.asleep || ba.pinned;
+                let static_b = bb.sleep.asleep || bb.pinned;
+                if static_a && static_b {
+                    continue;
+                }
+                let ra = ba.rot * j.anchor_a;
+                let rb = bb.rot * j.anchor_b;
+                let d = (bb.pos + rb) - (ba.pos + ra);
+                let dist = d.length();
+                if dist < 1e-6 {
+                    continue;
+                }
+                let n = d / dist;
+                let error = dist - j.rest_length;
+                // Only correct stretching (error > 0), not compression —
+                // compressing a rope is physically fine (it can fold).
+                if error <= 0.0 {
+                    continue;
+                }
+                let corr_b = self.pos_corr[j.body_b];
+                let corr_a = self.pos_corr[j.body_a];
+                let already = (corr_a - corr_b).dot(n);
+                let remaining = error - already;
+                if remaining <= 0.0 {
+                    continue;
+                }
+                let push = (JOINT_BETA * remaining).min(MAX_JOINT_CORRECTION_M);
+                let ia = if static_a { 0.0 } else { ba.inv_mass };
+                let ib = if static_b { 0.0 } else { bb.inv_mass };
+                let w = ia + ib;
+                if w <= 0.0 {
+                    continue;
+                }
+                // n points from a to b; to reduce distance, push a toward b
+                // (+n) and b toward a (-n), weighted by inverse mass.
+                self.pos_corr[j.body_a] += n * (push * ia / w);
+                self.pos_corr[j.body_b] -= n * (push * ib / w);
+            }
         }
         for (slot, entry) in self.slots.iter_mut().enumerate() {
             let Some(body) = entry else { continue };
