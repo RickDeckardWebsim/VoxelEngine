@@ -183,6 +183,64 @@ pub fn world_contacts(body: &Body, slot: usize, out: &mut Vec<Contact>, lookup: 
     }
 }
 
+/// Generate lightweight AABB-based world contacts for jointed bodies.
+/// Instead of per-voxel surface points (dozens of contacts that create
+/// feedback loops with joints), this checks the body's AABB faces
+/// against terrain and generates at most 6 contacts (one per face).
+/// Uses stable face IDs (6-11) for warm-start key stability.
+///
+/// Rope segments rest on terrain instead of falling through, without
+/// the solver divergence per-voxel contacts caused.
+pub fn aabb_world_contacts(
+    body: &Body,
+    slot: usize,
+    out: &mut Vec<Contact>,
+    lookup: &mut SolidLookup,
+) {
+    let s = lookup.world_cfg().voxel_size_m;
+    let inv_iw = body.inv_iw;
+    let center = (body.aabb_min + body.aabb_max) * 0.5;
+    let half_ext = (body.aabb_max - body.aabb_min) * 0.5;
+
+    // Stable face IDs for AABB contacts (above the 0-5 used by
+    // per-voxel contacts, so keys never collide).
+    const AABB_FACE_IDS: [(u8, IVec3); 6] = [
+        (6, IVec3::X),    // +X face
+        (7, IVec3::NEG_X), // -X face
+        (8, IVec3::Y),    // +Y face (top)
+        (9, IVec3::NEG_Y), // -Y face (bottom — most common for resting)
+        (10, IVec3::Z),   // +Z face
+        (11, IVec3::NEG_Z), // -Z face
+    ];
+
+    for &(face_id, dir) in &AABB_FACE_IDS {
+        let axis = (face_id - 6) as usize / 2;
+        let face_pos = center + dir.as_vec3() * half_ext;
+        let face_vox = voxel_at(face_pos, s);
+        if !lookup.solid(face_vox) {
+            continue;
+        }
+        // Find the nearest air neighbor to determine push direction.
+        let mut best: Option<(Vec3, f32, u8)> = None;
+        for (pid, pdir) in FACE_DIRS {
+            if lookup.solid(face_vox + pdir) {
+                continue;
+            }
+            let d = face_dist(face_pos, face_vox, pdir, s);
+            if d < half_ext[axis] {
+                if best.is_none_or(|(_, bd, _)| d < bd) {
+                    best = Some((pdir.as_vec3(), d, pid));
+                }
+            }
+        }
+        if let Some((push_n, d, pid)) = best {
+            let r_arm = face_pos - body.pos;
+            let depth = half_ext[axis] - d;
+            push_world_contact(out, body, slot, r_arm, push_n, depth, 0, face_id, &inv_iw);
+        }
+    }
+}
+
 #[expect(clippy::too_many_arguments, reason = "internal contact assembly")]
 fn push_world_contact(
     out: &mut Vec<Contact>,

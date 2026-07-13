@@ -15,7 +15,7 @@ use vox_world::{SolidLookup, Voxel, World};
 
 use crate::body::{Body, BodyId};
 use crate::broadphase::Broadphase;
-use crate::contact::{Contact, ContactKey, pair_contacts, world_contacts};
+use crate::contact::{Contact, ContactKey, aabb_world_contacts, pair_contacts, world_contacts};
 
 /// Relative contact speed above which a sleeping body is woken by an impact,
 /// as a multiple of the live `sleep_lin` tunable.
@@ -587,17 +587,15 @@ impl PhysicsWorld {
                 body.omega = body.omega.normalize() * MAX_ANGULAR_SPEED_RAD_S;
             }
             debug_assert!(body.vel.is_finite() && body.pos.is_finite());
-            // Jointed bodies skip world contacts: the per-voxel surface
-            // contact system generates dozens of contacts per segment,
-            // and interleaving those with joint constraints across 8
-            // solver iterations creates a feedback loop that produces
-            // wild velocity oscillation (the rope "freaks out"). The
-            // joints handle the rope's physical behavior; terrain
-            // collision is skipped to keep the solver stable. Rope is
-            // still cuttable by tools (dig/bomb/laser carve directly).
-            if !self.joints.iter().any(|j| {
-                j.body_a == slot || j.body_b == slot
-            }) {
+            // Jointed bodies use lightweight AABB contacts instead of
+            // per-voxel surface points. Per-voxel contacts (20+ per
+            // segment) create feedback loops with joint constraints
+            // across 8 solver iterations. AABB contacts (≤6 per body)
+            // are stable with joints and let rope segments rest on
+            // terrain instead of falling through.
+            if self.joints.iter().any(|j| j.body_a == slot || j.body_b == slot) {
+                aabb_world_contacts(body, slot, &mut contacts, &mut lookup);
+            } else {
                 world_contacts(body, slot, &mut contacts, &mut lookup);
             }
         }
