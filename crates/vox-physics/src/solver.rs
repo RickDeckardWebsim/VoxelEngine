@@ -822,18 +822,26 @@ impl PhysicsWorld {
         // the final post-impulse spin: baseline air drag for everyone, plus
         // rolling resistance for small grounded debris (see the constants'
         // docs for why each exists).
+        // Collect bodies that fell below the world floor for despawn
+        // after the loop (can't mutate self.slots/generations/free
+        // while holding iter_mut on self.slots).
+        let mut fell_out_of_world: Vec<usize> = Vec::new();
         for (slot, entry) in self.slots.iter_mut().enumerate() {
             let Some(body) = entry else { continue };
             if body.sleep.asleep {
                 continue;
             }
+            // Safety net: collect bodies that fell below the world floor.
+            // Without this, a body that falls through terrain (or spawns
+            // above void) accelerates to MAX_SPEED and pollutes the solver
+            // with huge velocities — joint chains whip, contacts oscillate.
+            if body.pos.y < -100.0 {
+                fell_out_of_world.push(slot);
+                continue;
+            }
             // NaN guard: the interleaved contact+joint velocity solve can
-            // produce non-finite velocities when jointed bodies (rope
-            // chains) generate competing world contacts — the impulses
-            // oscillate across solver iterations. Without this guard the
-            // NaN propagates into position (`pos += vel * h`), making the
-            // body invisible (NaN transforms produce no rasterized
-            // geometry). Reset to zero instead of integrating garbage.
+            // produce non-finite velocities. Reset to zero instead of
+            // integrating garbage that makes the body invisible.
             if !body.vel.is_finite() {
                 body.vel = Vec3::ZERO;
             }
@@ -864,6 +872,17 @@ impl PhysicsWorld {
             body.refresh_aabb();
         }
 
+        // Despawn bodies that fell below the world floor. Done after the
+        // integration loop to avoid borrow conflicts with iter_mut.
+        for slot in fell_out_of_world {
+            if let Some(body) = &self.slots[slot] {
+                tracing::warn!(slot, pos = ?body.pos, "body fell below world floor, despawning");
+            }
+            self.remove_joints_for_slot(slot);
+            self.slots[slot] = None;
+            self.generations[slot] += 1;
+            self.free.push(slot);
+        }
         // Split-impulse penetration recovery: resolve overlap by *moving*
         // bodies apart, weighted by inverse mass, never by changing their
         // velocities (see the velocity-iterations comment above for the

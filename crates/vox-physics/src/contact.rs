@@ -233,9 +233,14 @@ pub fn aabb_world_contacts(
                 }
             }
         }
-        if let Some((push_n, d, pid)) = best {
+        if let Some((push_n, d, _pid)) = best {
             let r_arm = face_pos - body.pos;
-            let depth = half_ext[axis] - d;
+            // Clamp depth to one voxel — deep penetrations (body fell
+            // through before contacts kicked in) get the same gentle
+            // correction as shallow ones, preventing huge impulses that
+            // clamp to MAX_SPEED and oscillate forever.
+            let raw_depth = half_ext[axis] - d;
+            let depth = raw_depth.min(s);
             push_world_contact(out, body, slot, r_arm, push_n, depth, 0, face_id, &inv_iw);
         }
     }
