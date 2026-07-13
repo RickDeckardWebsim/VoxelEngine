@@ -905,6 +905,21 @@ impl VoxApp {
         }
     }
 
+    /// Streaming system: generate chunks around the player, evict beyond
+    /// render distance. Self-contained — no cross-system data needed.
+    fn system_streaming(&mut self) {
+        let player_pos = self.player.ctrl.pos;
+        let streamed = self.chunk_loader.update(
+            player_pos,
+            self.player.ctrl.vel,
+            &mut self.world,
+            &mut self.pipeline,
+        );
+        if streamed {
+            self.grass_cache.invalidate();
+        }
+    }
+
     /// Material-based impact destruction: check each impact this frame's
     /// physics step(s) produced against the material actually at that
     /// point. A hit whose speed (impulse/mass -- the velocity change the
@@ -2026,16 +2041,7 @@ impl App for VoxApp {
         }
 
         // Stream chunks around the player: generate missing, evict beyond range.
-        let player_pos = self.player.ctrl.pos;
-        let _streamed = self.chunk_loader.update(
-            player_pos,
-            self.player.ctrl.vel,
-            &mut self.world,
-            &mut self.pipeline,
-        );
-        if _streamed {
-            self.grass_cache.invalidate();
-        }
+        self.system_streaming();
         // Wake any resting debris whose ground was just carved/edited from
         // under it, then remesh: absorb edits, dispatch to workers, upload.
         let eye = self.player.eye(timing.alpha);
