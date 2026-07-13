@@ -1042,6 +1042,18 @@ impl VoxApp {
         if input.key_pressed(KeyCode::KeyR) {
             self.replay.toggle_recording();
         }
+        if input.key_pressed(KeyCode::F5) {
+            match ecs_components::save_scene_to_file(&self.ecs, "scene.json") {
+                Ok(()) => tracing::info!("scene saved to scene.json"),
+                Err(e) => tracing::warn!("scene save failed: {e}"),
+            }
+        }
+        if input.key_pressed(KeyCode::F6) {
+            match ecs_components::load_scene_from_file(&mut self.ecs, "scene.json") {
+                Ok(n) => tracing::info!(entities = n, "scene loaded from scene.json"),
+                Err(e) => tracing::warn!("scene load failed: {e}"),
+            }
+        }
         if input.key_pressed(KeyCode::KeyP) {
             self.replay.start_playback();
         }
