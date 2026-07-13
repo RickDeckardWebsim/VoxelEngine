@@ -87,16 +87,25 @@ fn fs_ssao(@builtin(position) frag_pos: vec4f) -> @location(0) f32 {
     let p = view_pos_from_uv(uv, depth);
     let n = reconstruct_normal(uv, depth);
 
-    // SSAO hemisphere sampling: for each kernel sample, project it
-    // from view space back to screen space, sample the depth buffer
-    // there, and check if geometry is closer than the sample point.
-    // If so, the sample is occluded → contribute to AO.
+    // Build a TBN basis from the reconstructed normal to orient the
+    // hemisphere kernel along the surface. Without this, samples go in
+    // all directions (isotropic) — including through the surface —
+    // producing flat, uniform darkening instead of contact shadows.
+    let up = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), abs(n.y) > 0.99);
+    let tangent = normalize(cross(up, n));
+    let bitangent = cross(n, tangent);
+    let tbn = mat3x3f(tangent, bitangent, n);
+
+    // SSAO hemisphere sampling: for each kernel sample, rotate it into
+    // the surface's TBN frame, project to screen space, sample depth,
+    // and check if geometry is closer than the sample point.
     var occlusion = 0.0;
     for (var i = 0u; i < params.kernel_size; i = i + 1u) {
-        // Get the hemisphere sample direction + scale.
         let sample_dir = kernel[i].xyz;
         let sample_scale = kernel[i].w;
-        let sample_pos = p + sample_dir * sample_scale * params.radius;
+        // Orient the hemisphere sample along the surface normal.
+        let oriented_dir = tbn * sample_dir;
+        let sample_pos = p + oriented_dir * sample_scale * params.radius;
 
         // Project the sample point back to screen space. NDC Y=+1 is
         // top (projection convention), but wgpu UV Y=0 is top — flip.
