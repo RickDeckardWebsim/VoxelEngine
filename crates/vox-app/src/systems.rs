@@ -23,6 +23,9 @@ pub struct FrameData {
     pub player_pos: Vec3,
     pub player_vel: Vec3,
     pub grabbed: bool,
+    pub grabbed_this_frame: bool,
+    pub mario_active: bool,
+    pub mario_pos: Vec3,
 }
 
 impl Default for FrameData {
@@ -34,6 +37,9 @@ impl Default for FrameData {
             player_pos: Vec3::ZERO,
             player_vel: Vec3::ZERO,
             grabbed: false,
+            grabbed_this_frame: false,
+            mario_active: false,
+            mario_pos: Vec3::ZERO,
         }
     }
 }

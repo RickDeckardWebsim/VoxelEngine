@@ -472,6 +472,10 @@ struct VoxApp {
     /// damage state — set to 0 by default so cracks are invisible until a
     /// future change drives this from per-voxel damage.
     crack_intensity: f32,
+    /// ECS entity world for custom gameplay entities (doors, NPCs, projectiles).
+    ecs: vox_ecs::World,
+    /// Cross-system data carried between frame phases.
+    frame_data: systems::FrameData,
 }
 
 /// Hard cap on total debris bodies alive at once. Past this, the oldest
@@ -631,6 +635,8 @@ impl VoxApp {
             redo_stack: Vec::new(),
             crack_intensity: 0.0,
             replay: replay::ReplayState::default(),
+            ecs: vox_ecs::World::new(),
+            frame_data: systems::FrameData::default(),
             particles: ParticleSystem::new(),
             particle_pipeline,
             postprocess,
