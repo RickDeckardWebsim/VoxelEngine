@@ -920,6 +920,43 @@ impl VoxApp {
         }
     }
 
+    /// Day/night system: advance game time (unless frozen at noon).
+    /// The `dn` computation stays inline in frame() since the render
+    /// section uses it extensively.
+    fn system_day_night(&mut self, dt: f32) {
+        if !self.always_day {
+            self.game_time += dt;
+        } else {
+            self.game_time = 60.0; // Noon (halfway through 120s cycle)
+        }
+    }
+
+    /// Remesh system: wake physics/fluid/fire around dirty regions,
+    /// dispatch chunk meshing to workers, upload finished meshes.
+    /// Returns the count of uploaded meshes for pending-removal resolution.
+    fn system_remesh(&mut self, eye: Vec3) -> Vec<(u32, u32)> {
+        let _t = ScopedTimer::new(&mut self.profile.remesh);
+        let s = self.world.cfg.voxel_size_m;
+        let dirty = self.world.drain_dirty_regions();
+        if !dirty.is_empty() {
+            self.grass_cache.invalidate();
+        }
+        for (min, max) in &dirty {
+            self.phys.wake_region(min.as_vec3() * s, max.as_vec3() * s);
+            self.fluid.wake_region(&self.world, *min, *max);
+        }
+        for (min, max) in dirty {
+            if let Some(fire) = &mut self.fire {
+                fire.wake_region(&mut self.world, min, max);
+            }
+        }
+        self.remesh.absorb_dirty(&mut self.world);
+        self.remesh
+            .dispatch(&self.world, eye, &self.fluids);
+        self.remesh.collect(&self.gpu, &mut self.pipeline);
+        self.body_mesh.collect(&self.gpu, &mut self.pipeline)
+    }
+
     /// Material-based impact destruction: check each impact this frame's
     /// physics step(s) produced against the material actually at that
     /// point. A hit whose speed (impulse/mass -- the velocity change the
@@ -2045,28 +2082,7 @@ impl App for VoxApp {
         // Wake any resting debris whose ground was just carved/edited from
         // under it, then remesh: absorb edits, dispatch to workers, upload.
         let eye = self.player.eye(timing.alpha);
-        let uploaded = {
-            let _t = ScopedTimer::new(&mut self.profile.remesh);
-            let s = self.world.cfg.voxel_size_m;
-            let dirty = self.world.drain_dirty_regions();
-            if !dirty.is_empty() {
-                self.grass_cache.invalidate();
-            }
-            for (min, max) in &dirty {
-                self.phys.wake_region(min.as_vec3() * s, max.as_vec3() * s);
-                self.fluid.wake_region(&self.world, *min, *max);
-            }
-            for (min, max) in dirty {
-                if let Some(fire) = &mut self.fire {
-                    fire.wake_region(&mut self.world, min, max);
-                }
-            }
-            self.remesh.absorb_dirty(&mut self.world);
-            self.remesh
-                .dispatch(&self.world, eye, &self.fluids);
-            self.remesh.collect(&self.gpu, &mut self.pipeline);
-            self.body_mesh.collect(&self.gpu, &mut self.pipeline)
-        };
+        let uploaded = self.system_remesh(eye);
         self.resolve_pending_removals(&uploaded);
         self.sync_debris_render(timing.alpha);
         let body_colliders: Vec<particles::BodyCollisionRef> = self
@@ -2090,11 +2106,7 @@ impl App for VoxApp {
         );
 
         // Advance day/night cycle (unless frozen at noon).
-        if !self.always_day {
-            self.game_time += timing.dt_frame;
-        } else {
-            self.game_time = 60.0; // Noon (halfway through 120s cycle)
-        }
+        self.system_day_night(timing.dt_frame);
         let dn = day_night::compute(self.game_time);
 
         // Camera: third-person around Mario in Mario mode, else player eye.
