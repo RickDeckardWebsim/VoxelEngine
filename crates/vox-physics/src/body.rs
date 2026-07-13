@@ -330,6 +330,12 @@ pub struct Body {
     /// Half of this body's voxel edge length (contact radius).
     pub half_voxel: f32,
     pub sleep: SleepState,
+    /// When true, this body is pinned to the world: gravity, contacts, and
+    /// integration are all skipped, and it acts as a static (infinite-mass)
+    /// anchor for joints. Used to hang ropes/chains from a fixed point so
+    /// the chain doesn't free-fall — the anchor absorbs no KE, joints only
+    /// support the chain's weight. A pinned body never sleeps or wakes.
+    pub pinned: bool,
     /// World-space AABB, refreshed each step.
     pub aabb_min: Vec3,
     pub aabb_max: Vec3,
@@ -404,6 +410,7 @@ impl Body {
             aabb_max: Vec3::ZERO,
             prev_pos: com_world,
             prev_rot: Quat::IDENTITY,
+            pinned: false,
             lifetime_s: None,
             damage_dirty: false,
             topology_revision: 0,

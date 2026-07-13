@@ -22,6 +22,16 @@ pub const SUBSTEPS: u32 = 4;
 /// fewer inner iterations suffice; total passes are halved (4×2 = 8 vs
 /// the old 2×8 = 16), traded for fresher contact data each pass.
 pub const SOLVER_ITERS: u32 = 2;
+/// Extra joint solve iterations per substep, *after* the contact iterations
+/// finish. Sequential-impulse joint constraints propagate one link per
+/// iteration along a chain, so a chain of N joints needs O(N) iterations
+/// to fully propagate a disturbance end-to-end. Contacts converge in 2
+/// iterations (they're local, no long-range propagation), but a 4-joint
+/// rope with 2 iterations only reaches 2 joints deep — the chain can't
+/// converge and accumulates position error every substep. These extra
+/// iterations are joints-only (contacts are already converged), so the
+/// cost is proportional to joint count, not contact count.
+pub const JOINT_ITERS: u32 = 8;
 /// Baumgarte positional-correction factor for contacts.
 pub const CONTACT_BETA: f32 = 0.2;
 /// Allowed contact penetration in meters.

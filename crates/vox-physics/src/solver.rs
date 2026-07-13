@@ -8,7 +8,7 @@
 use glam::{IVec3, Mat3, Quat, Vec3};
 use vox_core::consts::{
     CLUTTER_LIFETIME_MAX_S, CLUTTER_LIFETIME_MIN_S, CLUTTER_MAX_VOXELS, CONTACT_SLOP, GRAVITY,
-    SLEEP_FRAMES, SOLVER_ITERS, SUBSTEPS,
+    JOINT_ITERS, SLEEP_FRAMES, SOLVER_ITERS, SUBSTEPS,
 };
 use vox_core::{FxHashMap, Tunables};
 use vox_world::{SolidLookup, Voxel, World};
@@ -368,6 +368,19 @@ impl PhysicsWorld {
         &self.joints
     }
 
+    /// Pin a body to the world: it becomes a static anchor that gravity,
+    /// contacts, and integration skip, but joints can attach to. Used to
+    /// hang ropes/chains from a fixed point so the chain doesn't free-fall.
+    /// A pinned body never sleeps or wakes.
+    pub fn pin(&mut self, id: BodyId) {
+        if let Some(body) = self.get_mut(id) {
+            body.pinned = true;
+            body.vel = Vec3::ZERO;
+            body.omega = Vec3::ZERO;
+            body.sleep.asleep = false;
+        }
+    }
+
     pub fn get(&self, id: BodyId) -> Option<&Body> {
         let slot = id.slot as usize;
         if self.generations.get(slot) == Some(&id.generation) {
@@ -530,6 +543,7 @@ impl PhysicsWorld {
                 for &s in island {
                     if let Some(b) = self.slots[s].as_mut()
                         && b.sleep.asleep
+                        && !b.pinned
                     {
                         b.sleep.asleep = false;
                         b.sleep.quiet_steps = 0;
@@ -541,9 +555,9 @@ impl PhysicsWorld {
                 break;
             }
         }
-        // Update per-body quiet counters.
+        // Update per-body quiet counters. Pinned bodies never sleep.
         for body in self.slots.iter_mut().flatten() {
-            if body.sleep.asleep {
+            if body.sleep.asleep || body.pinned {
                 continue;
             }
             let quiet = body.vel.length() < self.tunables.sleep_lin
@@ -577,9 +591,9 @@ impl PhysicsWorld {
                 continue;
             }
             let ready = island.iter().all(|&slot| {
-                self.slots[slot]
-                    .as_ref()
-                    .is_some_and(|b| b.sleep.asleep || b.sleep.quiet_steps > SLEEP_FRAMES)
+                self.slots[slot].as_ref().is_some_and(|b| {
+                    b.pinned || b.sleep.asleep || b.sleep.quiet_steps > SLEEP_FRAMES
+                })
             });
             if !ready {
                 continue;
@@ -587,6 +601,7 @@ impl PhysicsWorld {
             for &slot in &island {
                 if let Some(body) = self.slots[slot].as_mut()
                     && !body.sleep.asleep
+                    && !body.pinned
                 {
                     body.sleep.asleep = true;
                     body.vel = Vec3::ZERO;
@@ -659,7 +674,7 @@ impl PhysicsWorld {
         // Integrate velocities and collect contacts.
         for (slot, entry) in self.slots.iter_mut().enumerate() {
             let Some(body) = entry else { continue };
-            if body.sleep.asleep {
+            if body.sleep.asleep || body.pinned {
                 continue;
             }
             body.vel.y -= GRAVITY * h;
@@ -842,64 +857,18 @@ impl PhysicsWorld {
                     Self::apply_contact_impulse(&mut self.slots, c, t * applied_t);
                 }
             }
-            // Joint distance constraints (interleaved with contacts for
-            // convergence). Read block computes all Copy-typed values so the
-            // immutable borrow of self.slots ends before two_mut.
-            for j in &mut self.joints {
-                let (ba, bb) = match (self.slots[j.body_a].as_ref(), self.slots[j.body_b].as_ref()) {
-                    (Some(a), Some(b)) => (a, b),
-                    _ => continue,
-                };
-                if ba.sleep.asleep && bb.sleep.asleep {
-                    continue;
-                }
-                let asleep_a = ba.sleep.asleep;
-                let asleep_b = bb.sleep.asleep;
-                let ra = ba.rot * j.anchor_a;
-                let rb = bb.rot * j.anchor_b;
-                let d = (bb.pos + rb) - (ba.pos + ra);
-                let dist = d.length();
-                if dist < 1e-6 {
-                    continue;
-                }
-                let n = d / dist;
-                // Velocity-based solve: cancel relative velocity along the
-                // constraint axis. No position correction (disabled to
-                // prevent chain feedback loops); slight sag is acceptable.
-                let v_rel = (bb.vel + bb.omega.cross(rb)) - (ba.vel + ba.omega.cross(ra));
-                let vn = v_rel.dot(n);
-                let ima = if asleep_a { 0.0 } else { ba.inv_mass };
-                let imb = if asleep_b { 0.0 } else { bb.inv_mass };
-                let iwa = if asleep_a { Mat3::ZERO } else { ba.inv_iw };
-                let iwb = if asleep_b { Mat3::ZERO } else { bb.inv_iw };
-                let ra_cross_n = ra.cross(n);
-                let rb_cross_n = rb.cross(n);
-                let keff = ima + imb
-                    + iwa.mul_vec3(ra_cross_n).dot(ra_cross_n)
-                    + iwb.mul_vec3(rb_cross_n).dot(rb_cross_n);
-                if keff <= 0.0 {
-                    continue;
-                }
-                let lambda = -vn / (keff + j.compliance);
-                // Clamp the impulse to prevent solver divergence in joint
-                // chains: when contacts and joints compete (rope segment
-                // touching terrain), successive iterations can amplify the
-                // impulse. Cap at the impulse that would bring the relative
-                // velocity to MAX_SPEED — enough to constrain, not enough
-                // to diverge.
-                let max_lambda = MAX_SPEED / keff;
-                let lambda = lambda.clamp(-max_lambda, max_lambda);
-                let p = n * lambda;
-                let (ba, bb) = two_mut(&mut self.slots, j.body_a, j.body_b);
-                if !asleep_a {
-                    ba.vel += p * ba.inv_mass;
-                    ba.omega += ba.inv_iw * ra.cross(p);
-                }
-                if !asleep_b {
-                    bb.vel -= p * bb.inv_mass;
-                    bb.omega -= bb.inv_iw * rb.cross(p);
-                }
-            }
+            // Joint distance constraints interleaved with contacts for
+            // contact-joint coupling (e.g. rope segment resting on terrain).
+            self.solve_joints();
+        }
+        // Extra joint-only iterations: sequential-impulse joints propagate
+        // one link per iteration along a chain. A 4-joint rope with only 2
+        // contact iterations can't propagate end-to-end — these extra passes
+        // ensure the chain fully converges without re-solving contacts (which
+        // are already settled). Cost is proportional to joint count, not
+        // contact count.
+        for _ in 0..JOINT_ITERS {
+            self.solve_joints();
         }
 
         // Record each body's hardest single contact this substep, for
@@ -958,7 +927,7 @@ impl PhysicsWorld {
         let mut fell_out_of_world: Vec<usize> = Vec::new();
         for (slot, entry) in self.slots.iter_mut().enumerate() {
             let Some(body) = entry else { continue };
-            if body.sleep.asleep {
+            if body.sleep.asleep || body.pinned {
                 continue;
             }
             // Safety net: collect bodies that fell below the world floor.
@@ -1057,7 +1026,7 @@ impl PhysicsWorld {
         for (slot, entry) in self.slots.iter_mut().enumerate() {
             let Some(body) = entry else { continue };
             let corr = self.pos_corr[slot];
-            if corr != Vec3::ZERO && !body.sleep.asleep {
+            if corr != Vec3::ZERO && !body.sleep.asleep && !body.pinned {
                 body.pos += corr;
                 body.refresh_aabb();
             }
@@ -1067,6 +1036,59 @@ impl PhysicsWorld {
         self.warm.clear();
         for c in &contacts {
             self.warm.insert(c.key, (c.acc_n, c.acc_t1, c.acc_t2));
+        }
+    }
+
+    /// Solve all joint distance constraints once. Called both interleaved
+    /// with contact iterations (for contact-joint coupling) and as extra
+    /// joint-only iterations after contacts converge (for chain propagation).
+    /// A pinned or sleeping body is treated as static (infinite mass).
+    fn solve_joints(&mut self) {
+        for j in &mut self.joints {
+            let (ba, bb) = match (self.slots[j.body_a].as_ref(), self.slots[j.body_b].as_ref()) {
+                (Some(a), Some(b)) => (a, b),
+                _ => continue,
+            };
+            if (ba.sleep.asleep || ba.pinned) && (bb.sleep.asleep || bb.pinned) {
+                continue;
+            }
+            let static_a = ba.sleep.asleep || ba.pinned;
+            let static_b = bb.sleep.asleep || bb.pinned;
+            let ra = ba.rot * j.anchor_a;
+            let rb = bb.rot * j.anchor_b;
+            let d = (bb.pos + rb) - (ba.pos + ra);
+            let dist = d.length();
+            if dist < 1e-6 {
+                continue;
+            }
+            let n = d / dist;
+            let v_rel = (bb.vel + bb.omega.cross(rb)) - (ba.vel + ba.omega.cross(ra));
+            let vn = v_rel.dot(n);
+            let ima = if static_a { 0.0 } else { ba.inv_mass };
+            let imb = if static_b { 0.0 } else { bb.inv_mass };
+            let iwa = if static_a { Mat3::ZERO } else { ba.inv_iw };
+            let iwb = if static_b { Mat3::ZERO } else { bb.inv_iw };
+            let ra_cross_n = ra.cross(n);
+            let rb_cross_n = rb.cross(n);
+            let keff = ima + imb
+                + iwa.mul_vec3(ra_cross_n).dot(ra_cross_n)
+                + iwb.mul_vec3(rb_cross_n).dot(rb_cross_n);
+            if keff <= 0.0 {
+                continue;
+            }
+            let lambda = -vn / (keff + j.compliance);
+            let max_lambda = MAX_SPEED / keff;
+            let lambda = lambda.clamp(-max_lambda, max_lambda);
+            let p = n * lambda;
+            let (ba, bb) = two_mut(&mut self.slots, j.body_a, j.body_b);
+            if !static_a {
+                ba.vel -= p * ba.inv_mass;
+                ba.omega -= ba.inv_iw * ra.cross(p);
+            }
+            if !static_b {
+                bb.vel += p * bb.inv_mass;
+                bb.omega += bb.inv_iw * rb.cross(p);
+            }
         }
     }
 
@@ -1943,6 +1965,178 @@ mod tests {
             body.vel.length() < 0.1,
             "body must remain stable after warm-start re-enables, got {}",
             body.vel.length()
+        );
+    }
+
+    /// Build a 5-segment rope hanging from a pinned anchor. Returns the
+    /// body ids (index 0 = top/pinned, 4 = bottom). Each segment is 2×5×2
+    /// voxels at 0.1m scale (0.5m tall), connected by rigid joints at
+    /// rest_length = segment height.
+    fn build_rope(phys: &mut PhysicsWorld, base_y: f32) -> Vec<BodyId> {
+        let reg = registry();
+        let voxel_size = 0.1;
+        let seg_dims = IVec3::new(2, 5, 2);
+        let seg_voxels = vec![Voxel(1); (2 * 5 * 2) as usize];
+        let seg_height = 5.0 * voxel_size; // 0.5m
+        let half_h = seg_height * 0.5;
+
+        let mut ids = Vec::new();
+        let mut prev_id: Option<BodyId> = None;
+
+        for i in 0..5 {
+            let center = Vec3::new(16.0, base_y - i as f32 * seg_height, 16.0);
+            let grid = VoxelGrid::new(seg_dims, seg_voxels.clone());
+            let body = Body::from_grid(grid, &reg, voxel_size, center).expect("massive");
+            let id = phys.spawn(body);
+
+            if i == 0 {
+                phys.pin(id);
+            }
+            if let Some(prev) = prev_id {
+                let anchor_prev = Vec3::new(0.0, -half_h, 0.0);
+                let anchor_this = Vec3::new(0.0, half_h, 0.0);
+                phys.add_joint(prev, id, anchor_prev, anchor_this, seg_height, 0.0);
+            }
+            prev_id = Some(id);
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// A 5-segment rope hanging from a pinned anchor must settle stable:
+    /// no NaN, no velocity explosion, segments stay near rest length, and
+    /// the anchor doesn't move.
+    #[test]
+    fn rope_hangs_stably_from_pinned_anchor() {
+        let world = floored_world();
+        let mut phys = PhysicsWorld::new();
+        let ids = build_rope(&mut phys, 20.0);
+
+        // The rope should settle within ~3 seconds (180 steps).
+        for step in 0..360 {
+            phys.step(&world, PHYSICS_DT);
+            for (i, &id) in ids.iter().enumerate() {
+                let b = phys.get(id).expect("alive");
+                assert!(
+                    b.pos.is_finite() && b.vel.is_finite(),
+                    "NaN at step {step} segment {i}: pos={:?} vel={:?}",
+                    b.pos, b.vel
+                );
+                assert!(
+                    b.vel.length() < 50.0,
+                    "velocity explosion at step {step} segment {i}: {}",
+                    b.vel.length()
+                );
+            }
+        }
+
+        // Anchor (segment 0) must not have moved.
+        let anchor = phys.get(ids[0]).unwrap();
+        assert!(
+            (anchor.pos - Vec3::new(16.0, 20.0, 16.0)).length() < 0.01,
+            "pinned anchor moved: {:?}",
+            anchor.pos
+        );
+
+        // All segments should be near rest (low velocity).
+        for (i, &id) in ids.iter().enumerate() {
+            let b = phys.get(id).unwrap();
+            assert!(
+                b.vel.length() < 1.0,
+                "segment {i} still moving fast after settle: {}",
+                b.vel.length()
+            );
+        }
+
+        // Joint rest lengths should be approximately maintained.
+        let seg_height = 0.5;
+        for i in 0..4 {
+            let a = phys.get(ids[i]).unwrap().pos;
+            let b = phys.get(ids[i + 1]).unwrap().pos;
+            let dist = (a - b).length();
+            assert!(
+                (dist - seg_height).abs() < 0.2,
+                "joint {i} rest length broken: dist={dist}, expected ~{seg_height}"
+            );
+        }
+    }
+
+    /// The real failure mode: a rope that swings/drops into terrain. The
+    /// bottom segments hit the floor while joints constrain them — this is
+    /// where the old solver freaked out. Assert velocities stay bounded and
+    /// segment distances stay near rest_length THROUGH the collision.
+    #[test]
+    fn rope_colliding_with_terrain_stays_stable() {
+        let world = floored_world();
+        let mut phys = PhysicsWorld::new();
+        // Floor top is at 4m. Hang rope so bottom segment is just above
+        // the floor, then kick it DOWNWARD into terrain — the exact
+        // scenario that freaked out: contact pushes up while joints pull
+        // toward the anchor.
+        let base_y = 6.1; // bottom at 6.1 - 4*0.5 = 4.1m, 0.1m above floor
+        let ids = build_rope(&mut phys, base_y);
+
+        // Let it settle first.
+        for _ in 0..120 {
+            phys.step(&world, PHYSICS_DT);
+        }
+
+        // Kick the bottom segment DOWNWARD into the floor. This creates
+        // the contact-vs-joint competition: floor contact pushes up,
+        // joints pull toward the pinned anchor above.
+        let bottom = ids[4];
+        let b = phys.get(bottom).unwrap();
+        let mass = 1.0 / b.inv_mass;
+        phys.apply_impulse(bottom, Vec3::new(0.0, -8.0 * mass, 0.0), Vec3::ZERO);
+
+        // Step through the swing + collision. This is the critical window.
+        for step in 0..300 {
+            phys.step(&world, PHYSICS_DT);
+            for (i, &id) in ids.iter().enumerate() {
+                let b = phys.get(id).expect("alive");
+                assert!(
+                    b.pos.is_finite() && b.vel.is_finite(),
+                    "NaN at step {step} segment {i}: pos={:?} vel={:?}",
+                    b.pos, b.vel
+                );
+                assert!(
+                    b.vel.length() < 50.0,
+                    "velocity explosion at step {step} segment {i}: {}",
+                    b.vel.length()
+                );
+            }
+        }
+
+        // After the swing + collision, the rope should have settled again.
+        // All velocities should be low.
+        for (i, &id) in ids.iter().enumerate() {
+            let b = phys.get(id).unwrap();
+            assert!(
+                b.vel.length() < 5.0,
+                "segment {i} still moving after collision settle: {}",
+                b.vel.length()
+            );
+        }
+
+        // Segment distances should still be near rest length — the collision
+        // shouldn't have broken the chain.
+        let seg_height = 0.5;
+        for i in 0..4 {
+            let a = phys.get(ids[i]).unwrap().pos;
+            let b = phys.get(ids[i + 1]).unwrap().pos;
+            let dist = (a - b).length();
+            assert!(
+                (dist - seg_height).abs() < 0.3,
+                "joint {i} broken by collision: dist={dist}, expected ~{seg_height}"
+            );
+        }
+
+        // Anchor must not have moved.
+        let anchor = phys.get(ids[0]).unwrap();
+        assert!(
+            (anchor.pos - Vec3::new(16.0, base_y, 16.0)).length() < 0.01,
+            "pinned anchor moved during collision: {:?}",
+            anchor.pos
         );
     }
 }

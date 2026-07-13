@@ -742,12 +742,20 @@ impl VoxApp {
             // Stack segments vertically, top segment first.
             let seg_center = base_pos + Vec3::new(0.0, -i as f32 * seg_height_m, 0.0);
             let grid = VoxelGrid::new(seg_dims, seg_voxels.clone());
-            let Some(mut body) = Body::from_grid(grid, &self.registry, voxel_size, seg_center)
+            let Some(body) = Body::from_grid(grid, &self.registry, voxel_size, seg_center)
             else {
                 continue;
             };
             let id = self.phys.spawn(body);
             self.upload_debris_mesh(id);
+            // Pin the top segment (i==0) to the world so the rope hangs
+            // from a fixed point instead of free-falling. Without this, the
+            // entire rope accelerates under gravity and all KE must be
+            // absorbed by 4 joints in 2 iterations — the root cause of the
+            // rope freakout on collision.
+            if i == 0 {
+                self.phys.pin(id);
+            }
 
             if let Some(prev) = prev_id {
                 // Connect bottom of previous segment to top of this segment.
