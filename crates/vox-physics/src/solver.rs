@@ -85,6 +85,14 @@ pub struct Joint {
     pub acc_lambda: f32,
     /// Compliance (inverse stiffness). 0 = rigid.
     pub compliance: f32,
+    /// Hinge axis on body A, body-local frame. When non-zero, an angular
+    /// constraint keeps `rot_a * hinge_axis_a` aligned with `rot_b *
+    /// hinge_axis_b`, preventing segments from spinning freely around
+    /// the connection point while allowing pendulum-like swing. Zero =
+    /// pure distance constraint (backward-compatible).
+    pub hinge_axis_a: Vec3,
+    /// Hinge axis on body B, body-local frame.
+    pub hinge_axis_b: Vec3,
 }
 
 /// Two distinct mutable borrows out of the slot array.
@@ -282,7 +290,7 @@ impl PhysicsWorld {
         rest_length: f32,
         compliance: f32,
     ) -> usize {
-        self.add_joint_with_kernel(a, b, anchor_a, anchor_b, rest_length, compliance, Vec::new(), Vec::new())
+        self.add_joint_with_kernel(a, b, anchor_a, anchor_b, rest_length, compliance, Vec::new(), Vec::new(), Vec3::ZERO, Vec3::ZERO)
     }
 
     /// Like [`add_joint`](Self::add_joint) but attaches kernel voxels to each
@@ -301,6 +309,8 @@ impl PhysicsWorld {
         compliance: f32,
         kernel_a: Vec<IVec3>,
         kernel_b: Vec<IVec3>,
+        hinge_axis_a: Vec3,
+        hinge_axis_b: Vec3,
     ) -> usize {
         let joint = Joint {
             body_a: a.slot as usize,
@@ -312,6 +322,8 @@ impl PhysicsWorld {
             rest_length,
             acc_lambda: 0.0,
             compliance,
+            hinge_axis_a,
+            hinge_axis_b,
         };
         self.joints.push(joint);
         self.joints.len() - 1
@@ -850,7 +862,7 @@ impl PhysicsWorld {
             }
             // Joint distance constraints interleaved with contacts for
             // contact-joint coupling (e.g. rope segment resting on terrain).
-            self.solve_joints();
+            self.solve_joints(h);
         }
         // Extra joint-only iterations: sequential-impulse joints propagate
         // one link per iteration along a chain. A 4-joint rope with only 2
@@ -859,7 +871,7 @@ impl PhysicsWorld {
         // are already settled). Cost is proportional to joint count, not
         // contact count.
         for _ in 0..JOINT_ITERS {
-            self.solve_joints();
+            self.solve_joints(h);
         }
 
         // Record each body's hardest single contact this substep, for
@@ -1076,7 +1088,7 @@ impl PhysicsWorld {
     /// with contact iterations (for contact-joint coupling) and as extra
     /// joint-only iterations after contacts converge (for chain propagation).
     /// A pinned or sleeping body is treated as static (infinite mass).
-    fn solve_joints(&mut self) {
+    fn solve_joints(&mut self, h: f32) {
         for j in &mut self.joints {
             let (ba, bb) = match (self.slots[j.body_a].as_ref(), self.slots[j.body_b].as_ref()) {
                 (Some(a), Some(b)) => (a, b),
@@ -1121,6 +1133,52 @@ impl PhysicsWorld {
             if !static_b {
                 bb.vel += p * bb.inv_mass;
                 bb.omega += bb.inv_iw * rb.cross(p);
+            }
+
+            // Angular hinge constraint: keep the two hinge axes aligned in
+            // world space. The correction axis is the cross product of the
+            // world-space hinge axes — its magnitude is sin(θ), and driving
+            // the relative angular velocity along it to zero keeps them
+            // parallel. This prevents rope segments from spinning around
+            // the connection point while allowing pendulum-like swing.
+            if j.hinge_axis_a != Vec3::ZERO && j.hinge_axis_b != Vec3::ZERO {
+                let (ba, bb) = match (self.slots[j.body_a].as_ref(), self.slots[j.body_b].as_ref()) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => continue,
+                };
+                let axis_a = ba.rot * j.hinge_axis_a;
+                let axis_b = bb.rot * j.hinge_axis_b;
+                let corr_axis = axis_a.cross(axis_b);
+                let corr_mag = corr_axis.length();
+                if corr_mag < 1e-6 {
+                    continue;
+                }
+                let corr_n = corr_axis / corr_mag;
+                // Relative angular velocity along the correction axis.
+                let rel_omega = bb.omega - ba.omega;
+                let w_dot = rel_omega.dot(corr_n);
+                let iwa = if static_a { Mat3::ZERO } else { ba.inv_iw };
+                let iwb = if static_b { Mat3::ZERO } else { bb.inv_iw };
+                // Effective angular inverse inertia along the correction axis.
+                let keff_ang = iwa.mul_vec3(corr_n).dot(corr_n)
+                    + iwb.mul_vec3(corr_n).dot(corr_n);
+                if keff_ang <= 0.0 {
+                    continue;
+                }
+                // Soft constraint: compliance allows bending under load.
+                // Baumgarte position correction: corr_mag = sin(θ), so
+                // JOINT_BETA * corr_mag / h adds a target angular velocity
+                // that drives the axes back toward alignment over several
+                // substeps (same approach as the distance position correction).
+                let lambda_ang = -(w_dot + JOINT_BETA * corr_mag / h) / (keff_ang + j.compliance * 0.5);
+                let p_ang = corr_n * lambda_ang;
+                let (ba, bb) = two_mut(&mut self.slots, j.body_a, j.body_b);
+                if !static_a {
+                    ba.omega -= ba.inv_iw * p_ang;
+                }
+                if !static_b {
+                    bb.omega += bb.inv_iw * p_ang;
+                }
             }
         }
     }
@@ -2028,7 +2086,7 @@ mod tests {
             if let Some(prev) = prev_id {
                 let anchor_prev = Vec3::new(0.0, -half_h, 0.0);
                 let anchor_this = Vec3::new(0.0, half_h, 0.0);
-                phys.add_joint(prev, id, anchor_prev, anchor_this, seg_height, 0.0);
+                phys.add_joint_with_kernel(prev, id, anchor_prev, anchor_this, seg_height, 0.0, Vec::new(), Vec::new(), Vec3::X, Vec3::X);
             }
             prev_id = Some(id);
             ids.push(id);
@@ -2171,5 +2229,72 @@ mod tests {
             "pinned anchor moved during collision: {:?}",
             anchor.pos
         );
+    }
+
+    /// The hinge angular constraint must prevent rope segments from spinning
+    /// freely around the connection axis. A distance-only joint lets segments
+    /// tumble chaotically; a hinge joint keeps them aligned. We verify by
+    /// spinning one segment and checking that the hinge restores alignment.
+    #[test]
+    fn hinge_joint_prevents_segment_spinning() {
+        let world = floored_world();
+        let mut phys = PhysicsWorld::new();
+        let ids = build_rope(&mut phys, 20.0);
+
+        // Let it settle.
+        for _ in 0..120 {
+            phys.step(&world, PHYSICS_DT);
+        }
+
+        // Apply a spin impulse to segment 2 (middle of the rope) around the
+        // vertical (Y) axis — exactly the rotation the hinge should resist.
+        let mid = ids[2];
+        let b = phys.get(mid).unwrap();
+        let mass = 1.0 / b.inv_mass;
+        phys.apply_impulse(mid, Vec3::new(0.0, 0.0, 5.0 * mass), Vec3::new(0.1, 0.0, 0.0));
+
+        // Step through the recovery. The hinge should prevent persistent
+        /// spinning — angular velocity should decay, not sustain.
+        for step in 0..300 {
+            phys.step(&world, PHYSICS_DT);
+            let b = phys.get(mid).unwrap();
+            assert!(
+                b.omega.is_finite(),
+                "NaN angular velocity at step {step}: {:?}",
+                b.omega
+            );
+            assert!(
+                b.omega.length() < 20.0,
+                "angular velocity explosion at step {step}: {}",
+                b.omega.length()
+            );
+        }
+
+        // After recovery, the rope should have low angular velocity — the
+        /// hinge prevented the spin from persisting.
+        for (i, &id) in ids.iter().enumerate() {
+            let b = phys.get(id).unwrap();
+            assert!(
+                b.omega.length() < 5.0,
+                "segment {i} still spinning after recovery: {}",
+                b.omega.length()
+            );
+        }
+
+        // Check segment alignment: the X axis of each segment should still
+        // be roughly horizontal (not tilted). We check that adjacent segments
+        // have similar orientations by comparing their world-space X axes.
+        for i in 0..4 {
+            let rot_a = phys.get(ids[i]).unwrap().rot;
+            let rot_b = phys.get(ids[i + 1]).unwrap().rot;
+            let axis_a = rot_a * Vec3::X;
+            let axis_b = rot_b * Vec3::X;
+            let dot = axis_a.dot(axis_b).abs();
+            assert!(
+                dot > 0.7,
+                "segments {i} and {} misaligned after recovery: dot={dot:.3}",
+                i + 1,
+            );
+        }
     }
 }

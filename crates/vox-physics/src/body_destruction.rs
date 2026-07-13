@@ -1108,6 +1108,8 @@ mod tests {
             0.0,
             kernel,
             Vec::new(),
+            Vec3::ZERO,
+            Vec3::ZERO,
         );
         assert_eq!(phys.joints().len(), 1, "joint must exist before carve");
 
@@ -1205,6 +1207,8 @@ mod tests {
             0.0,
             kernel,
             Vec::new(),
+            Vec3::ZERO,
+            Vec3::ZERO,
         );
 
         let center_world = phys.get(bar_id).unwrap().pos;

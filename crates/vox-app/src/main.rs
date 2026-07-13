@@ -763,7 +763,7 @@ impl VoxApp {
                 // compliance = 0.0 (rigid — rope should be firm, not soft).
                 let anchor_prev = Vec3::new(0.0, -half_height, 0.0);
                 let anchor_this = Vec3::new(0.0, half_height, 0.0);
-                self.phys.add_joint(prev, id, anchor_prev, anchor_this, seg_height_m, 0.0);
+                self.phys.add_joint_with_kernel(prev, id, anchor_prev, anchor_this, seg_height_m, 0.0, Vec::new(), Vec::new(), Vec3::X, Vec3::X);
             }
 
             prev_id = Some(id);
