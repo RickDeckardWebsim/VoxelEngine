@@ -12,7 +12,7 @@
 
 use std::collections::VecDeque;
 
-use glam::{IVec3, Quat, Vec3};
+use glam::{IVec3, Mat3, Quat, Vec3};
 use vox_core::{FxHashMap, FxHashSet, MaterialRegistry};
 use vox_core::consts::{DEBRIS_MIN_VOXELS, MAX_BODY_VOXELS};
 use vox_world::{AIR, Voxel};
@@ -20,9 +20,9 @@ use vox_world::{AIR, Voxel};
 use vox_core::voxel_center_m;
 
 use crate::BodyId;
-use crate::body::{Body, VoxelGrid, mass_props};
+use crate::body::{Body, VoxelGrid, mass_props, MassProps};
 use crate::destruction::{ExplosionShape, small_hash};
-use crate::solver::PhysicsWorld;
+use crate::solver::{PhysicsWorld, Joint};
 
 const DIRS: [IVec3; 6] = [
     IVec3::X,
@@ -259,25 +259,132 @@ impl ParentState {
     }
 }
 
+/// Given the `split_components` output (each `(sub_grid, sub_min)` where
+/// `sub_min` is the fragment's min corner in *original* grid voxel coords),
+/// an `anchor_voxel` (the anchor point's body-local voxel position in the
+/// original grid), and a kernel of *offsets* from that anchor, find the
+/// index of the fragment that owns the majority of the anchor's kernel
+/// voxels. Each kernel entry is `anchor_voxel + offset` — an absolute
+/// original-grid voxel coordinate. A voxel is "owned" by a fragment if it
+/// falls within `[sub_min, sub_min + dims)` and is solid in that fragment's
+/// grid. Returns `None` if no fragment owns a strict majority (> half of
+/// the kernel voxels that are solid in *any* fragment), in which case the
+/// joint is detached.
+fn majority_fragment(
+    components: &[(VoxelGrid, IVec3)],
+    anchor_voxel: IVec3,
+    kernel: &[IVec3],
+) -> Option<usize> {
+    if kernel.is_empty() {
+        return None;
+    }
+    let mut counts = vec![0usize; components.len()];
+    let mut total_solid = 0usize;
+    for &offset in kernel {
+        let kv = anchor_voxel + offset;
+        for (i, (sub_grid, sub_min)) in components.iter().enumerate() {
+            let local = kv - *sub_min;
+            if local.cmplt(IVec3::ZERO).any() || local.cmpge(sub_grid.dims).any() {
+                continue;
+            }
+            if sub_grid.solid(local) {
+                counts[i] += 1;
+                total_solid += 1;
+                break; // a voxel belongs to at most one fragment
+            }
+        }
+    }
+    if total_solid == 0 {
+        return None;
+    }
+    let threshold = total_solid / 2;
+    counts
+        .iter()
+        .enumerate()
+        .find(|&(_, &c)| c > threshold)
+        .map(|(i, _)| i)
+}
+
 /// Turn one carved grid into 0+ replacement bodies, positioned and given
 /// velocity to match the parent they came from, and spawn them. Shared by
 /// [`carve_body_sphere_at`]/[`carve_body_capsule_at`] once the grid itself
 /// has already been mutated.
+///
+/// `parent_slot` is the raw slot index of the parent body (before despawn).
+/// `taken_joints` is the set of joints that were detached from the parent
+/// via [`PhysicsWorld::take_joints_for_slot`] *before* despawn — they are
+/// transferred to whichever fragment owns the majority of their kernel
+/// voxels, or detached if no majority. Empty kernels (the backward-compatible
+/// default) always detach: no fragment wins, so the joint is dropped. Pass an
+/// empty `Vec` when the caller has no joints to transfer.
 fn finish_carve(
     phys: &mut PhysicsWorld,
     registry: &MaterialRegistry,
     grid: VoxelGrid,
     voxel_size_m: f32,
     parent: ParentState,
+    parent_slot: usize,
+    taken_joints: Vec<Joint>,
 ) -> Vec<BodyId> {
-    let mut ids = Vec::new();
-    for (sub_grid, sub_min) in split_components(&grid) {
+    let components = split_components(&grid);
+    let n = components.len();
+
+    // Pre-compute spawn decisions for each component: (sub_min, props,
+    // spawnable). All Copy, no borrows into `components` — so the later
+    // `components.into_iter()` in the spawn loop is borrow-free.
+    let mut comp_meta: Vec<(IVec3, MassProps, bool)> = Vec::with_capacity(n);
+    for (sub_grid, sub_min) in &components {
         let count = sub_grid.solid_count();
-        if !(DEBRIS_MIN_VOXELS..=MAX_BODY_VOXELS).contains(&count) {
-            continue; // dust, or an oversize safety valve -- either way, gone.
-        }
-        let props = mass_props(&sub_grid, registry, voxel_size_m);
-        if props.mass <= 0.0 {
+        let spawnable = (DEBRIS_MIN_VOXELS..=MAX_BODY_VOXELS).contains(&count);
+        let props = if spawnable {
+            mass_props(sub_grid, registry, voxel_size_m)
+        } else {
+            MassProps { mass: 0.0, com_local: Vec3::ZERO, inertia_com: Mat3::IDENTITY }
+        };
+        let spawnable = spawnable && props.mass > 0.0;
+        comp_meta.push((*sub_min, props, spawnable));
+    }
+
+    // Joint transfer — kernel vote: for each taken joint, determine which
+    // fragment owns the majority of kernel voxels on the parent's side.
+    // The parent is body_a (use kernel_a + anchor_a) or body_b (use
+    // kernel_b + anchor_b); the other endpoint belongs to a different,
+    // still-live body and is untouched. Vote *before* spawning, while
+    // `components` (and its sub-grids) are still borrowed. Empty kernel or
+    // no majority → None (joint will be detached, the backward-compatible
+    // default). The anchor voxel is derived from the COM-relative anchor:
+    // grid-min corner sits at `grid_offset` from COM, so
+    // `anchor_voxel = floor((anchor - grid_offset) / voxel_size_m)`.
+    let joint_winners: Vec<Option<usize>> = taken_joints
+        .iter()
+        .map(|j| {
+            let (kernel, anchor) = if j.body_a == parent_slot {
+                (&j.kernel_a, j.anchor_a)
+            } else if j.body_b == parent_slot {
+                (&j.kernel_b, j.anchor_b)
+            } else {
+                // Joint doesn't reference the parent slot — shouldn't happen
+                // (take_joints_for_slot only returns joints touching the
+                // slot), but guard against it: no transfer.
+                return None;
+            };
+            if kernel.is_empty() {
+                return None;
+            }
+            let anchor_voxel = ((anchor - parent.grid_offset) / voxel_size_m)
+                .floor()
+                .as_ivec3();
+            majority_fragment(&components, anchor_voxel, kernel)
+        })
+        .collect();
+    // `components` borrow ends here — all vote results are plain `Option<usize>`.
+
+    // Spawn all fragments, recording the new slot per component index.
+    let mut ids = Vec::new();
+    let mut new_slots: Vec<Option<usize>> = vec![None; n];
+    for (i, (sub_grid, sub_min)) in components.into_iter().enumerate() {
+        let (_, props, spawnable) = comp_meta[i];
+        if !spawnable {
             continue;
         }
         let sub_com_world = parent.pos
@@ -296,9 +403,37 @@ fn finish_carve(
             // (which may have occupied this same slot before despawn).
             body.topology_revision = parent.topology_revision.wrapping_add(1);
             body.refresh_aabb();
-            ids.push(phys.spawn(body));
+            let id = phys.spawn(body);
+            new_slots[i] = Some(id.slot as usize);
+            ids.push(id);
         }
     }
+
+    // Apply joint transfer: re-point each joint from the parent slot to the
+    // winning fragment's new slot, adjusting the anchor from the parent's
+    // COM frame to the fragment's COM frame. Joints with no winner (empty
+    // kernel, no majority, or winning fragment wasn't spawned) are simply
+    // dropped — detached, the backward-compatible default.
+    //
+    // The anchor adjustment: the parent's anchor is COM-relative. The
+    // fragment's COM differs by `sub_min * voxel_size + grid_offset +
+    // props.com_local` (in the parent's body frame, since fragment.rot ==
+    // parent.rot). So `new_anchor = anchor - sub_min * voxel_size -
+    // grid_offset - props.com_local`.
+    for (mut joint, winner) in taken_joints.into_iter().zip(joint_winners) {
+        let Some(wi) = winner else { continue };
+        let Some(new_slot) = new_slots[wi] else { continue };
+        let (sub_min, props, _) = comp_meta[wi];
+        let anchor_delta = sub_min.as_vec3() * voxel_size_m + parent.grid_offset + props.com_local;
+        if joint.body_a == parent_slot {
+            joint.anchor_a -= anchor_delta;
+        }
+        if joint.body_b == parent_slot {
+            joint.anchor_b -= anchor_delta;
+        }
+        phys.rejoint(joint, parent_slot, new_slot);
+    }
+
     ids
 }
 /// Apply damage to a debris body's voxels. Sub-threshold impacts call this
@@ -345,8 +480,10 @@ pub fn apply_body_damage(
         // path goes through finish_carve, which sets each fragment to
         // parent.topology_revision + 1 -- that satisfies "increment when
         // voxels crumble."
+        let parent_slot = id.slot as usize;
+        let taken_joints = phys.take_joints_for_slot(parent_slot);
         phys.despawn(id);
-        Some(finish_carve(phys, registry, grid, voxel_size_m, parent))
+        Some(finish_carve(phys, registry, grid, voxel_size_m, parent, parent_slot, taken_joints))
     } else {
         // No crumble -- damage-only is not a topology change (no voxels
         // became air, surface/contact geometry is unchanged). Mutate the
@@ -390,8 +527,10 @@ pub fn carve_body_voxel_at(
         // Pass the parent's current revision; finish_carve adds +1.
         topology_revision: body.topology_revision,
     };
+    let parent_slot = id.slot as usize;
+    let taken_joints = phys.take_joints_for_slot(parent_slot);
     phys.despawn(id);
-    finish_carve(phys, registry, grid, voxel_size_m, parent)
+    finish_carve(phys, registry, grid, voxel_size_m, parent, parent_slot, taken_joints)
 }
 
 /// Carve a sphere out of an existing body's own grid (world-space center),
@@ -426,8 +565,10 @@ pub fn carve_body_sphere_at(
         // Pass the parent's current revision; finish_carve adds +1.
         topology_revision: body.topology_revision,
     };
+    let parent_slot = id.slot as usize;
+    let taken_joints = phys.take_joints_for_slot(parent_slot);
     phys.despawn(id);
-    finish_carve(phys, registry, grid, voxel_size_m, parent)
+    finish_carve(phys, registry, grid, voxel_size_m, parent, parent_slot, taken_joints)
 }
 
 /// Fraction of an impact fracture's removed voxels that become tiny flying
@@ -602,8 +743,10 @@ pub fn carve_body_sphere_at_impact(
         // Pass the parent's current revision; finish_carve adds +1.
         topology_revision: body.topology_revision,
     };
+    let parent_slot = id.slot as usize;
+    let taken_joints = phys.take_joints_for_slot(parent_slot);
     phys.despawn(id);
-    let mut ids = finish_carve(phys, registry, grid, voxel_size_m, parent);
+    let mut ids = finish_carve(phys, registry, grid, voxel_size_m, parent, parent_slot, taken_joints);
     ids.extend(spawn_impact_chips(
         phys,
         registry,
@@ -650,8 +793,10 @@ pub fn carve_body_explosion_at(
         // Pass the parent's current revision; finish_carve adds +1.
         topology_revision: body.topology_revision,
     };
+    let parent_slot = id.slot as usize;
+    let taken_joints = phys.take_joints_for_slot(parent_slot);
     phys.despawn(id);
-    finish_carve(phys, registry, grid, voxel_size_m, parent)
+    finish_carve(phys, registry, grid, voxel_size_m, parent, parent_slot, taken_joints)
 }
 
 /// Carve a tunnel through an existing body's own grid (world-space
@@ -687,8 +832,10 @@ pub fn carve_body_capsule_at(
         // Pass the parent's current revision; finish_carve adds +1.
         topology_revision: body.topology_revision,
     };
+    let parent_slot = id.slot as usize;
+    let taken_joints = phys.take_joints_for_slot(parent_slot);
     phys.despawn(id);
-    finish_carve(phys, registry, grid, voxel_size_m, parent)
+    finish_carve(phys, registry, grid, voxel_size_m, parent, parent_slot, taken_joints)
 }
 
 #[cfg(test)]
@@ -921,5 +1068,151 @@ mod tests {
                 "crumble fragment of a revision-0 body must be at revision 1"
             );
         }
+    }
+
+    #[test]
+    fn joint_with_kernel_transfers_to_majority_fragment() {
+        // A 1x1x20 bar (voxel size 1m) joined to a static anchor body.
+        // The bar runs along z (dims 1x1x20, grid_offset = (-0.5, -0.5, -10)).
+        // The joint's kernel_a is a 3-voxel neighborhood around the anchor at
+        // z=18 (near the far end). Carving the middle splits the bar; the far
+        // fragment owns all 3 kernel voxels, so the joint transfers to it.
+        let reg = registry();
+        let grid = solid_grid(IVec3::new(1, 1, 20));
+        let mut phys = PhysicsWorld::new();
+
+        // Bar at COM (0,10,0); grid spans world z [0, 20).
+        let bar = Body::from_grid(grid, &reg, 1.0, Vec3::new(0.0, 10.0, 0.0)).unwrap();
+        let bar_id = phys.spawn(bar);
+
+        // A separate anchor body to join to.
+        let anchor_grid = solid_grid(IVec3::splat(2));
+        let anchor_body =
+            Body::from_grid(anchor_grid, &reg, 1.0, Vec3::new(5.0, 15.0, 0.0)).unwrap();
+        let anchor_id = phys.spawn(anchor_body);
+
+        // Anchor on bar at COM + (0, 0, 8) → grid voxel (0, 0, 18).
+        // Kernel: 3 voxels centered on (0, 0, 18) along z.
+        let anchor_bar = Vec3::new(0.0, 0.0, 8.0);
+        let kernel = vec![
+            IVec3::new(0, 0, -1),
+            IVec3::new(0, 0, 0),
+            IVec3::new(0, 0, 1),
+        ];
+        phys.add_joint_with_kernel(
+            bar_id,
+            anchor_id,
+            anchor_bar,
+            Vec3::ZERO,
+            5.0,
+            0.0,
+            kernel,
+            Vec::new(),
+        );
+        assert_eq!(phys.joints().len(), 1, "joint must exist before carve");
+
+        // Carve at the bar's COM (world z=10): removes voxel z=10, splitting
+        // into [0..10) = 10 voxels and [11..20) = 9 voxels. Same as the
+        // existing bar-split test.
+        let center_world = phys.get(bar_id).unwrap().pos;
+        let spawned = carve_body_sphere_at(&mut phys, &reg, bar_id, center_world, 0.6);
+        assert_eq!(spawned.len(), 2, "must split into two fragments");
+        assert!(phys.get(bar_id).is_none(), "original bar must be gone");
+
+        // The joint must still exist, now pointing from a fragment to anchor_id.
+        assert_eq!(phys.joints().len(), 1, "joint must transfer, not detach");
+        let j = &phys.joints()[0];
+        assert!(
+            j.body_a == anchor_id.slot as usize || j.body_b == anchor_id.slot as usize,
+            "joint must still reference the anchor body"
+        );
+        // The other side must be one of the spawned fragments, not the old bar slot.
+        let frag_slot = if j.body_a == anchor_id.slot as usize {
+            j.body_b
+        } else {
+            j.body_a
+        };
+        assert!(
+            spawned.iter().any(|id| id.slot as usize == frag_slot),
+            "joint must point to a spawned fragment, not the old bar slot"
+        );
+    }
+
+    #[test]
+    fn joint_with_empty_kernel_detaches_on_fracture() {
+        // Same 1x1x20 bar as the transfer test, but with an empty kernel
+        // (backward-compatible default). The joint must detach when the bar
+        // splits — no transfer.
+        let reg = registry();
+        let grid = solid_grid(IVec3::new(1, 1, 20));
+        let mut phys = PhysicsWorld::new();
+
+        let bar = Body::from_grid(grid, &reg, 1.0, Vec3::new(0.0, 10.0, 0.0)).unwrap();
+        let bar_id = phys.spawn(bar);
+
+        let anchor_grid = solid_grid(IVec3::splat(2));
+        let anchor_body =
+            Body::from_grid(anchor_grid, &reg, 1.0, Vec3::new(5.0, 15.0, 0.0)).unwrap();
+        let anchor_id = phys.spawn(anchor_body);
+
+        // add_joint (no kernel) = backward-compatible.
+        phys.add_joint(bar_id, anchor_id, Vec3::new(0.0, 0.0, 8.0), Vec3::ZERO, 5.0, 0.0);
+        assert_eq!(phys.joints().len(), 1);
+
+        let center_world = phys.get(bar_id).unwrap().pos;
+        let _spawned = carve_body_sphere_at(&mut phys, &reg, bar_id, center_world, 0.6);
+
+        assert_eq!(
+            phys.joints().len(),
+            0,
+            "empty-kernel joint must detach on fracture (backward compat)"
+        );
+    }
+
+    #[test]
+    fn joint_with_no_majority_detaches() {
+        // Kernel straddles the carve boundary so no fragment owns a majority.
+        // 1x1x20 bar at COM (0,10,0); grid_offset = (-0.5, -0.5, -10).
+        // Anchor at COM + (0,0,0) → grid voxel (0,0,10). Kernel offsets
+        // [-2, 0, +2] along z → voxels 8, 10, 12. Carving at the COM removes
+        // voxels 9 and 10 (both within 0.6m of world z=0). Voxel 8 survives
+        // in the bottom fragment [0..9), voxel 12 survives in the top
+        // fragment [11..20) — 1 vs 1, no majority → detach.
+        let reg = registry();
+        let grid = solid_grid(IVec3::new(1, 1, 20));
+        let mut phys = PhysicsWorld::new();
+
+        let bar = Body::from_grid(grid, &reg, 1.0, Vec3::new(0.0, 10.0, 0.0)).unwrap();
+        let bar_id = phys.spawn(bar);
+
+        let anchor_grid = solid_grid(IVec3::splat(2));
+        let anchor_body =
+            Body::from_grid(anchor_grid, &reg, 1.0, Vec3::new(5.0, 15.0, 0.0)).unwrap();
+        let anchor_id = phys.spawn(anchor_body);
+
+        let anchor_bar = Vec3::new(0.0, 0.0, 0.0);
+        let kernel = vec![
+            IVec3::new(0, 0, -2),
+            IVec3::new(0, 0, 0),
+            IVec3::new(0, 0, 2),
+        ];
+        phys.add_joint_with_kernel(
+            bar_id,
+            anchor_id,
+            anchor_bar,
+            Vec3::ZERO,
+            5.0,
+            0.0,
+            kernel,
+            Vec::new(),
+        );
+
+        let center_world = phys.get(bar_id).unwrap().pos;
+        let _spawned = carve_body_sphere_at(&mut phys, &reg, bar_id, center_world, 0.6);
+        assert_eq!(
+            phys.joints().len(),
+            0,
+            "no-majority kernel must detach the joint"
+        );
     }
 }

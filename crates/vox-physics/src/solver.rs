@@ -5,7 +5,7 @@
 //! face) so stacks converge across frames; settled bodies sleep at ~zero
 //! cost until an impulse or a nearby world edit wakes them.
 
-use glam::{Mat3, Quat, Vec3};
+use glam::{IVec3, Mat3, Quat, Vec3};
 use vox_core::consts::{
     CLUTTER_LIFETIME_MAX_S, CLUTTER_LIFETIME_MIN_S, CLUTTER_MAX_VOXELS, CONTACT_SLOP, GRAVITY,
     SLEEP_FRAMES, SOLVER_ITERS, SUBSTEPS,
@@ -72,6 +72,13 @@ pub struct Joint {
     pub anchor_a: Vec3,
     /// Anchor on body B, relative to COM, body-local frame.
     pub anchor_b: Vec3,
+    /// Kernel voxels around anchor A: body-local voxel coords (grid frame)
+    /// describing the neighborhood the anchor lives in. Used by fracture
+    /// to decide which fragment inherits this joint when the parent body
+    /// splits. Empty = backward-compatible (no kernel transfer).
+    pub kernel_a: Vec<IVec3>,
+    /// Kernel voxels around anchor B (body B's grid frame).
+    pub kernel_b: Vec<IVec3>,
     /// Rest length between anchors (meters).
     pub rest_length: f32,
     /// Accumulated Lagrange multiplier (warm start).
@@ -265,6 +272,7 @@ impl PhysicsWorld {
     }
 
     /// Add a distance joint between two bodies. Returns the joint index.
+    /// Backward-compatible: no kernel (empty), so fracture detaches as before.
     pub fn add_joint(
         &mut self,
         a: BodyId,
@@ -274,11 +282,33 @@ impl PhysicsWorld {
         rest_length: f32,
         compliance: f32,
     ) -> usize {
+        self.add_joint_with_kernel(a, b, anchor_a, anchor_b, rest_length, compliance, Vec::new(), Vec::new())
+    }
+
+    /// Like [`add_joint`](Self::add_joint) but attaches kernel voxels to each
+    /// anchor. `kernel_a`/`kernel_b` are body-local voxel coordinates (grid
+    /// frame) around the anchor point. When the body is later carved/split,
+    /// the fragment owning the majority of these voxels inherits the joint;
+    /// if no fragment owns a majority, the joint is detached. Empty kernels
+    /// reproduce the current detach-on-fracture behavior.
+    pub fn add_joint_with_kernel(
+        &mut self,
+        a: BodyId,
+        b: BodyId,
+        anchor_a: Vec3,
+        anchor_b: Vec3,
+        rest_length: f32,
+        compliance: f32,
+        kernel_a: Vec<IVec3>,
+        kernel_b: Vec<IVec3>,
+    ) -> usize {
         let joint = Joint {
             body_a: a.slot as usize,
             body_b: b.slot as usize,
             anchor_a,
             anchor_b,
+            kernel_a,
+            kernel_b,
             rest_length,
             acc_lambda: 0.0,
             compliance,
@@ -297,6 +327,40 @@ impl PhysicsWorld {
     /// Remove all joints referencing a given body slot (called on despawn).
     fn remove_joints_for_slot(&mut self, slot: usize) {
         self.joints.retain(|j| j.body_a != slot && j.body_b != slot);
+    }
+
+    /// Detach all joints referencing `slot` *without* discarding them,
+    /// returning them for later re-attachment to a winning fragment (see
+    /// [`rejoint`]). Unlike [`remove_joints_for_slot`], this preserves the
+    /// joint data so fracture can transfer it. Call this *before* despawn.
+    pub(crate) fn take_joints_for_slot(&mut self, slot: usize) -> Vec<Joint> {
+        let mut taken = Vec::new();
+        let mut rest = Vec::new();
+        for j in self.joints.drain(..) {
+            if j.body_a == slot || j.body_b == slot {
+                taken.push(j);
+            } else {
+                rest.push(j);
+            }
+        }
+        self.joints = rest;
+        taken
+    }
+
+    /// Re-attach a joint that was detached via [`take_joints_for_slot`],
+    /// re-pointing it from the old parent slot to the winning fragment's
+    /// new slot. `old_slot` is the parent slot the joint referenced on the
+    /// kernel side; `new_slot` is the fragment that won the majority vote.
+    /// If the joint's other endpoint also references `old_slot` (a self-joint
+    /// where both anchors were on the same body), both sides are re-pointed.
+    pub(crate) fn rejoint(&mut self, mut joint: Joint, old_slot: usize, new_slot: usize) {
+        if joint.body_a == old_slot {
+            joint.body_a = new_slot;
+        }
+        if joint.body_b == old_slot {
+            joint.body_b = new_slot;
+        }
+        self.joints.push(joint);
     }
 
     /// Read access to joints (for debugging/rendering).
