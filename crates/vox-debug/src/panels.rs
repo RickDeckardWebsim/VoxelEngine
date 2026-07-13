@@ -10,6 +10,7 @@ use crate::OverlayState;
 pub fn build(ctx: &Context, mut state: OverlayState<'_>) {
     stats_window(ctx, &state);
     tuning_window(ctx, &mut state);
+    entity_window(ctx, &state);
 }
 
 fn stats_window(ctx: &Context, state: &OverlayState<'_>) {
@@ -132,5 +133,28 @@ fn tuning_window(ctx: &Context, state: &mut OverlayState<'_>) {
                         ui.selectable_value(state.selected_material, i, name);
                     }
                 });
+        });
+}
+
+fn entity_window(ctx: &Context, state: &OverlayState<'_>) {
+    Window::new("Entities")
+        .default_pos([320.0, 8.0])
+        .resizable(true)
+        .show(ctx, |ui| {
+            ui.label(format!("Entity count: {}", state.ecs_entity_count));
+            ui.separator();
+            if state.ecs_entities.is_empty() {
+                ui.label("(no entities — press G to spawn a projectile)");
+                return;
+            }
+            ui.label("Slot | Name | Position");
+            for &(slot, ref name, pos) in state.ecs_entities {
+                ui.label(format!(
+                    "#{slot} | {name} | ({:.1}, {:.1}, {:.1})",
+                    pos[0], pos[1], pos[2]
+                ));
+            }
+            ui.separator();
+            ui.label("F5 = save scene | F6 = load scene");
         });
 }

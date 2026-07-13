@@ -2193,6 +2193,15 @@ impl App for VoxApp {
                 .map(|d| d.color)
                 .unwrap_or([0.8, 0.8, 0.8]),
         };
+        let ecs_entity_list: Vec<(u32, String, [f32; 3])> = self
+            .ecs
+            .entities()
+            .filter_map(|id| {
+                let name = self.ecs.get::<ecs_components::Name>(id).map(|n| n.0.clone()).unwrap_or("Unnamed".to_string());
+                let pos = self.ecs.get::<ecs_components::Transform>(id).map(|t| [t.pos.x, t.pos.y, t.pos.z]).unwrap_or([0.0; 3]);
+                Some((id.slot(), name, pos))
+            })
+            .collect();
         let debug_state = self.debug_visible.then(|| OverlayState {
             profile: &self.profile,
             tunables: &mut self.tunables,
@@ -2214,6 +2223,8 @@ impl App for VoxApp {
                 Quality::High => "high",
                 Quality::Ultra => "ultra",
             },
+            ecs_entity_count: self.ecs.entity_count(),
+            ecs_entities: &ecs_entity_list,
         });
         let prepared_overlay = self.debug_overlay.prepare(
             &self.window,

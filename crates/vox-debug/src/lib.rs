@@ -44,6 +44,8 @@ pub struct OverlayState<'a> {
     pub selected_material: &'a mut usize,
     pub always_day: &'a mut bool,
     pub quality_label: &'a str,
+    pub ecs_entity_count: usize,
+    pub ecs_entities: &'a [(u32, String, [f32; 3])],
 }
 /// Output of [`DebugOverlay::prepare`]: owned, tessellated draw data ready
 /// to record into a render pass via [`DebugOverlay::paint`].
