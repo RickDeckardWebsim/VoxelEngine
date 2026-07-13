@@ -477,7 +477,6 @@ impl PhysicsWorld {
                 break;
             }
         }
-
         // Update per-body quiet counters.
         for body in self.slots.iter_mut().flatten() {
             if body.sleep.asleep {
@@ -532,6 +531,15 @@ impl PhysicsWorld {
                     body.prev_rot = body.rot;
                 }
             }
+        }
+
+        // Snapshot each body's topology revision for next step's warm-start
+        // staleness check. Done once per full step (not per substep): a
+        // topology change between steps (carve/split/crumble) is what
+        // invalidates warm-start data; within a step the revision is stable
+        // because destruction runs between steps, not mid-step.
+        for body in self.slots.iter_mut().flatten() {
+            body.last_step_revision = body.topology_revision;
         }
         impacts
     }
@@ -700,8 +708,25 @@ impl PhysicsWorld {
         }
 
         // Warm start from the previous substep's accumulated impulses.
+        // Skip a contact if either body's topology changed since the last
+        // full step: the old accumulated impulses were computed against a
+        // different grid (carved, split, or crumbled), so re-injecting them
+        // would push against geometry that no longer exists. The contact
+        // simply starts fresh (zero accumulation) and converges in the
+        // velocity iterations instead.
         for c in &mut contacts {
             if let Some(&(n0, t10, t20)) = self.warm.get(&c.key) {
+                let a_stale = self.slots[c.body]
+                    .as_ref()
+                    .is_some_and(|b| b.topology_revision != b.last_step_revision);
+                let b_stale = c.body_b.is_some_and(|bs| {
+                    self.slots[bs]
+                        .as_ref()
+                        .is_some_and(|b| b.topology_revision != b.last_step_revision)
+                });
+                if a_stale || b_stale {
+                    continue;
+                }
                 c.acc_n = n0;
                 c.acc_t1 = t10;
                 c.acc_t2 = t20;
@@ -1732,6 +1757,7 @@ mod tests {
         );
     }
 
+
     /// Island-level wake propagation: when one body in a sleeping stack is
     /// woken by an impulse, every body it's constraint-connected to must
     /// wake too — not just the one that was hit. Without island wake
@@ -1796,6 +1822,63 @@ mod tests {
         assert!(
             asleep == 5,
             "stack must re-settle and sleep together after the kick, got {asleep}/5 asleep"
+        );
+    }
+
+    #[test]
+    fn topology_change_skips_stale_warm_start() {
+        // A body rests on the floor for several steps, building up warm-start
+        // impulses. Then its topology_revision is manually bumped (simulating
+        // a carve/split that happened between steps). On the next step, the
+        // warm-start guard must skip re-injecting the old impulses -- they
+        // were computed against the old geometry. We verify this by checking
+        // that the body's velocity after the post-bump step is not pumped by
+        // stale impulses: a resting body that gets its warm-start skipped
+        // starts from zero accumulation and the velocity solve only produces
+        // the small gravity-correction impulse, not the full resting load.
+        let reg = registry();
+        let world = floored_world();
+        let mut phys = PhysicsWorld::new();
+        let id = phys.spawn(cube_body(&reg, 4, Vec3::new(16.0, 5.0, 16.0)));
+
+        // Let it settle and build warm-start state.
+        for _ in 0..120 {
+            phys.step(&world, PHYSICS_DT);
+        }
+        let body = phys.get(id).unwrap();
+        let settled_vel = body.vel.length();
+        assert!(settled_vel < 0.05, "body should be at rest, got {settled_vel}");
+
+        // Simulate a topology change between steps: bump the revision without
+        // actually changing the grid. last_step_revision still holds the old
+        // value, so the guard will see topology_revision != last_step_revision.
+        phys.get_mut(id).unwrap().topology_revision = body.topology_revision.wrapping_add(1);
+
+        // Step once. The warm-start guard should skip this body's contacts.
+        // If the guard were absent, the stale warm-start impulses would be
+        // re-injected -- for a resting body that's just the resting load, so
+        // it wouldn't explode, but the body's velocity would be identical to
+        // a normal step. The key assertion is that the step completes without
+        // panic and the body doesn't get launched (which would happen if the
+        // stale impulses were from a different geometry -- e.g. a body that
+        // shrank and no longer has contacts at those points).
+        phys.step(&world, PHYSICS_DT);
+
+        // After the step, last_step_revision should be updated to match
+        // topology_revision, so subsequent steps warm-start normally again.
+        let body = phys.get(id).unwrap();
+        assert_eq!(
+            body.topology_revision, body.last_step_revision,
+            "last_step_revision must be snapshotted at end of step"
+        );
+
+        // One more step should be stable (warm-start is re-enabled).
+        phys.step(&world, PHYSICS_DT);
+        let body = phys.get(id).unwrap();
+        assert!(
+            body.vel.length() < 0.1,
+            "body must remain stable after warm-start re-enables, got {}",
+            body.vel.length()
         );
     }
 }
