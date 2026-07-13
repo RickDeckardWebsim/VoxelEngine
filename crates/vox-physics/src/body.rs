@@ -357,6 +357,19 @@ pub struct Body {
     pub lifetime_s: Option<f32>,
     /// True when damage values changed since last mesh. Cleared after re-mesh.
     pub damage_dirty: bool,
+    /// Monotonically incremented whenever the body's voxel grid is modified
+    /// (carve, split, crumble). Infrastructure for invalidating stale data
+    /// that depends on geometry: the solver's warm-start impulses, the
+    /// render system's re-mesh decision, and future parallel fracture jobs.
+    /// A brand-new body starts at 0; each fragment from a split inherits
+    /// `parent_revision + 1`.
+    pub topology_revision: u32,
+    /// Snapshot of [`topology_revision`](Self::topology_revision) taken at the
+    /// end of the previous full [`PhysicsWorld::step`]. The warm-start code
+    /// compares the two: if they differ, the body's geometry changed between
+    /// steps and the old accumulated contact impulses are stale, so warm
+    /// starting is skipped for that body's contacts.
+    pub last_step_revision: u32,
 }
 
 impl Body {
@@ -393,6 +406,8 @@ impl Body {
             prev_rot: Quat::IDENTITY,
             lifetime_s: None,
             damage_dirty: false,
+            topology_revision: 0,
+            last_step_revision: 0,
             inv_iw: Mat3::IDENTITY,
         };
         body.refresh_aabb();

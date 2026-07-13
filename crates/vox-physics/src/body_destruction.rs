@@ -245,6 +245,10 @@ struct ParentState {
     vel: Vec3,
     omega: Vec3,
     grid_offset: Vec3,
+    /// Parent's topology revision at carve time. Each fragment inherits
+    /// `parent_revision + 1` so the solver can tell a freshly-split body
+    /// apart from its predecessor's stale warm-start state.
+    topology_revision: u32,
 }
 
 impl ParentState {
@@ -284,6 +288,13 @@ fn finish_carve(
             body.prev_rot = parent.rot;
             body.vel = parent.vel + parent.omega.cross(sub_com_world - parent.pos);
             body.omega = parent.omega;
+            // Each fragment inherits parent_revision + 1: the grid was
+            // carved and split, a topology change. last_step_revision stays
+            // 0 (from from_grid's default) so the warm-start guard sees
+            // topology_revision != last_step_revision on the first step and
+            // skips the stale impulses left in `self.warm` by the parent
+            // (which may have occupied this same slot before despawn).
+            body.topology_revision = parent.topology_revision.wrapping_add(1);
             body.refresh_aabb();
             ids.push(phys.spawn(body));
         }
@@ -317,8 +328,8 @@ pub fn apply_body_damage(
         vel: body.vel,
         omega: body.omega,
         grid_offset: body.grid_offset,
+        topology_revision: body.topology_revision,
     };
-
     let mut crumbled = false;
     for &(voxel_pos, amount) in damage_voxels {
         if grid.add_damage(voxel_pos, amount) {
@@ -330,11 +341,17 @@ pub fn apply_body_damage(
     }
 
     if crumbled {
-        // Despawn + split + respawn, same as the fracture path.
+        // Crumble is a topology change (voxels became air). The crumble
+        // path goes through finish_carve, which sets each fragment to
+        // parent.topology_revision + 1 -- that satisfies "increment when
+        // voxels crumble."
         phys.despawn(id);
         Some(finish_carve(phys, registry, grid, voxel_size_m, parent))
     } else {
-        // No crumble -- mutate the body's grid in-place.
+        // No crumble -- damage-only is not a topology change (no voxels
+        // became air, surface/contact geometry is unchanged). Mutate the
+        // grid in-place, set damage_dirty for the render system, but leave
+        // topology_revision alone.
         if let Some(body) = phys.get_mut(id) {
             body.grid = grid;
             body.damage_dirty = true;
@@ -370,6 +387,8 @@ pub fn carve_body_voxel_at(
         vel: body.vel,
         omega: body.omega,
         grid_offset: body.grid_offset,
+        // Pass the parent's current revision; finish_carve adds +1.
+        topology_revision: body.topology_revision,
     };
     phys.despawn(id);
     finish_carve(phys, registry, grid, voxel_size_m, parent)
@@ -404,6 +423,8 @@ pub fn carve_body_sphere_at(
         vel: body.vel,
         omega: body.omega,
         grid_offset: body.grid_offset,
+        // Pass the parent's current revision; finish_carve adds +1.
+        topology_revision: body.topology_revision,
     };
     phys.despawn(id);
     finish_carve(phys, registry, grid, voxel_size_m, parent)
@@ -519,6 +540,12 @@ fn spawn_impact_chips(
         else {
             continue;
         };
+        // Chips are spawned into potentially reused freed slots. A fresh
+        // body defaults to revision 0 == last_step 0, which would make the
+        // warm-start guard think the body is unchanged and re-inject the
+        // stale impulses left by whatever body previously occupied this
+        // slot. Set parent+1 so the guard fires on the first step.
+        body.topology_revision = parent.topology_revision.wrapping_add(1);
 
         // Radial scatter from the cluster's actual position, not the seed.
         let radial_dir = (cluster_center_world - parent.pos).normalize_or(dir);
@@ -572,6 +599,8 @@ pub fn carve_body_sphere_at_impact(
         vel: body.vel,
         omega: body.omega,
         grid_offset: body.grid_offset,
+        // Pass the parent's current revision; finish_carve adds +1.
+        topology_revision: body.topology_revision,
     };
     phys.despawn(id);
     let mut ids = finish_carve(phys, registry, grid, voxel_size_m, parent);
@@ -618,6 +647,8 @@ pub fn carve_body_explosion_at(
         vel: body.vel,
         omega: body.omega,
         grid_offset: body.grid_offset,
+        // Pass the parent's current revision; finish_carve adds +1.
+        topology_revision: body.topology_revision,
     };
     phys.despawn(id);
     finish_carve(phys, registry, grid, voxel_size_m, parent)
@@ -653,6 +684,8 @@ pub fn carve_body_capsule_at(
         vel: body.vel,
         omega: body.omega,
         grid_offset: body.grid_offset,
+        // Pass the parent's current revision; finish_carve adds +1.
+        topology_revision: body.topology_revision,
     };
     phys.despawn(id);
     finish_carve(phys, registry, grid, voxel_size_m, parent)
@@ -809,5 +842,84 @@ mod tests {
         // Right component (voxel 3) should have 0 damage.
         let right = components.iter().find(|(_, min)| min.x == 3).unwrap();
         assert_eq!(right.0.damage_at(IVec3::ZERO), 0.0, "right fragment must be pristine");
+    }
+
+    #[test]
+    fn fresh_body_starts_at_revision_zero() {
+        let reg = registry();
+        let grid = solid_grid(IVec3::splat(3));
+        let body = Body::from_grid(grid, &reg, 0.2, Vec3::ZERO).unwrap();
+        assert_eq!(body.topology_revision, 0, "fresh body starts at revision 0");
+        assert_eq!(body.last_step_revision, 0);
+    }
+
+    #[test]
+    fn carved_fragments_inherit_parent_revision_plus_one() {
+        // carve_*_at passes the parent's current revision (no bump), and
+        // finish_carve adds +1. So fragments of a revision-0 body land at 1.
+        let reg = registry();
+        let grid = solid_grid(IVec3::new(1, 1, 20));
+        let mut phys = PhysicsWorld::new();
+        let body = Body::from_grid(grid, &reg, 1.0, Vec3::new(0.0, 10.0, 0.0)).unwrap();
+        let id = phys.spawn(body);
+
+        let center_world = phys.get(id).unwrap().pos;
+        let spawned = carve_body_sphere_at(&mut phys, &reg, id, center_world, 0.6);
+
+        assert_eq!(spawned.len(), 2, "must split into two");
+        for &fid in &spawned {
+            let f = phys.get(fid).expect("alive");
+            assert_eq!(
+                f.topology_revision, 1,
+                "fragment of a revision-0 body must be at revision 1 (finish_carve +1)"
+            );
+        }
+    }
+
+    #[test]
+    fn in_place_damage_does_not_bump_revision() {
+        // apply_body_damage without a crumble is damage-only: no voxels
+        // became air, surface/contact geometry is unchanged. The topology
+        // revision must NOT change (it tracks geometry, not damage values).
+        let reg = registry();
+        let grid = solid_grid(IVec3::splat(3));
+        let mut phys = PhysicsWorld::new();
+        let id = phys.spawn(Body::from_grid(grid, &reg, 0.2, Vec3::ZERO).unwrap());
+
+        let before = phys.get(id).unwrap().topology_revision;
+        // Sub-threshold damage: 0.3 won't crumble a pristine voxel.
+        let result = apply_body_damage(
+            &mut phys,
+            &reg,
+            id,
+            &[(IVec3::ZERO, 0.3)],
+            0.2,
+        );
+        assert!(result.is_none(), "no crumble -- body stays in-place");
+        let after = phys.get(id).unwrap().topology_revision;
+        assert_eq!(after, before, "in-place damage must not bump revision");
+    }
+
+    #[test]
+    fn crumble_fragments_inherit_parent_revision_plus_one() {
+        // Crumble goes through finish_carve, which gives fragments
+        // parent.topology_revision + 1. A revision-0 body that crumbles
+        // directly (single hit >= 1.0) produces fragments at revision 1.
+        let reg = registry();
+        let grid = solid_grid(IVec3::splat(3));
+        let mut phys = PhysicsWorld::new();
+        let id = phys.spawn(Body::from_grid(grid, &reg, 0.2, Vec3::ZERO).unwrap());
+
+        // A single hit of 1.0 crumbles the voxel immediately.
+        let result = apply_body_damage(&mut phys, &reg, id, &[(IVec3::ZERO, 1.0)], 0.2);
+        assert!(result.is_some(), "must crumble and despawn");
+        let spawned = result.unwrap();
+        for &fid in &spawned {
+            let f = phys.get(fid).expect("alive");
+            assert_eq!(
+                f.topology_revision, 1,
+                "crumble fragment of a revision-0 body must be at revision 1"
+            );
+        }
     }
 }
