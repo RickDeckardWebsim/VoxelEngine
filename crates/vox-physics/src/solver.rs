@@ -15,7 +15,7 @@ use vox_world::{SolidLookup, Voxel, World};
 
 use crate::body::{Body, BodyId};
 use crate::broadphase::Broadphase;
-use crate::contact::{Contact, ContactKey, aabb_world_contacts, pair_contacts, world_contacts};
+use crate::contact::{Contact, ContactKey, pair_contacts, world_contacts};
 
 /// Relative contact speed above which a sleeping body is woken by an impact,
 /// as a multiple of the live `sleep_lin` tunable.
@@ -714,17 +714,7 @@ impl PhysicsWorld {
                 body.omega = body.omega.normalize() * MAX_ANGULAR_SPEED_RAD_S;
             }
             debug_assert!(body.vel.is_finite() && body.pos.is_finite());
-            // Jointed bodies use lightweight AABB contacts instead of
-            // per-voxel surface points. Per-voxel contacts (20+ per
-            // segment) create feedback loops with joint constraints
-            // across 2 solver iterations. AABB contacts (≤6 per body)
-            // are stable with joints and let rope segments rest on
-            // terrain instead of falling through.
-            if self.joints.iter().any(|j| j.body_a == slot || j.body_b == slot) {
-                aabb_world_contacts(body, slot, &mut contacts, &mut lookup);
-            } else {
-                world_contacts(body, slot, &mut contacts, &mut lookup);
-            }
+            world_contacts(body, slot, &mut contacts, &mut lookup);
         }
 
         // Body-body narrowphase over broadphase candidates. One staging
@@ -734,8 +724,9 @@ impl PhysicsWorld {
         let mut staged: Vec<Contact> = Vec::new();
         let pairs: Vec<(usize, usize)> = self.broadphase.candidate_pairs(&self.slots).to_vec();
         for (a, b) in pairs {
-            // Skip contact between jointed bodies — the joint handles their
-            // connection. Contacts between rope segments fight the joint.
+            // Skip contact between directly joined bodies — the joint
+            // constrains their distance. Non-adjacent segments (e.g.
+            // segment 0 and 3) still collide when the rope folds.
             if self.are_joined(a, b) {
                 continue;
             }

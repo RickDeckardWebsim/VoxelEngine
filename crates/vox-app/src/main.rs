@@ -1442,19 +1442,6 @@ impl VoxApp {
             if body.grid.solid_count() < MIN_FRACTURE_BODY_VOXELS {
                 continue;
             }
-            // Jointed bodies (rope segments) skip impact fracture: the
-            // interleaved contact+joint solver produces large phantom
-            // impulses when a segment touches terrain while constrained
-            // by joints. These are solver artifacts, not real impacts —
-            // the rope's strength (50.0) should survive any real fall,
-            // but the feedback impulses blow past it. Rope is still
-            // cuttable by tools (dig/bomb/laser carve directly, bypassing
-            // fracture entirely).
-            if self.phys.joints().iter().any(|j| {
-                j.body_a == event.body.slot as usize || j.body_b == event.body.slot as usize
-            }) {
-                continue;
-            }
             let impact_speed = event.impulse / body.mass();
             let voxel_size_m = body.half_voxel * 2.0;
             let local = body.rot.inverse() * (event.point_m - body.pos) - body.grid_offset;
