@@ -957,6 +957,101 @@ impl VoxApp {
         self.body_mesh.collect(&self.gpu, &mut self.pipeline)
     }
 
+    /// Input system: handle all key/mouse input. Returns true if the
+ /// app should exit (Escape when not grabbed).
+    fn system_input(&mut self, input: &mut InputState) -> bool {
+        self.frame_data.grabbed_this_frame = false;
+        if input.key_pressed(KeyCode::Escape) {
+            if self.grabbed {
+                self.set_grab(false);
+            } else {
+                return true;
+            }
+        }
+        if input.mouse_clicked(MouseButton::Left) && !self.grabbed {
+            self.set_grab(true);
+            self.frame_data.grabbed_this_frame = true;
+        }
+        if input.key_pressed(KeyCode::KeyF) {
+            self.player.toggle_fly();
+        }
+        if input.key_pressed(KeyCode::KeyB) {
+            let origin = self.player.eye(1.0) + self.player.look_dir() * 4.0;
+            self.spawn_debris(origin, 4, self.player.look_dir() * 8.0);
+        }
+        if input.key_pressed(KeyCode::KeyT) {
+            let t0 = std::time::Instant::now();
+            self.spawn_rope();
+            tracing::info!(elapsed_ms = t0.elapsed().as_millis(), "spawn_rope took");
+        }
+        if input.key_pressed(KeyCode::KeyX) {
+            let removed = self.phys.clear_sleeping();
+            for id in &removed {
+                self.burning_bodies.remove(id);
+                self.pipeline.remove_body((id.slot, id.generation));
+            }
+            if !removed.is_empty() {
+                tracing::info!(count = removed.len(), "cleared sleeping debris");
+            }
+        }
+        const HOTBAR_KEYS: [KeyCode; 9] = [
+            KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3,
+            KeyCode::Digit4, KeyCode::Digit5, KeyCode::Digit6,
+            KeyCode::Digit7, KeyCode::Digit8, KeyCode::Digit9,
+        ];
+        for (i, key) in HOTBAR_KEYS.into_iter().enumerate() {
+            if input.key_pressed(key)
+                && let Some(tool) = self.tools.select_hotbar_slot(i as u8 + 1)
+            {
+                tracing::info!(tool = ?tool, "tool selected");
+            }
+        }
+        if input.key_pressed(KeyCode::BracketLeft) {
+            self.tools.shrink_radius();
+            tracing::info!(radius_m = self.tools.active_radius_m(), "tool radius");
+        }
+        if input.key_pressed(KeyCode::BracketRight) {
+            self.tools.grow_radius();
+            tracing::info!(radius_m = self.tools.active_radius_m(), "tool radius");
+        }
+        if input.key_pressed(KeyCode::F3) {
+            self.debug_visible = !self.debug_visible;
+        }
+        if input.key_pressed(KeyCode::KeyM) {
+            self.toggle_mario_mode();
+        }
+        if input.key_pressed(KeyCode::KeyE) {
+            self.editor_active = !self.editor_active;
+            tracing::info!("editor mode toggled active={}", self.editor_active);
+        }
+        if input.key_pressed(KeyCode::KeyR) {
+            self.replay.toggle_recording();
+        }
+        if input.key_pressed(KeyCode::KeyP) {
+            self.replay.start_playback();
+        }
+        if input.key_pressed(KeyCode::KeyQ) {
+            let next = match self.chunk_loader.quality() {
+                Quality::Low => Quality::Medium,
+                Quality::Medium => Quality::High,
+                Quality::High => Quality::Ultra,
+                Quality::Ultra => Quality::Low,
+            };
+            self.chunk_loader.set_quality(next);
+            tracing::info!(?next, "quality switched");
+        }
+        if input.key_down(KeyCode::ControlLeft) && input.key_pressed(KeyCode::KeyZ) {
+            self.undo();
+        }
+        if input.key_down(KeyCode::ControlLeft) && input.key_pressed(KeyCode::KeyY) {
+            self.redo();
+        }
+        // Sync tunables into consuming systems.
+        self.player.fly_speed = self.tunables.fly_speed;
+        self.phys.tunables = self.tunables;
+        false
+    }
+
     /// Material-based impact destruction: check each impact this frame's
     /// physics step(s) produced against the material actually at that
     /// point. A hit whose speed (impulse/mass -- the velocity change the
@@ -1623,111 +1718,14 @@ impl VoxApp {
 
 impl App for VoxApp {
     fn frame(&mut self, input: &mut InputState, timing: FrameTiming) -> FrameControl {
-        // Measured manually (not via ScopedTimer's RAII guard): this block
-        // calls several &mut self methods (set_grab, spawn_debris, ...),
-        // which would conflict with a live &mut self.profile.input borrow.
         let input_start = Instant::now();
-        if input.key_pressed(KeyCode::Escape) {
-            if self.grabbed {
-                self.set_grab(false);
-            } else {
-                return FrameControl::Exit;
-            }
-        }
-        let mut grabbed_this_frame = false;
-        if input.mouse_clicked(MouseButton::Left) && !self.grabbed {
-            self.set_grab(true);
-            grabbed_this_frame = true;
-        }
-        if input.key_pressed(KeyCode::KeyF) {
-            self.player.toggle_fly();
-        }
-        if input.key_pressed(KeyCode::KeyB) {
-            let origin = self.player.eye(1.0) + self.player.look_dir() * 4.0;
-            self.spawn_debris(origin, 4, self.player.look_dir() * 8.0);
-        }
-        if input.key_pressed(KeyCode::KeyT) {
-            let t0 = std::time::Instant::now();
-            self.spawn_rope();
-            tracing::info!(elapsed_ms = t0.elapsed().as_millis(), "spawn_rope took");
-        }
-        if input.key_pressed(KeyCode::KeyX) {
-            let removed = self.phys.clear_sleeping();
-            for id in &removed {
-                self.burning_bodies.remove(id);
-                self.pipeline.remove_body((id.slot, id.generation));
-            }
-            if !removed.is_empty() {
-                tracing::info!(count = removed.len(), "cleared sleeping debris");
-            }
-        }
-        const HOTBAR_KEYS: [KeyCode; 9] = [
-            KeyCode::Digit1,
-            KeyCode::Digit2,
-            KeyCode::Digit3,
-            KeyCode::Digit4,
-            KeyCode::Digit5,
-            KeyCode::Digit6,
-            KeyCode::Digit7,
-            KeyCode::Digit8,
-            KeyCode::Digit9,
-        ];
-        for (i, key) in HOTBAR_KEYS.into_iter().enumerate() {
-            if input.key_pressed(key)
-                && let Some(tool) = self.tools.select_hotbar_slot(i as u8 + 1)
-            {
-                tracing::info!(tool = ?tool, "tool selected");
-            }
-        }
-        if input.key_pressed(KeyCode::BracketLeft) {
-            self.tools.shrink_radius();
-            tracing::info!(radius_m = self.tools.active_radius_m(), "tool radius");
-        }
-        if input.key_pressed(KeyCode::BracketRight) {
-            self.tools.grow_radius();
-            tracing::info!(radius_m = self.tools.active_radius_m(), "tool radius");
-        }
-        if input.key_pressed(KeyCode::F3) {
-            self.debug_visible = !self.debug_visible;
-        }
-        if input.key_pressed(KeyCode::KeyM) {
-            self.toggle_mario_mode();
-        }
-        if input.key_pressed(KeyCode::KeyE) {
-            self.editor_active = !self.editor_active;
-            tracing::info!("editor mode toggled active={}", self.editor_active);
-        }
-        if input.key_pressed(KeyCode::KeyR) {
-            self.replay.toggle_recording();
-        }
-        if input.key_pressed(KeyCode::KeyP) {
-            self.replay.start_playback();
-        }
-        if input.key_pressed(KeyCode::KeyQ) {
-            let next = match self.chunk_loader.quality() {
-                Quality::Low => Quality::Medium,
-                Quality::Medium => Quality::High,
-                Quality::High => Quality::Ultra,
-                Quality::Ultra => Quality::Low,
-            };
-            self.chunk_loader.set_quality(next);
-            tracing::info!(?next, "quality switched");
-        }
-        if input.key_down(KeyCode::ControlLeft) && input.key_pressed(KeyCode::KeyZ) {
-            self.undo();
-        }
-        if input.key_down(KeyCode::ControlLeft) && input.key_pressed(KeyCode::KeyY) {
-            self.redo();
+        let exit = self.system_input(input);
+        if exit {
+            return FrameControl::Exit;
         }
         self.profile
             .input
             .push(input_start.elapsed().as_secs_f32() * 1000.0);
-
-        // Sync the debug overlay's live tunables into the systems that
-        // actually consume them (both fields are pub; this is a cheap copy,
-        // not a real coupling).
-        self.player.fly_speed = self.tunables.fly_speed;
-        self.phys.tunables = self.tunables;
 
         let mario_active = self.mario_mode.as_ref().is_some_and(|m| m.is_active());
 
@@ -1764,7 +1762,7 @@ impl App for VoxApp {
                     .fixed_steps(&self.world, input, timing.physics_steps);
             }
         }
-        if self.grabbed && !grabbed_this_frame && !mario_active && !self.replay.is_playing() {
+        if self.grabbed && !self.frame_data.grabbed_this_frame && !mario_active && !self.replay.is_playing() {
             // Manual timing: apply_tools takes &mut self as a whole, which
             // would conflict with a live &mut self.profile.tools borrow.
             let tools_start = Instant::now();
