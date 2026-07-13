@@ -86,7 +86,6 @@ fn fs_ssao(@builtin(position) frag_pos: vec4f) -> @location(0) f32 {
     }
     let p = view_pos_from_uv(uv, depth);
     let n = reconstruct_normal(uv, depth);
-    let _ = n; // Unused in screen-space AO; kept for future normal-oriented sampling.
 
     // SSAO hemisphere sampling: for each kernel sample, project it
     // from view space back to screen space, sample the depth buffer
