@@ -35,7 +35,7 @@ use player::Player;
 use remesh::RemeshQueue;
 use tools::{CarveOutcome, HOTBAR, Tool, Tools};
 
-use vox_core::consts::{CHUNK_SIZE, REACH};
+use vox_core::consts::{CHUNK_SIZE, REACH, SLEEP_FRAMES};
 use vox_core::{
     FrameProfile, FxHashMap, FxHashSet, MaterialId, MaterialRegistry, ScopedTimer, Tunables,
     WorldConfig, chunk_origin, voxel_at,
@@ -740,9 +740,9 @@ impl VoxApp {
 
         for i in 0..5 {
             // Stack segments vertically, top segment first.
-        let seg_center = base_pos + Vec3::new(0.0, -i as f32 * seg_height_m, 0.0);
+            let seg_center = base_pos + Vec3::new(0.0, -i as f32 * seg_height_m, 0.0);
             let grid = VoxelGrid::new(seg_dims, seg_voxels.clone());
-            let Some(body) = Body::from_grid(grid, &self.registry, voxel_size, seg_center)
+            let Some(mut body) = Body::from_grid(grid, &self.registry, voxel_size, seg_center)
             else {
                 continue;
             };
@@ -751,9 +751,11 @@ impl VoxApp {
 
             if let Some(prev) = prev_id {
                 // Connect bottom of previous segment to top of this segment.
+                // rest_length = seg_height_m (end-to-end, not overlapping).
+                // compliance = 0.0 (rigid — rope should be firm, not soft).
                 let anchor_prev = Vec3::new(0.0, -half_height, 0.0);
                 let anchor_this = Vec3::new(0.0, half_height, 0.0);
-                self.phys.add_joint(prev, id, anchor_prev, anchor_this, 0.0, 0.001);
+                self.phys.add_joint(prev, id, anchor_prev, anchor_this, seg_height_m, 0.0);
             }
 
             prev_id = Some(id);
