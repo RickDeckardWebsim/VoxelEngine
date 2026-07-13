@@ -1052,6 +1052,91 @@ impl VoxApp {
         false
     }
 
+    /// Player system: player/mario/replay update + tool application.
+    /// Stores mario_active and mario_pos in frame_data for later systems.
+    fn system_player(&mut self, input: &mut InputState, timing: FrameTiming) {
+        let mario_active = self.mario_mode.as_ref().is_some_and(|m| m.is_active());
+        self.frame_data.mario_active = mario_active;
+        let mut mario_pos = Vec3::ZERO;
+
+        if self.frame_data.mario_active {
+            if self.grabbed {
+                self.mario_mode.as_mut().unwrap().look(input.mouse_delta);
+            }
+            mario_pos = self
+                .mario_mode
+                .as_mut()
+                .map(|m| m.tick(&self.world, input, timing.dt_frame))
+                .unwrap_or(Vec3::ZERO);
+            if let Some(impact_m) = self.mario_mode.as_mut().unwrap().pending_ground_pound() {
+                self.apply_ground_pound(impact_m);
+            }
+        } else if self.replay.is_playing() {
+            // Replay playback: snapshot drives player + camera.
+        } else {
+            if self.grabbed {
+                self.player.look(input.mouse_delta);
+            }
+            {
+                let _t = ScopedTimer::new(&mut self.profile.player);
+                self.player
+                    .fixed_steps(&self.world, input, timing.physics_steps);
+            }
+        }
+        if self.grabbed && !self.frame_data.grabbed_this_frame && !mario_active && !self.replay.is_playing() {
+            let tools_start = Instant::now();
+            self.apply_tools(input);
+            self.profile
+                .tools
+                .push(tools_start.elapsed().as_secs_f32() * 1000.0);
+        }
+        self.frame_data.mario_pos = mario_pos;
+    }
+
+    /// Physics system: step physics, apply impact fracture, manage debris
+    /// budget and clutter lifetime.
+    fn system_physics(&mut self, timing: FrameTiming) {
+        let impacts = {
+            let _t = ScopedTimer::new(&mut self.profile.physics);
+            let step_start = std::time::Instant::now();
+            let mut impacts = Vec::new();
+            for _ in 0..timing.physics_steps {
+                impacts.extend(self.phys.step(&self.world, vox_core::consts::PHYSICS_DT));
+            }
+            let elapsed = step_start.elapsed().as_millis();
+            if elapsed > 50 {
+                tracing::warn!(elapsed_ms = elapsed, bodies = self.phys.body_count(), "slow physics step");
+            }
+            impacts
+        };
+        self.apply_impact_fracture(impacts);
+        // Debug: check rope segment health for NaN/divergence.
+        if !self.phys.joints().is_empty() {
+            if let Some(j) = self.phys.joints().first() {
+                if let Some(body) = self.phys.iter().find(|(id, _)| id.slot as usize == j.body_a) {
+                    let (_, b) = body;
+                    if !b.pos.is_finite() || !b.vel.is_finite() || b.vel.length() > 50.0 {
+                        tracing::warn!(pos=?b.pos, vel=?b.vel, vel_len=b.vel.length(), "rope segment 0 DIVERGED");
+                    }
+                }
+            }
+        }
+        let damage_dirty_ids: Vec<BodyId> = self
+            .phys
+            .iter()
+            .filter(|(_, b)| b.damage_dirty)
+            .map(|(id, _)| id)
+            .collect();
+        for id in damage_dirty_ids {
+            self.upload_debris_mesh(id);
+            if let Some(body) = self.phys.get_mut(id) {
+                body.damage_dirty = false;
+            }
+        }
+        self.enforce_debris_budget();
+        self.expire_clutter(timing.physics_steps as f32 * vox_core::consts::PHYSICS_DT);
+    }
+
     /// Material-based impact destruction: check each impact this frame's
     /// physics step(s) produced against the material actually at that
     /// point. A hit whose speed (impulse/mass -- the velocity change the
@@ -1727,91 +1812,8 @@ impl App for VoxApp {
             .input
             .push(input_start.elapsed().as_secs_f32() * 1000.0);
 
-        let mario_active = self.mario_mode.as_ref().is_some_and(|m| m.is_active());
-
-        let mut mario_pos = Vec3::ZERO;
-
-        if mario_active {
-            // Mario mode: mouse look controls the third-person camera
-            if self.grabbed {
-                self.mario_mode.as_mut().unwrap().look(input.mouse_delta);
-            }
-            // Tick Mario's simulation
-            mario_pos = self
-                .mario_mode
-                .as_mut()
-                .map(|m| m.tick(&self.world, input, timing.dt_frame))
-                .unwrap_or(Vec3::ZERO);
-            // A ground pound may have landed this frame — carve a crater
-            // at the impact point and detach/spawn debris like a blast.
-            if let Some(impact_m) = self.mario_mode.as_mut().unwrap().pending_ground_pound() {
-                self.apply_ground_pound(impact_m);
-            }
-        } else if self.replay.is_playing() {
-            // Replay playback: the snapshot drives the player + camera, so
-            // skip the normal mouse-look + fixed_steps input handling. The
-            // snapshot is applied after the physics step below.
-        } else {
-            // FPS mode: existing player controller
-            if self.grabbed {
-                self.player.look(input.mouse_delta);
-            }
-            {
-                let _t = ScopedTimer::new(&mut self.profile.player);
-                self.player
-                    .fixed_steps(&self.world, input, timing.physics_steps);
-            }
-        }
-        if self.grabbed && !self.frame_data.grabbed_this_frame && !mario_active && !self.replay.is_playing() {
-            // Manual timing: apply_tools takes &mut self as a whole, which
-            // would conflict with a live &mut self.profile.tools borrow.
-            let tools_start = Instant::now();
-            self.apply_tools(input);
-            self.profile
-                .tools
-                .push(tools_start.elapsed().as_secs_f32() * 1000.0);
-        }
-        let impacts = {
-            let _t = ScopedTimer::new(&mut self.profile.physics);
-            let step_start = std::time::Instant::now();
-            let mut impacts = Vec::new();
-            for _ in 0..timing.physics_steps {
-                impacts.extend(self.phys.step(&self.world, vox_core::consts::PHYSICS_DT));
-            }
-            let elapsed = step_start.elapsed().as_millis();
-            if elapsed > 50 {
-                tracing::warn!(elapsed_ms = elapsed, bodies = self.phys.body_count(), "slow physics step");
-            }
-            impacts
-        };
-        self.apply_impact_fracture(impacts);
-        // Debug: check rope segment health for NaN/divergence.
-        if !self.phys.joints().is_empty() {
-            if let Some(j) = self.phys.joints().first() {
-                if let Some(body) = self.phys.iter().find(|(id, _)| id.slot as usize == j.body_a) {
-                    let (_, b) = body;
-                    if !b.pos.is_finite() || !b.vel.is_finite() || b.vel.length() > 50.0 {
-                        tracing::warn!(pos=?b.pos, vel=?b.vel, vel_len=b.vel.length(), "rope segment 0 DIVERGED");
-                    }
-                }
-            }
-        }
-        // Re-mesh debris bodies whose damage changed this frame (sub-threshold
-        // impacts set damage_dirty via apply_body_damage's in-place path).
-        let damage_dirty_ids: Vec<BodyId> = self
-            .phys
-            .iter()
-            .filter(|(_, b)| b.damage_dirty)
-            .map(|(id, _)| id)
-            .collect();
-        for id in damage_dirty_ids {
-            self.upload_debris_mesh(id);
-            if let Some(body) = self.phys.get_mut(id) {
-                body.damage_dirty = false;
-            }
-        }
-        self.enforce_debris_budget();
-        self.expire_clutter(timing.physics_steps as f32 * vox_core::consts::PHYSICS_DT);
+        self.system_player(input, timing);
+        self.system_physics(timing);
         // Replay: record (throttled internally to 1/sec) or apply the next
         // playback snapshot to the player + debris bodies. Runs after the
         // physics step so recorded body transforms are this frame's final
@@ -1833,8 +1835,8 @@ impl App for VoxApp {
         // Must run after the physics step (fresh transforms) and after
         // debris eviction/lifetime expiry (so we don't register surfaces
         // for bodies that are already gone this frame).
-        if mario_active {
-            let mario_pos = self.mario_mode.as_ref().unwrap().mario_pos_m();
+        if self.frame_data.mario_active {
+            let mario_pos = self.frame_data.mario_pos;
             let radius = mario::SURFACE_RADIUS_M + 2.0;
             let mut nearby: Vec<(u64, Vec3, glam::Quat, Vec3, Vec3)> = Vec::new();
             for (_id, body) in self.phys.iter() {
@@ -2108,9 +2110,9 @@ impl App for VoxApp {
         let dn = day_night::compute(self.game_time);
 
         // Camera: third-person around Mario in Mario mode, else player eye.
-        if mario_active {
+        if self.frame_data.mario_active {
             let mode = self.mario_mode.as_ref().unwrap();
-            self.camera.pos = mode.camera_pos(mario_pos);
+            self.camera.pos = mode.camera_pos(self.frame_data.mario_pos);
             self.camera.yaw = mode.cam_yaw;
             self.camera.pitch = mode.cam_pitch;
         } else {
@@ -2153,8 +2155,8 @@ impl App for VoxApp {
         // day/night cycle. The camera focus is the player/mario position
         // (whichever is active) so the 100 m shadow box always covers the
         // nearby terrain the eye actually sees.
-        let shadow_focus = if mario_active {
-            mario_pos
+        let shadow_focus = if self.frame_data.mario_active {
+            self.frame_data.mario_pos
         } else {
             self.camera.pos
         };
