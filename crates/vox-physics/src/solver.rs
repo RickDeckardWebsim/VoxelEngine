@@ -438,6 +438,46 @@ impl PhysicsWorld {
             }
         }
 
+        // Island wake propagation to fixpoint. When a body is woken — by an
+        // impact inside a substep, by `wake_region`/`apply_impulse` between
+        // steps, or by topology changes — every body constraint-connected
+        // to it must wake too. Without this, a fast impactor hitting one
+        // cube of a sleeping pile wakes only that cube; the rest stay
+        // asleep and are treated as static (infinite-mass) in the solver,
+        // welding the pile to the world.
+        //
+        // `Broadphase::build` skips pairs where *both* bodies are asleep, so
+        // a fully-asleep pile A–B–C–D–E is 5 singleton islands — `islands()`
+        // can only see one hop at a time. We iterate to fixpoint: each pass
+        // rebuilds broadphase (waking one hop of sleeping neighbors of any
+        // awake body), repeating until no more bodies wake. Converges in
+        // O(pile-depth) passes. This runs *before* the quiet-counter update
+        // so freshly-woken bodies start accumulating quiet steps from zero.
+        loop {
+            let islands = self.islands();
+            let mut woke = false;
+            for island in &islands {
+                let any_awake = island
+                    .iter()
+                    .any(|&s| self.slots[s].as_ref().is_some_and(|b| !b.sleep.asleep));
+                if !any_awake {
+                    continue;
+                }
+                for &s in island {
+                    if let Some(b) = self.slots[s].as_mut()
+                        && b.sleep.asleep
+                    {
+                        b.sleep.asleep = false;
+                        b.sleep.quiet_steps = 0;
+                        woke = true;
+                    }
+                }
+            }
+            if !woke {
+                break;
+            }
+        }
+
         // Update per-body quiet counters.
         for body in self.slots.iter_mut().flatten() {
             if body.sleep.asleep {
@@ -1689,6 +1729,73 @@ mod tests {
         assert!(
             (dist - 1.0).abs() < 0.15,
             "joint should maintain rest length ~1.0m, got {dist}"
+        );
+    }
+
+    /// Island-level wake propagation: when one body in a sleeping stack is
+    /// woken by an impulse, every body it's constraint-connected to must
+    /// wake too — not just the one that was hit. Without island wake
+    /// propagation, a fast impactor hitting the bottom of a sleeping stack
+    /// wakes only the bottom cube; the rest stay asleep and are treated as
+    /// static (infinite-mass) in the solver, welding the stack to the
+    /// world. The stack should collapse, not stay frozen in mid-air.
+    #[test]
+    fn impulse_on_one_sleeping_body_wakes_the_whole_island() {
+        let reg = registry();
+        let world = floored_world();
+        let mut phys = PhysicsWorld::new();
+
+        // Build a 5-cube vertical stack, let it fully settle and sleep.
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let y = 4.2 + i as f32 * 0.45;
+            ids.push(phys.spawn(cube_body(&reg, 4, Vec3::new(16.0, y, 16.0))));
+        }
+        for _ in 0..360 {
+            phys.step(&world, PHYSICS_DT);
+        }
+        for (i, id) in ids.iter().enumerate() {
+            assert!(
+                phys.get(*id).expect("alive").sleep.asleep,
+                "stack body {i} must be asleep before the kick"
+            );
+        }
+
+        // Kick the bottom cube sideways with an impulse. The bottom body
+        // wakes directly; the four above it must wake via island
+        // propagation (they're constraint-connected through contacts).
+        let bottom = ids[0];
+        let b = phys.get(bottom).expect("alive");
+        let mass = 1.0 / b.inv_mass;
+        phys.apply_impulse(bottom, Vec3::new(5.0 * mass, 0.0, 0.0), Vec3::ZERO);
+
+        // Step once: island wake propagation should have woken the entire
+        // stack. If only the bottom woke, the upper bodies would be frozen
+        // as static — the stack would look welded, not collapsing.
+        phys.step(&world, PHYSICS_DT);
+        let awake = ids
+            .iter()
+            .filter(|id| !phys.get(**id).expect("alive").sleep.asleep)
+            .count();
+        assert!(
+            awake == 5,
+            "island wake propagation must wake the whole stack, got {awake}/5 awake"
+        );
+
+        // After enough steps the kicked stack should re-settle and all
+        // sleep again (island-consensus sleep still works after wake
+        // propagation). The kick is sideways, so the stack may topple but
+        // everything should eventually come to rest.
+        for _ in 0..600 {
+            phys.step(&world, PHYSICS_DT);
+        }
+        let asleep = ids
+            .iter()
+            .filter(|id| phys.get(**id).expect("alive").sleep.asleep)
+            .count();
+        assert!(
+            asleep == 5,
+            "stack must re-settle and sleep together after the kick, got {asleep}/5 asleep"
         );
     }
 }
