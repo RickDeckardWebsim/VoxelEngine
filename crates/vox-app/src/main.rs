@@ -16,6 +16,7 @@ mod particles;
 mod player;
 mod remesh;
 mod replay;
+mod ecs_components;
 mod systems;
 mod tools;
 
@@ -986,6 +987,12 @@ impl VoxApp {
         if input.key_pressed(KeyCode::KeyB) {
             let origin = self.player.eye(1.0) + self.player.look_dir() * 4.0;
             self.spawn_debris(origin, 4, self.player.look_dir() * 8.0);
+        }
+        if input.key_pressed(KeyCode::KeyG) {
+            let pos = self.player.eye(1.0) + self.player.look_dir() * 2.0;
+            let vel = self.player.look_dir() * 20.0;
+            let id = ecs_components::spawn_projectile(&mut self.ecs, pos, vel, 5.0);
+            tracing::info!(?id, "spawned ECS projectile");
         }
         if input.key_pressed(KeyCode::KeyT) {
             let t0 = std::time::Instant::now();
@@ -1965,7 +1972,6 @@ impl VoxApp {
                 bodies_awake = self.phys.awake_count(),
                 pos = ?voxel_at(self.player.ctrl.pos, self.world.cfg.voxel_size_m),
                 grounded = self.player.ctrl.grounded,
-                "frame stats"
             );
             self.last_fps = self.frames;
             self.frames = 0;
@@ -2052,6 +2058,7 @@ impl App for VoxApp {
 
         self.system_player(input, timing);
         self.system_physics(timing);
+        ecs_components::tick_ecs(&mut self.ecs, timing.dt_frame);
         // Replay: record (throttled internally to 1/sec) or apply the next
         // playback snapshot to the player + debris bodies. Runs after the
         // physics step so recorded body transforms are this frame's final
