@@ -48,10 +48,10 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
 
-use glam::{IVec3, Vec3, Vec3Swizzles};
-use vox_core::consts::{DEBRIS_MIN_VOXELS, MAX_BODY_VOXELS};
+use glam::{IVec3, UVec3, Vec3, Vec3Swizzles};
+use vox_core::consts::{CHUNK_SIZE, DEBRIS_MIN_VOXELS, MAX_BODY_VOXELS};
 use vox_core::{FxHashMap, FxHashSet, MaterialRegistry, voxel_at, voxel_center_m};
-use vox_world::{AIR, SolidLookup, Voxel, World};
+use vox_world::{AIR, Chunk, SolidLookup, Voxel, World};
 
 use crate::BodyId;
 use crate::body::{Body, VoxelGrid, mass_props};
@@ -426,6 +426,95 @@ fn flood_from(
     FloodResult::Bounded(component)
 }
 
+
+/// For each of a chunk's 6 faces, whether any solid (present, non-air) voxel
+/// touches that face — i.e. whether the chunk is *connected to its neighbor
+/// across that face*. A face is "touched" when some voxel on the chunk's
+/// boundary slice for that axis is present (non-air): e.g. the +X face
+/// (`local.x == CHUNK_SIZE - 1`) is touched iff some voxel with
+/// `x == CHUNK_SIZE - 1` is present. The index order matches [`DIRS`]:
+/// `[+X, -X, +Y, -Y, +Z, -Z]`.
+///
+/// This captures *inter-chunk* connectivity only — whether a chunk links to
+/// its six face-neighbors. It does **not** capture intra-chunk connectivity:
+/// a carve that severs a structure entirely *within* one chunk (no removed
+/// voxel on any chunk boundary) leaves every face mask unchanged while still
+/// potentially creating floating debris. See [`edit_can_sever`] for the
+/// sound fast-path that accounts for both inter- and intra-chunk cuts.
+fn face_mask(chunk: &Chunk) -> [bool; 6] {
+    // `solid_slice_masks` gives, per axis, a [bool; CHUNK_SIZE] marking which
+    // slices contain a solid voxel. A face is touched iff the boundary slice
+    // for that face's axis+sign is solid.
+    let slices = chunk.solid_slice_masks();
+    let last = CHUNK_SIZE - 1;
+    [
+        slices[0][last],  // +X face: x == CHUNK_SIZE-1
+        slices[0][0],     // -X face: x == 0
+        slices[1][last],  // +Y face: y == CHUNK_SIZE-1
+        slices[1][0],     // -Y face: y == 0
+        slices[2][last],  // +Z face: z == CHUNK_SIZE-1
+        slices[2][0],     // -Z face: z == 0
+    ]
+}
+
+/// The 26 face-, edge-, and corner-adjacent offsets (everything but the
+/// center). Used by [`edit_can_sever`] to check whether each removed voxel
+/// was fully embedded in solid material.
+const NEIGHBORS_26: [IVec3; 26] = [
+    // Face neighbors (6)
+    IVec3::new(1, 0, 0), IVec3::new(-1, 0, 0),
+    IVec3::new(0, 1, 0), IVec3::new(0, -1, 0),
+    IVec3::new(0, 0, 1), IVec3::new(0, 0, -1),
+    // Edge neighbors (12)
+    IVec3::new(1, 1, 0), IVec3::new(-1, 1, 0), IVec3::new(1, -1, 0), IVec3::new(-1, -1, 0),
+    IVec3::new(1, 0, 1), IVec3::new(-1, 0, 1), IVec3::new(1, 0, -1), IVec3::new(-1, 0, -1),
+    IVec3::new(0, 1, 1), IVec3::new(0, -1, 1), IVec3::new(0, 1, -1), IVec3::new(0, -1, -1),
+    // Corner neighbors (8)
+    IVec3::new(1, 1, 1), IVec3::new(-1, 1, 1), IVec3::new(1, -1, 1), IVec3::new(-1, -1, 1),
+    IVec3::new(1, 1, -1), IVec3::new(-1, 1, -1), IVec3::new(1, -1, -1), IVec3::new(-1, -1, -1),
+];
+
+/// Fast "can this edit possibly have severed anything?" test, run *before*
+/// the full 6-neighbor flood in [`detach_unsupported`]. If it proves the
+/// edit cannot have disconnected any material, the flood is skipped entirely
+/// — the dominant cost of a single-voxel break deep inside a huge terrain
+/// mass, the exact case where the flood is pure waste (it always finds
+/// "anchored" but only after exploring a large component).
+///
+/// A carve can only create a disconnected component if at least one removed
+/// voxel had a neighbor (after the carve) that is now air or out of bounds —
+/// i.e. the removed voxel was on the *surface* of the solid, not fully
+/// embedded. A fully-embedded voxel (all 26 neighbors present and solid)
+/// leaves every remaining solid voxel still 6-connected through the
+/// surrounding mass: the hole it leaves is surrounded on all sides, so no
+/// surviving voxel loses its path to the rest of the structure.
+///
+/// This checks the 26-neighborhood (faces + edges + corners), not just the
+/// 6 face-neighbors, because connectivity of the *surviving* material is
+/// 6-connected but a removed voxel at the edge of a thin wall (a
+/// face-neighbor present but an edge-neighbor absent) can still sever it.
+/// Checking 26 neighbors is a cheap superset that stays sound: it can only
+/// *fail to skip* (run a flood that turns out to be unnecessary), never
+/// *wrongly skip* (miss a real detachment) — the failure direction is safe.
+///
+/// `removed` are the world-voxel positions carved away (already air in
+/// `world`). `lookup` caches chunk reads across the check.
+fn edit_can_sever(removed: &[IVec3], lookup: &mut SolidLookup<'_>) -> bool {
+    let removed_set: FxHashSet<IVec3> = removed.iter().copied().collect();
+    for &r in removed {
+        for &d in &NEIGHBORS_26 {
+            let n = r + d;
+            if removed_set.contains(&n) {
+                continue;
+            }
+            if !lookup.present(n) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Find material that became newly unsupported when `removed` was carved
 /// away, extract it from the world, and spawn each surviving component as a
 /// sleeping-eligible (initially awake, zero-velocity) rigid body. Components
@@ -451,6 +540,18 @@ pub fn detach_unsupported(
     // seeds from the same edit land in the same handful of chunks, so the
     // chunk-lookup cache carries over between them too.
     let mut lookup = SolidLookup::new(world);
+    // Fast connected-or-split test: if every removed voxel was fully embedded
+    // in solid material (all 26 neighbors present), the hole it leaves is
+    // surrounded on all sides and no surviving voxel can have lost its
+    // 6-connected path to the rest of the structure — so nothing can have
+    // become unsupported. Skip the flood entirely. This is the dominant win
+    // for a single-voxel break deep inside a huge contiguous terrain mass,
+    // where the flood always concludes "anchored" but only after exploring a
+    // large component at real cost. Sound: a false negative (missing a real
+    // detachment) is impossible — see [`edit_can_sever`].
+    if !removed.is_empty() && !edit_can_sever(removed, &mut lookup) {
+        return Vec::new();
+    }
     for &r in removed {
         for d in DIRS {
             let seed = r + d;
@@ -1409,5 +1510,196 @@ mod tests {
             0,
             "an L-shaped chip's spin must damp out and let it sleep"
         );
+    }
+
+    // ── face_mask ──────────────────────────────────────────────────
+
+    /// A fully-solid chunk touches all 6 faces.
+    #[test]
+    fn face_mask_full_chunk_touches_all_faces() {
+        let mut chunk = Chunk::new();
+        for y in 0..CHUNK_SIZE as u32 {
+            for z in 0..CHUNK_SIZE as u32 {
+                for x in 0..CHUNK_SIZE as u32 {
+                    chunk.set(UVec3::new(x, y, z), STONE);
+                }
+            }
+        }
+        let mask = face_mask(&chunk);
+        assert!(mask.iter().all(|&f| f), "fully-solid chunk touches all 6 faces");
+    }
+
+    /// An all-air chunk touches no faces.
+    #[test]
+    fn face_mask_empty_chunk_touches_no_faces() {
+        let chunk = Chunk::new();
+        let mask = face_mask(&chunk);
+        assert!(mask.iter().all(|&f| !f), "empty chunk touches no faces");
+    }
+
+    /// A voxel at a corner touches exactly 3 faces (the 3 axes it sits on).
+    #[test]
+    fn face_mask_corner_voxel_touches_three_faces() {
+        let mut chunk = Chunk::new();
+        chunk.set(UVec3::new(0, 0, 0), STONE);
+        let mask = face_mask(&chunk);
+        // -X, -Y, -Z (indices 1, 3, 5) touched; +X, +Y, +Z (0, 2, 4) not.
+        assert_eq!(mask, [false, true, false, true, false, true]);
+    }
+
+    /// Voxels only in the interior (not on any boundary slice) touch no faces.
+    #[test]
+    fn face_mask_interior_only_voxels_touch_no_faces() {
+        let mut chunk = Chunk::new();
+        // Voxels at (5,5,5) and (10,10,10): interior, no boundary contact.
+        chunk.set(UVec3::new(5, 5, 5), STONE);
+        chunk.set(UVec3::new(10, 10, 10), STONE);
+        let mask = face_mask(&chunk);
+        assert!(mask.iter().all(|&f| !f), "interior voxels touch no faces");
+    }
+
+    /// Voxels on opposite +X and -X faces: only the X faces are touched.
+    #[test]
+    fn face_mask_opposite_x_faces() {
+        let mut chunk = Chunk::new();
+        let last = CHUNK_SIZE as u32 - 1;
+        chunk.set(UVec3::new(0, 5, 5), STONE);       // -X face
+        chunk.set(UVec3::new(last, 5, 5), STONE);    // +X face
+        let mask = face_mask(&chunk);
+        assert_eq!(mask, [true, true, false, false, false, false]);
+    }
+
+    /// A voxel on the +Y face (y == CHUNK_SIZE-1) touches only +Y.
+    #[test]
+    fn face_mask_top_face_only() {
+        let mut chunk = Chunk::new();
+        let last = CHUNK_SIZE as u32 - 1;
+        chunk.set(UVec3::new(5, last, 5), STONE);
+        let mask = face_mask(&chunk);
+        // +Y is index 2.
+        assert_eq!(mask, [false, false, true, false, false, false]);
+    }
+
+    // ── edit_can_sever ─────────────────────────────────────────────
+
+    /// A single voxel removed from deep inside a solid mass: all 26
+    /// neighbors are present → cannot sever → returns false (skip the flood).
+    #[test]
+    fn edit_can_sever_deep_interior_returns_false() {
+        let mut world = test_world();
+        // A 10³ solid block — (5,5,5) is fully embedded (all 26 neighbors solid).
+        world.fill_box(IVec3::new(0, 0, 0), IVec3::new(10, 10, 10), STONE);
+        let removed = vec![IVec3::new(5, 5, 5)];
+        let mut lookup = SolidLookup::new(&world);
+        assert!(
+            !edit_can_sever(&removed, &mut lookup),
+            "interior break cannot sever anything"
+        );
+    }
+
+    /// A voxel on the surface of a solid mass has air neighbors → can sever.
+    #[test]
+    fn edit_can_sever_surface_voxel_returns_true() {
+        let mut world = test_world();
+        world.fill_box(IVec3::new(0, 0, 0), IVec3::new(10, 10, 10), STONE);
+        // Corner voxel (0,0,0): 19 of its 26 neighbors are air (out of bounds
+        // or outside the block).
+        let removed = vec![IVec3::new(0, 0, 0)];
+        let mut lookup = SolidLookup::new(&world);
+        assert!(
+            edit_can_sever(&removed, &mut lookup),
+            "surface break can sever"
+        );
+    }
+
+    /// A thin wall severed by removing its only connecting slice: the
+    /// removed voxels have edge/corner neighbors that are air → can sever.
+    /// This is the case a 6-neighbor-only check could miss but 26-neighbor
+    /// catches.
+    #[test]
+    fn edit_can_sever_thin_wall_returns_true() {
+        let mut world = test_world();
+        // A 1-voxel-thick wall in z, 5 wide in x, 5 tall in y.
+        world.fill_box(IVec3::new(5, 5, 5), IVec3::new(10, 10, 6), STONE);
+        // Remove the middle column (x=7) — severs the wall into left/right.
+        let removed: Vec<IVec3> = (5..10)
+            .flat_map(|y| (5..10).map(move |x| IVec3::new(x, y, 5)))
+            .filter(|v| v.x == 7)
+            .collect();
+        let mut lookup = SolidLookup::new(&world);
+        assert!(
+            edit_can_sever(&removed, &mut lookup),
+            "removing a wall's connecting column can sever it"
+        );
+    }
+
+    /// Removing a 3³ cube from deep inside a large solid mass: the shell
+    /// around the cavity is all solid → cannot sever → false. This is the
+    /// blast-inside-terrain case: a small crater fully surrounded by solid.
+    #[test]
+    fn edit_can_sever_small_cavity_in_large_mass_returns_false() {
+        let mut world = World::new(WorldConfig {
+            voxel_size_m: 1.0,
+            extent_m: [32.0, 32.0, 32.0],
+            ..WorldConfig::default()
+        });
+        world.fill_box(IVec3::new(0, 0, 0), IVec3::new(32, 32, 32), STONE);
+        // Remove a 3³ cube at (14,14,14) — its 26-shell is all solid.
+        let removed: Vec<IVec3> = (14..17)
+            .flat_map(|x| (14..17).flat_map(move |y| (14..17).map(move |z| IVec3::new(x, y, z))))
+            .collect();
+        let mut lookup = SolidLookup::new(&world);
+        assert!(
+            !edit_can_sever(&removed, &mut lookup),
+            "a cavity fully surrounded by solid cannot sever anything"
+        );
+    }
+
+    /// The regression that killed the naive face-mask approach: an interior
+    /// carve (no removed voxel on any chunk boundary) that severs a structure
+    /// within one chunk. `edit_can_sever` must return true (the flood must
+    /// run) — a [bool;6] face mask would be unchanged and wrongly skip.
+    #[test]
+    fn edit_can_sever_interior_pillar_cut_returns_true() {
+        let mut world = World::new(WorldConfig {
+            voxel_size_m: 1.0,
+            extent_m: [32.0, 96.0, 32.0],
+            ..WorldConfig::default()
+        });
+        // 1-wide pillar at x=5,z=5, y=0..64. The cut at y=5,6,7 is entirely
+        // interior to chunk (0,0,0) — local coords (5,5,5),(5,6,5),(5,7,5),
+        // none on a boundary (0 or 31). But it severs the pillar.
+        world.fill_box(IVec3::new(5, 0, 5), IVec3::new(6, 65, 6), STONE);
+        let removed = vec![IVec3::new(5, 5, 5), IVec3::new(5, 6, 5), IVec3::new(5, 7, 5)];
+        let mut lookup = SolidLookup::new(&world);
+        assert!(
+            edit_can_sever(&removed, &mut lookup),
+            "interior pillar cut can sever — must not be skipped by face-mask"
+        );
+    }
+
+    /// Integration: the fast-path skip fires for a deep terrain break and
+    /// `detach_unsupported` returns empty (nothing falls) — matching the
+    /// existing `breaking_a_voxel_deep_in_huge_terrain` test, but explicitly
+    /// exercising the skip path.
+    #[test]
+    fn detach_skips_flood_for_deep_interior_break() {
+        let mut world = World::new(WorldConfig {
+            voxel_size_m: 1.0,
+            extent_m: [64.0, 64.0, 64.0],
+            ..WorldConfig::default()
+        });
+        world.fill_box(IVec3::new(0, 0, 0), IVec3::new(64, 64, 64), STONE);
+        let broken = IVec3::new(32, 32, 32);
+        world.set_voxel(broken, AIR);
+
+        let reg = registry();
+        let mut phys = PhysicsWorld::new();
+        let ids = detach_unsupported(&mut world, &mut phys, &reg, &[broken]);
+        assert!(ids.is_empty(), "deep interior break detaches nothing");
+        assert_eq!(phys.body_count(), 0);
+        // The surrounding mass is untouched.
+        assert_eq!(world.get_voxel(IVec3::new(31, 32, 32)), STONE);
+        assert_eq!(world.get_voxel(IVec3::new(33, 32, 32)), STONE);
     }
 }
