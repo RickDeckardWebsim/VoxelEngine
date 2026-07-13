@@ -1137,6 +1137,159 @@ impl VoxApp {
         self.expire_clutter(timing.physics_steps as f32 * vox_core::consts::PHYSICS_DT);
     }
 
+    /// Fluid system: fluid tick, weathering, fire, fire events → particles,
+    /// burning body management, body smoke. Runs at fluid tick rate.
+    fn system_fluid(&mut self, timing: FrameTiming) {
+        let fluid_timing = self.fluid_clock.advance(timing.dt_frame);
+        for _ in 0..fluid_timing.physics_steps {
+            {
+                const DIRS6: [IVec3; 6] = [
+                    IVec3::X, IVec3::NEG_X, IVec3::Y,
+                    IVec3::NEG_Y, IVec3::Z, IVec3::NEG_Z,
+                ];
+                let neighbor_chunks: FxHashSet<IVec3> = self
+                    .fluid
+                    .active_chunk_keys()
+                    .flat_map(|ck| DIRS6.into_iter().map(move |d| ck + d))
+                    .collect();
+                for ck in neighbor_chunks {
+                    if self.world.chunk_at(ck).is_none() {
+                        self.chunk_loader.ensure_loaded(&mut self.world, ck);
+                    }
+                }
+            }
+            self.fluid.tick(&mut self.world);
+            if let Some(w) = &mut self.weathering {
+                let events = self.fluid.drain_events();
+                w.tick(&mut self.world, &events);
+            } else {
+                self.fluid.drain_events();
+            }
+            let mut spawned_ids = Vec::new();
+            let mut remesh_ids: FxHashSet<BodyId> = FxHashSet::default();
+            if let Some(f) = &mut self.fire {
+                f.tick(&mut self.world);
+                let s = self.world.cfg.voxel_size_m;
+                let mut consumed_positions = Vec::new();
+                for event in f.drain_events() {
+                    match event {
+                        vox_sim::FireEvent::Smoke { pos, face, kind } => {
+                            let (count, color, speed, upward, life, size, salt) = match kind {
+                                vox_sim::SmokeKind::Burning => {
+                                    (1, [0.35, 0.34, 0.33], 0.04, 0.08, 4.5, s * 0.35, 0)
+                                }
+                                vox_sim::SmokeKind::Extinguished => {
+                                    (3, [0.7, 0.7, 0.75], 0.12, 0.15, 2.5, s * 0.3, 1)
+                                }
+                                vox_sim::SmokeKind::Consumed => {
+                                    (2, [0.25, 0.22, 0.20], 0.08, 0.1, 3.5, s * 0.35, 2)
+                                }
+                            };
+                            let center = fire_smoke_origin(
+                                pos, face, s,
+                                (self.particles.len() as u32).wrapping_add(salt),
+                            );
+                            self.particles.burst(Burst {
+                                center, count, color, speed, upward, life, size,
+                                buoyant: true,
+                            });
+                        }
+                        vox_sim::FireEvent::Consumed(pos) => consumed_positions.push(pos),
+                        vox_sim::FireEvent::Extinguished(_) => {}
+                    }
+                }
+                if !consumed_positions.is_empty() {
+                    spawned_ids = vox_physics::detach_unsupported(
+                        &mut self.world, &mut self.phys, &self.registry,
+                        &consumed_positions,
+                    );
+                }
+                let ember = self.registry.id_by_name("ember").map(|m| Voxel(m.0));
+                let mut ignite_world: FxHashSet<IVec3> = FxHashSet::default();
+                let mut ignite_body: FxHashSet<(BodyId, IVec3)> = FxHashSet::default();
+                if let Some(ember) = ember {
+                    let phys = &self.phys;
+                    self.burning_bodies.retain(|id, _| phys.get(*id).is_some());
+                    let world_fire_bounds_m = f.burning_bounds().map(|(min, max)| {
+                        ((min - IVec3::ONE).as_vec3() * s, (max + IVec3::ONE).as_vec3() * s)
+                    });
+                    for (body_id, body) in self.phys.iter() {
+                        if body.sleep.asleep { continue; }
+                        let carries_fire = self.burning_bodies.contains_key(&body_id);
+                        let near_world_fire = world_fire_bounds_m.is_some_and(|(min, max)| {
+                            body.aabb_max.cmpge(min).all() && body.aabb_min.cmple(max).all()
+                        });
+                        if !carries_fire && !near_world_fire { continue; }
+                        for sample in &body.surface {
+                            let local_voxel = ((*sample - body.grid_offset) / s).floor().as_ivec3();
+                            let body_voxel = body.grid.get(local_voxel);
+                            let world_voxel = voxel_at(body.pos + body.rot * *sample, s);
+                            if body_voxel == ember && carries_fire {
+                                for face in [IVec3::X, IVec3::NEG_X, IVec3::Y, IVec3::NEG_Y, IVec3::Z, IVec3::NEG_Z] {
+                                    let neighbor = world_voxel + face;
+                                    let neighbor_voxel = self.world.get_voxel(neighbor);
+                                    if neighbor_voxel != ember
+                                        && self.registry.get(MaterialId(neighbor_voxel.0))
+                                            .is_some_and(|def| def.flammable)
+                                    {
+                                        ignite_world.insert(neighbor);
+                                    }
+                                }
+                            } else if near_world_fire
+                                && body_voxel != AIR && body_voxel != ember
+                                && self.registry.get(MaterialId(body_voxel.0))
+                                    .is_some_and(|def| def.flammable)
+                                && [IVec3::X, IVec3::NEG_X, IVec3::Y, IVec3::NEG_Y, IVec3::Z, IVec3::NEG_Z]
+                                    .iter().any(|&face| f.is_burning(world_voxel + face))
+                            {
+                                ignite_body.insert((body_id, local_voxel));
+                            }
+                        }
+                    }
+                    for (body_id, local_voxel) in ignite_body {
+                        if let Some(body) = self.phys.get_mut(body_id) {
+                            body.grid.set(local_voxel, ember);
+                            remesh_ids.insert(body_id);
+                        }
+                    }
+                }
+                for pos in ignite_world {
+                    f.ignite(&mut self.world, pos);
+                }
+            }
+            for id in spawned_ids {
+                self.upload_debris_mesh(id);
+            }
+            for id in remesh_ids {
+                self.upload_debris_mesh(id);
+            }
+            let body_smoke_ids: Vec<BodyId> = self.burning_bodies.keys().copied().collect();
+            for body_id in body_smoke_ids {
+                let Some(body) = self.phys.get(body_id) else {
+                    self.burning_bodies.remove(&body_id);
+                    continue;
+                };
+                let Some(visual) = self.burning_bodies.get_mut(&body_id) else { continue; };
+                if visual.cooldown > 0 {
+                    visual.cooldown -= 1;
+                    continue;
+                }
+                if let Some(origin) =
+                    next_body_smoke_origin(body, visual, &self.world, self.world.cfg.voxel_size_m)
+                {
+                    visual.cooldown = 10;
+                    self.particles.burst(Burst {
+                        center: origin, count: 1, color: [0.35, 0.34, 0.33],
+                        speed: 0.03, upward: 0.07, life: 4.5,
+                        size: self.world.cfg.voxel_size_m * 0.35, buoyant: true,
+                    });
+                } else {
+                    visual.cooldown = 2;
+                }
+            }
+        }
+    }
+
     /// Material-based impact destruction: check each impact this frame's
     /// physics step(s) produced against the material actually at that
     /// point. A hit whose speed (impulse/mass -- the velocity change the
@@ -1868,214 +2021,7 @@ impl App for VoxApp {
                 .update_debris(nearby.into_iter());
         }
 
-        let fluid_timing = self.fluid_clock.advance(timing.dt_frame);
-        for _ in 0..fluid_timing.physics_steps {
-            // Ensure chunks adjacent to active fluid are loaded — water
-            // flowing into an unloaded chunk allocates an empty chunk
-            // (no terrain), which then blocks proper generation.
-            {
-                const DIRS6: [IVec3; 6] = [
-                    IVec3::X, IVec3::NEG_X, IVec3::Y,
-                    IVec3::NEG_Y, IVec3::Z, IVec3::NEG_Z,
-                ];
-                let neighbor_chunks: FxHashSet<IVec3> = self
-                    .fluid
-                    .active_chunk_keys()
-                    .flat_map(|ck| DIRS6.into_iter().map(move |d| ck + d))
-                    .collect();
-                for ck in neighbor_chunks {
-                    if self.world.chunk_at(ck).is_none() {
-                        self.chunk_loader.ensure_loaded(&mut self.world, ck);
-                    }
-                }
-            }
-            self.fluid.tick(&mut self.world);
-            if let Some(w) = &mut self.weathering {
-                let events = self.fluid.drain_events();
-                w.tick(&mut self.world, &events);
-            } else {
-                // Weathering disabled — still drain to prevent unbounded
-                // events growth (2 entries per active cell per tick).
-                self.fluid.drain_events();
-            }
-            let mut spawned_ids = Vec::new();
-            let mut remesh_ids: FxHashSet<BodyId> = FxHashSet::default();
-            if let Some(f) = &mut self.fire {
-                f.tick(&mut self.world);
-                let s = self.world.cfg.voxel_size_m;
-                let mut consumed_positions = Vec::new();
-                for event in f.drain_events() {
-                    match event {
-                        vox_sim::FireEvent::Smoke { pos, face, kind } => {
-                            let (count, color, speed, upward, life, size, salt) = match kind {
-                                vox_sim::SmokeKind::Burning => {
-                                    (1, [0.35, 0.34, 0.33], 0.04, 0.08, 4.5, s * 0.35, 0)
-                                }
-                                vox_sim::SmokeKind::Extinguished => {
-                                    (3, [0.7, 0.7, 0.75], 0.12, 0.15, 2.5, s * 0.3, 1)
-                                }
-                                vox_sim::SmokeKind::Consumed => {
-                                    (2, [0.25, 0.22, 0.20], 0.08, 0.1, 3.5, s * 0.35, 2)
-                                }
-                            };
-                            let center = fire_smoke_origin(
-                                pos,
-                                face,
-                                s,
-                                (self.particles.len() as u32).wrapping_add(salt),
-                            );
-                            self.particles.burst(Burst {
-                                center,
-                                count,
-                                color,
-                                speed,
-                                upward,
-                                life,
-                                size,
-                                buoyant: true,
-                            });
-                        }
-                        vox_sim::FireEvent::Consumed(pos) => consumed_positions.push(pos),
-                        vox_sim::FireEvent::Extinguished(_) => {}
-                    }
-                }
-
-                if !consumed_positions.is_empty() {
-                    spawned_ids = vox_physics::detach_unsupported(
-                        &mut self.world,
-                        &mut self.phys,
-                        &self.registry,
-                        &consumed_positions,
-                    );
-                }
-
-                let ember = self.registry.id_by_name("ember").map(|m| Voxel(m.0));
-                let mut ignite_world: FxHashSet<IVec3> = FxHashSet::default();
-                let mut ignite_body: FxHashSet<(BodyId, IVec3)> = FxHashSet::default();
-                if let Some(ember) = ember {
-                    let phys = &self.phys;
-                    self.burning_bodies.retain(|id, _| phys.get(*id).is_some());
-
-                    let world_fire_bounds_m = f.burning_bounds().map(|(min, max)| {
-                        (
-                            (min - IVec3::ONE).as_vec3() * s,
-                            (max + IVec3::ONE).as_vec3() * s,
-                        )
-                    });
-                    for (body_id, body) in self.phys.iter() {
-                        if body.sleep.asleep {
-                            continue;
-                        }
-                        let carries_fire = self.burning_bodies.contains_key(&body_id);
-                        let near_world_fire = world_fire_bounds_m.is_some_and(|(min, max)| {
-                            body.aabb_max.cmpge(min).all() && body.aabb_min.cmple(max).all()
-                        });
-                        if !carries_fire && !near_world_fire {
-                            continue;
-                        }
-
-                        for sample in &body.surface {
-                            let local_voxel = ((*sample - body.grid_offset) / s).floor().as_ivec3();
-                            let body_voxel = body.grid.get(local_voxel);
-                            let world_voxel = voxel_at(body.pos + body.rot * *sample, s);
-                            if body_voxel == ember && carries_fire {
-                                for face in [
-                                    IVec3::X,
-                                    IVec3::NEG_X,
-                                    IVec3::Y,
-                                    IVec3::NEG_Y,
-                                    IVec3::Z,
-                                    IVec3::NEG_Z,
-                                ] {
-                                    let neighbor = world_voxel + face;
-                                    let neighbor_voxel = self.world.get_voxel(neighbor);
-                                    if neighbor_voxel != ember
-                                        && self
-                                            .registry
-                                            .get(MaterialId(neighbor_voxel.0))
-                                            .is_some_and(|def| def.flammable)
-                                    {
-                                        ignite_world.insert(neighbor);
-                                    }
-                                }
-                            } else if near_world_fire
-                                && body_voxel != AIR
-                                && body_voxel != ember
-                                && self
-                                    .registry
-                                    .get(MaterialId(body_voxel.0))
-                                    .is_some_and(|def| def.flammable)
-                                && [
-                                    IVec3::X,
-                                    IVec3::NEG_X,
-                                    IVec3::Y,
-                                    IVec3::NEG_Y,
-                                    IVec3::Z,
-                                    IVec3::NEG_Z,
-                                ]
-                                .iter()
-                                .any(|&face| f.is_burning(world_voxel + face))
-                            {
-                                ignite_body.insert((body_id, local_voxel));
-                            }
-                        }
-                    }
-
-                    for (body_id, local_voxel) in ignite_body {
-                        if let Some(body) = self.phys.get_mut(body_id) {
-                            body.grid.set(local_voxel, ember);
-                            remesh_ids.insert(body_id);
-                        }
-                    }
-                }
-                for pos in ignite_world {
-                    f.ignite(&mut self.world, pos);
-                }
-            }
-
-            for id in spawned_ids {
-                self.upload_debris_mesh(id);
-            }
-            for id in remesh_ids {
-                self.upload_debris_mesh(id);
-            }
-
-            // Detached burning objects emit at most one restrained puff per
-            // body every ten fire ticks. Outlet topology is cached from the
-            // exposed surface, and the world-air check suppresses smoke when
-            // the chosen face is pressed into terrain.
-            let body_smoke_ids: Vec<BodyId> = self.burning_bodies.keys().copied().collect();
-            for body_id in body_smoke_ids {
-                let Some(body) = self.phys.get(body_id) else {
-                    self.burning_bodies.remove(&body_id);
-                    continue;
-                };
-                let Some(visual) = self.burning_bodies.get_mut(&body_id) else {
-                    continue;
-                };
-                if visual.cooldown > 0 {
-                    visual.cooldown -= 1;
-                    continue;
-                }
-                if let Some(origin) =
-                    next_body_smoke_origin(body, visual, &self.world, self.world.cfg.voxel_size_m)
-                {
-                    visual.cooldown = 10;
-                    self.particles.burst(Burst {
-                        center: origin,
-                        count: 1,
-                        color: [0.35, 0.34, 0.33],
-                        speed: 0.03,
-                        upward: 0.07,
-                        life: 4.5,
-                        size: self.world.cfg.voxel_size_m * 0.35,
-                        buoyant: true,
-                    });
-                } else {
-                    visual.cooldown = 2;
-                }
-            }
-        }
+        self.system_fluid(timing);
 
         // Stream chunks around the player: generate missing, evict beyond range.
         self.system_streaming();
