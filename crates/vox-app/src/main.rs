@@ -476,6 +476,11 @@ struct VoxApp {
     ecs: vox_ecs::World,
     /// Cross-system data carried between frame phases.
     frame_data: systems::FrameData,
+    /// Cached render values from system_render_prep, consumed by the
+    /// inline GPU render passes in frame().
+    last_view_proj: glam::Mat4,
+    last_frustum: vox_render::Frustum,
+    last_shadow_frustum: vox_render::Frustum,
 }
 
 /// Hard cap on total debris bodies alive at once. Past this, the oldest
@@ -633,10 +638,13 @@ impl VoxApp {
             editor_radius: 2.0,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            frame_data: systems::FrameData::default(),
+            last_view_proj: glam::Mat4::IDENTITY,
+            last_frustum: vox_render::Frustum::from_view_proj(glam::Mat4::IDENTITY),
+            last_shadow_frustum: vox_render::Frustum::from_view_proj(glam::Mat4::IDENTITY),
             crack_intensity: 0.0,
             replay: replay::ReplayState::default(),
             ecs: vox_ecs::World::new(),
-            frame_data: systems::FrameData::default(),
             particles: ParticleSystem::new(),
             particle_pipeline,
             postprocess,
@@ -1288,6 +1296,83 @@ impl VoxApp {
                 }
             }
         }
+    }
+
+    /// Render prep: particle update, day/night, camera setup, frustum,
+    /// shadow camera. Everything before gpu.begin_frame() — the actual
+    /// GPU render passes stay inline in frame() due to frame lifetime.
+    fn system_render_prep(&mut self, timing: FrameTiming) {
+        let body_colliders: Vec<particles::BodyCollisionRef> = self
+            .phys
+            .iter()
+            .map(|(_, b)| particles::BodyCollisionRef {
+                aabb_min: b.aabb_min,
+                aabb_max: b.aabb_max,
+                pos: b.pos,
+                inv_rot: b.rot.inverse(),
+                grid_offset: b.grid_offset,
+                dims: b.grid.dims,
+                voxels: &b.grid.voxels,
+            })
+            .collect();
+        self.particles.update(
+            timing.dt_frame,
+            &self.world,
+            self.world.cfg.voxel_size_m,
+            &body_colliders,
+        );
+        self.system_day_night(timing.dt_frame);
+        let dn = day_night::compute(self.game_time);
+        let eye = self.player.eye(timing.alpha);
+        if self.frame_data.mario_active {
+            let mode = self.mario_mode.as_ref().unwrap();
+            self.camera.pos = mode.camera_pos(self.frame_data.mario_pos);
+            self.camera.yaw = mode.cam_yaw;
+            self.camera.pitch = mode.cam_pitch;
+        } else {
+            self.camera.pos = eye;
+            self.camera.yaw = self.player.yaw;
+            self.camera.pitch = self.player.pitch;
+        }
+        let (w, h) = self.gpu.surface_size();
+        let aspect = w as f32 / h.max(1) as f32;
+        let view_proj = self.camera.view_proj(aspect);
+        self.pipeline.write_camera(
+            &self.gpu,
+            view_proj,
+            self.camera.pos,
+            FOG_END_M,
+            dn.sun_dir,
+            dn.sun_strength,
+            dn.sky_color,
+            dn.fill_strength,
+            dn.ambient_strength,
+            dn.sun_color,
+            dn.ambient_sky,
+            dn.ambient_ground,
+            self.crack_intensity,
+            self.game_time,
+        );
+        let cam_right = self.camera.right();
+        let cam_up = cam_right.cross(self.camera.forward()).normalize();
+        self.particle_pipeline
+            .write_camera(&self.gpu, view_proj, cam_right, cam_up);
+        let particle_instances = self.particles.instances();
+        self.particle_pipeline
+            .upload(&self.gpu, &particle_instances);
+        self.last_view_proj = view_proj;
+        self.last_frustum = Frustum::from_view_proj(view_proj);
+        let shadow_focus = if self.frame_data.mario_active {
+            self.frame_data.mario_pos
+        } else {
+            self.camera.pos
+        };
+        self.last_shadow_frustum = self.shadow_pipeline.write_camera(
+            &self.gpu,
+            dn.sun_dir,
+            shadow_focus,
+            self.world.cfg.voxel_size_m,
+        );
     }
 
     /// Material-based impact destruction: check each impact this frame's
@@ -2031,88 +2116,14 @@ impl App for VoxApp {
         let uploaded = self.system_remesh(eye);
         self.resolve_pending_removals(&uploaded);
         self.sync_debris_render(timing.alpha);
-        let body_colliders: Vec<particles::BodyCollisionRef> = self
-            .phys
-            .iter()
-            .map(|(_, b)| particles::BodyCollisionRef {
-                aabb_min: b.aabb_min,
-                aabb_max: b.aabb_max,
-                pos: b.pos,
-                inv_rot: b.rot.inverse(),
-                grid_offset: b.grid_offset,
-                dims: b.grid.dims,
-                voxels: &b.grid.voxels,
-            })
-            .collect();
-        self.particles.update(
-            timing.dt_frame,
-            &self.world,
-            self.world.cfg.voxel_size_m,
-            &body_colliders,
-        );
+        self.system_render_prep(timing);
 
-        // Advance day/night cycle (unless frozen at noon).
-        self.system_day_night(timing.dt_frame);
         let dn = day_night::compute(self.game_time);
-
-        // Camera: third-person around Mario in Mario mode, else player eye.
-        if self.frame_data.mario_active {
-            let mode = self.mario_mode.as_ref().unwrap();
-            self.camera.pos = mode.camera_pos(self.frame_data.mario_pos);
-            self.camera.yaw = mode.cam_yaw;
-            self.camera.pitch = mode.cam_pitch;
-        } else {
-            self.camera.pos = eye;
-            self.camera.yaw = self.player.yaw;
-            self.camera.pitch = self.player.pitch;
-        }
+        let view_proj = self.last_view_proj;
+        let frustum = self.last_frustum.clone();
+        let shadow_frustum = self.last_shadow_frustum.clone();
         let (w, h) = self.gpu.surface_size();
         let aspect = w as f32 / h.max(1) as f32;
-        let view_proj = self.camera.view_proj(aspect);
-        self.pipeline.write_camera(
-            &self.gpu,
-            view_proj,
-            self.camera.pos,
-            FOG_END_M,
-            dn.sun_dir,
-            dn.sun_strength,
-            dn.sky_color,
-            dn.fill_strength,
-            dn.ambient_strength,
-            dn.sun_color,
-            dn.ambient_sky,
-            dn.ambient_ground,
-            self.crack_intensity,
-            self.game_time,
-        );
-        // Billboard basis: camera right and true up (right x forward).
-        let cam_right = self.camera.right();
-        let cam_up = cam_right.cross(self.camera.forward()).normalize();
-        self.particle_pipeline
-            .write_camera(&self.gpu, view_proj, cam_right, cam_up);
-        let particle_instances = self.particles.instances();
-        self.particle_pipeline
-            .upload(&self.gpu, &particle_instances);
-        let frustum = Frustum::from_view_proj(view_proj);
-
-        // Shadow camera (#14): orthographic box centered on the player,
-        // oriented along the sun direction. Updated every frame so shadows
-        // track the player and re-orient as the sun moves through the
-        // day/night cycle. The camera focus is the player/mario position
-        // (whichever is active) so the 100 m shadow box always covers the
-        // nearby terrain the eye actually sees.
-        let shadow_focus = if self.frame_data.mario_active {
-            self.frame_data.mario_pos
-        } else {
-            self.camera.pos
-        };
-        let shadow_frustum = self.shadow_pipeline.write_camera(
-            &self.gpu,
-            dn.sun_dir,
-            shadow_focus,
-            self.world.cfg.voxel_size_m,
-        );
-
         let render_start = Instant::now();
         let frame = match self.gpu.begin_frame() {
             Ok(frame) => frame,
