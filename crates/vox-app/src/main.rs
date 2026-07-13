@@ -992,7 +992,21 @@ impl VoxApp {
             let pos = self.player.eye(1.0) + self.player.look_dir() * 2.0;
             let vel = self.player.look_dir() * 20.0;
             let id = ecs_components::spawn_projectile(&mut self.ecs, pos, vel, 5.0);
-            tracing::info!(?id, "spawned ECS projectile");
+            // Spawn a small debris body so the projectile is visible —
+            // the ECS entity tracks it logically, the debris body is the visual.
+            self.spawn_debris(pos, 2, vel);
+            // Particle burst at spawn for feedback.
+            self.particles.burst(Burst {
+                center: pos,
+                count: 8,
+                color: [1.0, 0.8, 0.3],
+                speed: 2.0,
+                upward: 0.3,
+                life: 0.5,
+                size: 0.08,
+                buoyant: false,
+            });
+            tracing::info!(?id, "spawned ECS projectile + debris body");
         }
         if input.key_pressed(KeyCode::KeyT) {
             let t0 = std::time::Instant::now();
