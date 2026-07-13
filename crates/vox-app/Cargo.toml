@@ -25,7 +25,9 @@ vox-platform = { workspace = true }
 vox-sm64 = { workspace = true, optional = true }
 vox-debug = { workspace = true }
 vox-sim = { workspace = true }
+vox-ecs = { workspace = true }
 glam = { workspace = true }
+serde_json = "1"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 pollster = { workspace = true }

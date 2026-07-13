@@ -16,6 +16,7 @@ mod particles;
 mod player;
 mod remesh;
 mod replay;
+mod systems;
 mod tools;
 
 use std::collections::{HashMap, HashSet, VecDeque};

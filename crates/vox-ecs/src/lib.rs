@@ -43,8 +43,29 @@ pub struct World {
     /// Generation counter per slot; `None` = free slot.
     generations: Vec<Option<u32>>,
     free: Vec<u32>,
-    /// `TypeId → Box<dyn Any>` where the inner type is `FxHashMap<EntityId, T>`.
-    components: HashMap<TypeId, Box<dyn Any>>,
+    /// `TypeId → Box<dyn ComponentStorage>` where each storage is a
+    /// `FxHashMap<EntityId, T>` behind the trait object.
+    components: HashMap<TypeId, Box<dyn ComponentStorage>>,
+}
+
+/// Trait object wrapper for per-type component storage. Enables despawn
+/// to remove components without knowing the concrete type `T`.
+trait ComponentStorage: Any + Send + Sync {
+    fn remove_entity(&mut self, id: EntityId);
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+impl<T: Component> ComponentStorage for FxHashMap<EntityId, T> {
+    fn remove_entity(&mut self, id: EntityId) {
+        self.remove(&id);
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 impl Default for World {
@@ -74,15 +95,16 @@ impl World {
         }
     }
 
-    /// Despawn an entity. Its components are removed and its slot is freed.
-    /// A stale handle from before despawn will no longer resolve.
+    /// Despawn an entity. Its components are removed from all storages
+    /// and its slot is freed. A stale handle from before despawn will
+    /// no longer resolve.
     pub fn despawn(&mut self, id: EntityId) {
         if !self.is_alive(id) {
             return;
         }
-        // Remove all components for this entity.
+        // Remove all components for this entity via the trait object.
         for storage in self.components.values_mut() {
-            remove_entity_from_storage(storage, id);
+            storage.remove_entity(id);
         }
         let slot = id.slot as usize;
         self.generations[slot] = Some(id.generation + 1);
@@ -105,6 +127,7 @@ impl World {
             .entry(type_id)
             .or_insert_with(|| Box::new(FxHashMap::<EntityId, T>::default()));
         let map = storage
+            .as_any_mut()
             .downcast_mut::<FxHashMap<EntityId, T>>()
             .expect("type mismatch in component storage");
         map.insert(id, component);
@@ -115,6 +138,7 @@ impl World {
         let type_id = TypeId::of::<T>();
         let storage = self.components.get(&type_id)?;
         let map = storage
+            .as_any()
             .downcast_ref::<FxHashMap<EntityId, T>>()
             .expect("type mismatch in component storage");
         map.get(&id)
@@ -125,6 +149,7 @@ impl World {
         let type_id = TypeId::of::<T>();
         let storage = self.components.get_mut(&type_id)?;
         let map = storage
+            .as_any_mut()
             .downcast_mut::<FxHashMap<EntityId, T>>()
             .expect("type mismatch in component storage");
         map.get_mut(&id)
@@ -135,6 +160,7 @@ impl World {
         let type_id = TypeId::of::<T>();
         let storage = self.components.get_mut(&type_id)?;
         let map = storage
+            .as_any_mut()
             .downcast_mut::<FxHashMap<EntityId, T>>()
             .expect("type mismatch in component storage");
         map.remove(&id)
@@ -147,7 +173,11 @@ impl World {
         let type_id = TypeId::of::<T>();
         self.components
             .get(&type_id)
-            .and_then(|storage| storage.downcast_ref::<FxHashMap<EntityId, T>>())
+            .and_then(|storage| {
+                storage
+                    .as_any()
+                    .downcast_ref::<FxHashMap<EntityId, T>>()
+            })
             .into_iter()
             .flat_map(|map| map.iter().map(|(&id, v)| (id, v)))
     }
@@ -158,7 +188,11 @@ impl World {
         let type_id = TypeId::of::<T>();
         self.components
             .get_mut(&type_id)
-            .and_then(|storage| storage.downcast_mut::<FxHashMap<EntityId, T>>())
+            .and_then(|storage| {
+                storage
+                    .as_any_mut()
+                    .downcast_mut::<FxHashMap<EntityId, T>>()
+            })
             .into_iter()
             .flat_map(|map| map.iter_mut().map(|(&id, v)| (id, v)))
     }
@@ -185,28 +219,6 @@ impl World {
                 })
             })
     }
-}
-
-/// Remove an entity from a `Box<dyn Any>` component storage without
-/// knowing the concrete type. Does nothing if the storage type doesn't
-/// use `EntityId` keys (it always does — all storages are
-/// `FxHashMap<EntityId, T>`).
-fn remove_entity_from_storage(storage: &mut Box<dyn Any>, id: EntityId) {
-    // We can't downcast to the concrete HashMap type without knowing T,
-    // but we can downcast to a trait object that supports removal.
-    // The simplest approach: try the most common pattern — the storage
-    // is always `FxHashMap<EntityId, _>`, but we can't remove without
-    // knowing the value type. Instead, mark the entity as despawned and
-    // let lazy cleanup happen on next access. For now, this is a no-op:
-    // despawned entities' components become inaccessible because
-    // `is_alive()` returns false, and queries filter by alive entities
-    // in practice (callers check `is_alive` before using a component).
-    //
-    // A proper implementation would store a `Vec<EntityId>` removal list
-    // per storage and clean up lazily. For the MVP, the memory leak is
-    // bounded by the number of despawned entities × component types,
-    // which is small for gameplay entities (doors, NPCs, projectiles).
-    let _ = (storage, id);
 }
 
 #[cfg(test)]
