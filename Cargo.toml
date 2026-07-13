@@ -19,6 +19,7 @@ vox-render = { path = "crates/vox-render" }
 vox-platform = { path = "crates/vox-platform" }
 vox-sm64 = { path = "crates/vox-sm64" }
 vox-debug = { path = "crates/vox-debug" }
+vox-ecs = { path = "crates/vox-ecs" }
 
 wgpu = { version = "0.20.1", features = ["wgsl"] }
 winit = { version = "0.29", features = ["rwh_06"] }
